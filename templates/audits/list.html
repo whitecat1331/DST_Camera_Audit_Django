@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Audits — DST Camera Audit{% endblock %}
+{% block content %}
+<h1>Audit jobs</h1>
+
+{% if can_audit %}
+<section class="panel">
+  <h2>Start audit</h2>
+  <form method="post" action="{% url 'audit_start' %}" class="filters">
+    {% csrf_token %}
+    <input type="text" name="pole_number" placeholder="Pole number" required>
+    <select name="device_type" required>
+      <option value="pole_bundle" selected>Full pole (CBW + VNC L1/L2)</option>
+      <option value="cbw">CBW only</option>
+      <option value="tf_vnc">TF VNC only</option>
+    </select>
+    <select name="lane">
+      <option value="1">Lane 1</option>
+      <option value="2">Lane 2</option>
+    </select>
+    <button type="submit">Start</button>
+  </form>
+</section>
+{% endif %}
+
+{% include "audits/_job_table.html" with jobs=jobs %}
+{% endblock %}

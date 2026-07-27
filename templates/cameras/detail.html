@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block title %}{{ installation.identifier }} — DST Camera Audit{% endblock %}
+{% block content %}
+<div class="browse-head">
+  <div>
+    <p class="crumb"><a href="{% url 'camera_list' %}">Installations</a> / {{ installation.identifier|default:installation.serial_number }}</p>
+    <h1>{{ installation.identifier|default:installation.serial_number }}</h1>
+    <p class="lede">{{ installation.location }} · {{ installation.agency }} · {{ installation.state }}</p>
+  </div>
+  <nav class="detail-nav">
+    {% if prev_pk %}
+    <a class="btn-secondary" href="{% url 'camera_detail' prev_pk %}">Previous</a>
+    {% else %}
+    <span class="btn-secondary btn-disabled">Previous</span>
+    {% endif %}
+    {% if nav_position %}
+    <span class="nav-pos">{{ nav_position }} / {{ nav_total }}</span>
+    {% endif %}
+    {% if next_pk %}
+    <a class="btn-secondary" href="{% url 'camera_detail' next_pk %}">Next</a>
+    {% else %}
+    <span class="btn-secondary btn-disabled">Next</span>
+    {% endif %}
+  </nav>
+</div>
+
+<div class="two-col">
+  <section>
+    <h2>IMS inventory</h2>
+    <dl class="kv">
+      <dt>IMS ID</dt><dd>{{ installation.ims_id }}</dd>
+      <dt>Pole</dt><dd><code>{{ installation.pole_number }}</code></dd>
+      <dt>Platform</dt><dd>{{ installation.primary_platform }}{% if installation.all_platforms %} <span class="cell-muted">({{ installation.all_platforms }})</span>{% endif %}</dd>
+      <dt>Serial</dt><dd>{{ installation.serial_number|default:"—" }}</dd>
+      <dt>FL number</dt><dd>{{ installation.fl_number|default:"—" }}</dd>
+      <dt>Status</dt><dd>{{ installation.status }}</dd>
+      <dt>Vendor / model</dt><dd>{{ installation.vendor }} {{ installation.model }}</dd>
+      <dt>IMS IP</dt><dd><code>{{ installation.ip_address|default:"—" }}</code></dd>
+      <dt>Camera A (L1)</dt><dd><code>{{ installation.camera_a|default:"—" }}</code></dd>
+      <dt>Camera B (L2)</dt><dd><code>{{ installation.camera_b|default:"—" }}</code></dd>
+      <dt>TF A / B IP</dt>
+      <dd>
+        <code>{{ installation.tf_a_ip|default:"—" }}</code>
+        /
+        <code>{{ installation.tf_b_ip|default:"—" }}</code>
+      </dd>
+      <dt>GPS</dt>
+      <dd>
+        {% if installation.has_gps %}
+        {{ installation.gps_lat }}, {{ installation.gps_long }}
+        · <a href="{% url 'map' %}">Map</a>
+        {% else %}
+        —
+        {% endif %}
+      </dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Derived audit IPs</h2>
+    <dl class="kv">
+      <dt>CBW</dt><dd><code>{{ installation.derived_cbw_ip|default:"—" }}</code></dd>
+      {% for label, ip in installation.derived_tf_cpu_ips %}
+      <dt>{{ label }}</dt><dd><code>{{ ip }}</code></dd>
+      {% empty %}
+      <dt>TF CPU</dt><dd>—</dd>
+      {% endfor %}
+    </dl>
+
+    {% if can_audit %}
+    <h2>Run audit</h2>
+    <form method="post" action="{% url 'audit_start' %}" class="stack">
+      {% csrf_token %}
+      <input type="hidden" name="installation_id" value="{{ installation.pk }}">
+      <input type="hidden" name="pole_number" value="{{ installation.pole_number }}">
+      <input type="hidden" name="next" value="{% url 'camera_detail' installation.pk %}">
+      <label>
+        Device
+        <select name="device_type" required>
+          <option value="pole_bundle" selected>Full pole (CBW + VNC L1/L2)</option>
+          <option value="cbw">CBW only (Date/Time)</option>
+          <option value="tf_vnc">TF VNC only</option>
+        </select>
+      </label>
+      <label>
+        TF lane (VNC only)
+        <select name="lane">
+          <option value="1">1</option>
+          <option value="2">2</option>
+        </select>
+      </label>
+      <button type="submit">Start audit</button>
+    </form>
+    {% endif %}
+  </section>
+</div>
+
+<section>
+  <h2>Devices &amp; sensors (IMS)</h2>
+  <div class="device-layers detail-layers">
+    {% for layer in device_layers %}
+    <section class="device-layer {% if layer.matched %}matched{% endif %}">
+      <div class="layer-body">
+        <div class="layer-label">{{ layer.label }}</div>
+        <div class="layer-ip"><code>{{ layer.ip|default:"—" }}</code></div>
+        {% if layer.ds_number or layer.device %}
+        <div class="layer-device">
+          <strong>{% firstof layer.display_name layer.ds_number "Device" %}</strong>
+          {% if layer.device and layer.device.name and layer.ds_number and layer.ds_number != layer.device.name %}
+          <span class="cell-muted">({{ layer.device.name }})</span>
+          {% elif layer.device and layer.device.device_type and not layer.ds_number %}
+          <span class="cell-muted">({{ layer.device.device_type }})</span>
+          {% endif %}
+          {% if layer.device and layer.device.enclosure_label %}<div class="cell-muted">{{ layer.device.enclosure_label }}</div>{% endif %}
+        </div>
+        {% else %}
+        <div class="layer-device cell-muted">No IMS device match</div>
+        {% endif %}
+        {% if layer.sensors %}
+        <ul class="sensor-chips">
+          {% for s in layer.sensors %}
+          <li><span class="sensor-name">{{ s.name }}</span> <span class="sensor-val">{{ s.last_value }}</span></li>
+          {% endfor %}
+        </ul>
+        {% elif layer.device %}
+        <p class="cell-muted">No sensors synced for this device.</p>
+        {% endif %}
+      </div>
+      {% if layer.thumb_key %}
+      <div class="layer-thumb">
+        {% if layer.thumb %}
+        <img class="detail-thumb" src="{{ layer.thumb.image.url }}" alt="{{ layer.label }}">
+        {% else %}
+        <span class="thumb-empty">Not run</span>
+        {% endif %}
+      </div>
+      {% endif %}
+    </section>
+    {% empty %}
+    <p class="cell-muted">No device layers — run an IMS sync with devices included.</p>
+    {% endfor %}
+  </div>
+  {% with comps=installation.components.all %}
+  {% if comps %}
+  <h3>Components</h3>
+  <ul class="comp-list">
+    {% for c in comps %}
+    <li>{{ c.name }}{% if c.host %} · <code>{{ c.host }}</code>{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% endwith %}
+</section>
+
+<section>
+  <h2>Recent audits for this pole</h2>
+  {% include "audits/_job_table.html" with jobs=recent_jobs %}
+</section>
+{% endblock %}

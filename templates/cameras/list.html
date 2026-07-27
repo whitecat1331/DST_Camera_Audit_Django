@@ -1,0 +1,375 @@
+{% extends "base.html" %}
+{% block title %}Installations — DST Camera Audit{% endblock %}
+{% block container_class %}wide{% endblock %}
+{% block content %}
+<div class="browse-head">
+  <div>
+    <h1>Installations</h1>
+    <p class="lede">
+      {{ total }} ASE site{{ total|pluralize }} from IMS
+      {% if has_filters %}(filtered){% endif %}
+      · Each card layers audit IPs with IMS device + sensor data; captures sit beside the matching IP
+    </p>
+  </div>
+  <a class="btn-secondary" href="{% url 'map' %}">Open map</a>
+</div>
+
+<form method="get" class="browse-filters" id="install-filters">
+  <div class="filters-primary">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search pole, identifier, serial, IP, location…" autofocus>
+    <button type="submit">Search</button>
+    {% if has_filters %}
+    <a class="btn-secondary" href="{% url 'camera_list' %}">Clear</a>
+    {% endif %}
+  </div>
+  <div class="filters-secondary">
+    <label>Platform
+      <select name="platform" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for p in platforms %}
+        <option value="{{ p }}" {% if platform == p %}selected{% endif %}>{{ p }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>State
+      <select name="state" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for s in states %}
+        <option value="{{ s }}" {% if state == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Agency
+      <select name="agency" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for a in agencies %}
+        <option value="{{ a }}" {% if agency == a %}selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Status
+      <select name="status" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for st in statuses %}
+        <option value="{{ st }}" {% if status == st %}selected{% endif %}>{{ st }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Sort
+      <select name="sort" onchange="this.form.submit()">
+        <option value="pole" {% if sort == "pole" %}selected{% endif %}>Pole</option>
+        <option value="identifier" {% if sort == "identifier" %}selected{% endif %}>Identifier</option>
+        <option value="platform" {% if sort == "platform" %}selected{% endif %}>Platform</option>
+        <option value="agency" {% if sort == "agency" %}selected{% endif %}>Agency</option>
+        <option value="state" {% if sort == "state" %}selected{% endif %}>State</option>
+        <option value="status" {% if sort == "status" %}selected{% endif %}>Status</option>
+      </select>
+    </label>
+    <label>Per page
+      <select name="page_size" onchange="this.form.submit()">
+        <option value="25" {% if page_size == 25 %}selected{% endif %}>25</option>
+        <option value="50" {% if page_size == 50 %}selected{% endif %}>50</option>
+        <option value="100" {% if page_size == 100 %}selected{% endif %}>100</option>
+      </select>
+    </label>
+  </div>
+</form>
+
+{% if page.paginator.num_pages > 1 %}
+<nav class="pager pager-top">
+  {% if page.has_previous %}
+  <a href="?page={{ page.previous_page_number }}&{{ querystring }}">Previous</a>
+  {% else %}
+  <span class="pager-disabled">Previous</span>
+  {% endif %}
+  <span>Page {{ page.number }} of {{ page.paginator.num_pages }} · showing {{ page.start_index }}–{{ page.end_index }}</span>
+  {% if page.has_next %}
+  <a href="?page={{ page.next_page_number }}&{{ querystring }}">Next</a>
+  {% else %}
+  <span class="pager-disabled">Next</span>
+  {% endif %}
+</nav>
+{% endif %}
+
+<div class="install-cards">
+  {% for installation in page %}
+  <article class="install-card" data-detail="{% url 'camera_detail' installation.pk %}" data-pole="{{ installation.pole_number }}">
+    <header class="install-card-head">
+      <div class="install-card-title">
+        <a href="{% url 'camera_detail' installation.pk %}">
+          {{ installation.identifier|default:installation.serial_number|default:"—" }}
+        </a>
+        <code class="pole-tag">{{ installation.pole_number|default:"—" }}</code>
+        {% if installation.primary_platform %}
+        <span class="badge">{{ installation.primary_platform }}</span>
+        {% endif %}
+        {% if installation.status %}
+        <span class="badge">{{ installation.status }}</span>
+        {% endif %}
+      </div>
+      <div class="install-card-meta">
+        <span>{{ installation.agency|default:"—" }}</span>
+        {% if installation.location %}<span>· {{ installation.location }}</span>{% endif %}
+        {% if installation.state %}<span>· {{ installation.state }}</span>{% endif %}
+      </div>
+      <div class="install-card-facts">
+        {% if installation.serial_number %}<span>Serial <code>{{ installation.serial_number }}</code></span>{% endif %}
+        {% if installation.vendor or installation.model %}
+        <span>{{ installation.vendor }} {{ installation.model }}</span>
+        {% endif %}
+        {% with comps=installation.components.all %}
+        {% if comps %}
+        <span>{{ comps|length }} component{{ comps|length|pluralize }}</span>
+        {% endif %}
+        {% endwith %}
+      </div>
+      {% if can_audit %}
+      <div class="install-card-actions" onclick="event.stopPropagation()">
+        <button type="button" class="icon-btn btn-capture"
+          title="{% if installation.is_dragoneye %}Capture DragonEye via TeamViewer{% else %}Capture CBW + VNC L1/L2{% endif %}"
+          data-action="capture" data-pole="{{ installation.pole_number }}"
+          {% if not installation.pole_number %}disabled{% endif %}>Capture</button>
+        <button type="button" class="icon-btn btn-relays" title="Turn CBW relays ON"
+          data-action="relays" data-pole="{{ installation.pole_number }}"
+          {% if not installation.pole_number or installation.is_dragoneye %}disabled{% endif %}>Turn On</button>
+      </div>
+      {% endif %}
+    </header>
+
+    <div class="device-layers">
+      {% for layer in installation.device_layers %}
+      <section class="device-layer {% if layer.matched %}matched{% endif %}" data-layer="{{ layer.key }}">
+        <div class="layer-body">
+          <div class="layer-label">{{ layer.label }}</div>
+          <div class="layer-ip"><code>{{ layer.ip|default:"—" }}</code></div>
+          {% if layer.ds_number or layer.device %}
+          <div class="layer-device"{% if layer.device %} title="{{ layer.device.enclosure_label }}"{% endif %}>
+            <strong>{% firstof layer.display_name layer.ds_number "Device" %}</strong>
+            {% if layer.device and layer.device.name and layer.ds_number and layer.ds_number != layer.device.name %}
+            <span class="cell-muted">· {{ layer.device.name }}</span>
+            {% endif %}
+            {% if layer.device and layer.device.lane_code %}<span class="cell-muted">· {{ layer.device.lane_code }}</span>{% endif %}
+          </div>
+          {% else %}
+          <div class="layer-device cell-muted">No IMS device match</div>
+          {% endif %}
+          {% if layer.sensors %}
+          <ul class="sensor-chips">
+            {% for s in layer.sensors %}
+            <li><span class="sensor-name">{{ s.name }}</span> <span class="sensor-val">{{ s.last_value }}</span></li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </div>
+        {% if layer.thumb_key %}
+        <div class="layer-thumb" data-thumb-key="{{ layer.thumb_key }}" onclick="event.stopPropagation()">
+          {% if layer.thumb %}
+          <button type="button" class="thumb-btn" data-full="{{ layer.thumb.image.url }}"
+            title="{{ layer.label }} · {{ layer.thumb.created_at }}">
+            <img src="{{ layer.thumb.image.url }}" alt="{{ layer.label }} capture" loading="lazy">
+          </button>
+          {% else %}
+          <span class="thumb-empty">Not run</span>
+          {% endif %}
+        </div>
+        {% endif %}
+      </section>
+      {% empty %}
+      <p class="cell-muted">No derived IPs for this pole — sync IMS or check pole number.</p>
+      {% endfor %}
+    </div>
+  </article>
+  {% empty %}
+  <p class="panel">No installations match these filters.</p>
+  {% endfor %}
+</div>
+
+{% if page.paginator.num_pages > 1 %}
+<nav class="pager">
+  {% if page.has_previous %}
+  <a href="?page={{ page.previous_page_number }}&{{ querystring }}">Previous</a>
+  {% endif %}
+  <span>Page {{ page.number }} of {{ page.paginator.num_pages }}</span>
+  {% if page.has_next %}
+  <a href="?page={{ page.next_page_number }}&{{ querystring }}">Next</a>
+  {% endif %}
+</nav>
+{% endif %}
+
+<dialog id="thumb-modal" class="thumb-modal">
+  <form method="dialog"><button class="modal-close" value="close" aria-label="Close">×</button></form>
+  <img id="thumb-modal-img" alt="Capture preview">
+</dialog>
+
+<button type="button" class="fab-top" id="scroll-to-top" aria-label="Scroll to top" title="Scroll to top">↑</button>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+  const CAPTURE_URL = "{% url 'capture_pole' %}";
+  const RELAYS_URL = "{% url 'turn_relays' %}";
+
+  document.querySelectorAll('.install-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('a, button, .install-card-actions, .layer-thumb')) return;
+      const url = card.dataset.detail;
+      if (url) window.location = url;
+    });
+  });
+
+  const modal = document.getElementById('thumb-modal');
+  const modalImg = document.getElementById('thumb-modal-img');
+
+  function wireThumbBtn(btn) {
+    if (btn.dataset.wired === '1') return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', () => {
+      modalImg.src = btn.dataset.full;
+      modal.showModal();
+    });
+  }
+  document.querySelectorAll('.thumb-btn').forEach(wireThumbBtn);
+
+  function applyScreenshots(pole, screenshots) {
+    if (!pole || !Array.isArray(screenshots) || !screenshots.length) return;
+    const card = document.querySelector(`.install-card[data-pole="${CSS.escape(pole)}"]`);
+    if (!card) return;
+    for (const shot of screenshots) {
+      const key = String(shot.label || '').trim().toLowerCase();
+      if (!key || !shot.url) continue;
+      const box = card.querySelector(`.layer-thumb[data-thumb-key="${CSS.escape(key)}"]`);
+      if (!box) continue;
+      let btn = box.querySelector('.thumb-btn');
+      if (!btn) {
+        box.innerHTML = '';
+        btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'thumb-btn';
+        const img = document.createElement('img');
+        img.alt = key + ' capture';
+        img.loading = 'lazy';
+        btn.appendChild(img);
+        box.appendChild(btn);
+        wireThumbBtn(btn);
+      }
+      if (btn.dataset.full === shot.url) continue;
+      btn.dataset.full = shot.url;
+      btn.title = key;
+      const img = btn.querySelector('img');
+      if (img) img.src = shot.url;
+    }
+  }
+
+  const fab = document.getElementById('scroll-to-top');
+  window.addEventListener('scroll', () => {
+    fab.classList.toggle('visible', window.scrollY > 400);
+  });
+  fab.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+  async function pollJob(statusUrl, btn, pole) {
+    for (let i = 0; i < 180; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      const res = await fetch(statusUrl, { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      applyScreenshots(pole, data.screenshots);
+      const label = data.progress || data.message || data.status || 'Running';
+      const elapsed = (data.elapsed_s != null) ? ` (${data.elapsed_s}s)` : '';
+      const short = label.length > 28 ? label.slice(0, 26) + '…' : label;
+      btn.textContent = short;
+      btn.title = `${label}${elapsed}`;
+      if (data.status === 'succeeded') {
+        btn.disabled = false;
+        btn.textContent = 'Capture';
+        btn.title = data.error_message
+          ? `Done with warnings: ${data.error_message}`
+          : 'Capture CBW + VNC L1/L2';
+        if (data.error_message) {
+          alert('Capture finished with warnings:\n' + data.error_message);
+        }
+        return;
+      }
+      if (data.status === 'failed') {
+        btn.disabled = false;
+        btn.textContent = 'Capture';
+        alert(data.error_message || data.message || 'Capture failed');
+        return;
+      }
+    }
+    btn.disabled = false;
+    btn.textContent = 'Capture';
+    alert('Capture timed out waiting for status — check logs/dst.log for [AUDIT] / [CBW] / [VNC] lines');
+  }
+
+  document.querySelectorAll('[data-action="capture"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const pole = btn.dataset.pole;
+      if (!pole) return;
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        const res = await fetch(CAPTURE_URL, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': csrf,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ pole_number: pole }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || 'Capture failed to start');
+          btn.disabled = false;
+          btn.textContent = 'Capture';
+          return;
+        }
+        btn.textContent = 'Starting…';
+        pollJob(data.status_url, btn, pole);
+      } catch (err) {
+        alert(String(err));
+        btn.disabled = false;
+        btn.textContent = 'Capture';
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-action="relays"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const pole = btn.dataset.pole;
+      if (!pole) return;
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = '…';
+      try {
+        const res = await fetch(RELAYS_URL, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': csrf,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ pole_number: pole }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || 'Relay request failed');
+        } else {
+          const names = (data.relays || []).join(', ') || 'ok';
+          btn.title = 'Relays ON: ' + names;
+          btn.textContent = 'On';
+          setTimeout(() => { btn.textContent = prev; }, 2000);
+        }
+      } catch (err) {
+        alert(String(err));
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '…') btn.textContent = prev;
+      }
+    });
+  });
+})();
+</script>
+{% endblock %}

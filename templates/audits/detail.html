@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Audit #{{ job.pk }} — DST Camera Audit{% endblock %}
+{% block content %}
+<p class="crumb"><a href="{% url 'audit_list' %}">Audits</a> / #{{ job.pk }}</p>
+<h1>Audit #{{ job.pk }}</h1>
+<p class="lede">
+  <span class="badge status-{{ job.status }}">{{ job.get_status_display }}</span>
+  {{ job.get_device_type_display }} · pole {{ job.pole_number }} · <code>{{ job.target_host }}</code>
+</p>
+
+<dl class="kv">
+  <dt>Created</dt><dd>{{ job.created_at }}{% if job.created_by %} by {{ job.created_by.username }}{% endif %}</dd>
+  <dt>Started</dt><dd>{{ job.started_at|default:"—" }}</dd>
+  <dt>Finished</dt><dd>{{ job.finished_at|default:"—" }}</dd>
+  {% if job.error_message %}
+  <dt>Error</dt><dd class="error">{{ job.error_message }}</dd>
+  {% endif %}
+</dl>
+
+{% if job.status == "pending" or job.status == "running" %}
+<p class="lede">Job still running — refresh this page for updates.</p>
+<meta http-equiv="refresh" content="5">
+{% endif %}
+
+<section>
+  <h2>Screenshots</h2>
+  <div class="shot-grid">
+    {% for shot in job.screenshots.all %}
+    <figure class="shot">
+      <a href="{{ shot.image.url }}" target="_blank" rel="noopener">
+        <img src="{{ shot.image.url }}" alt="{{ shot.label }}">
+      </a>
+      <figcaption>{{ shot.label }}</figcaption>
+    </figure>
+    {% empty %}
+    <p>No screenshots yet.</p>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
