@@ -1,0 +1,7 @@
+﻿{
+  "production_branch": "main",
+  "integration_branch": "dev",
+  "feature_branch": "feature",
+  "assignees": ["whitecat1331", "Yorton1120"],
+  "reviewers": ["Yorton1120"]
+}
