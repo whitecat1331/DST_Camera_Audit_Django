@@ -3,15 +3,18 @@
 from pathlib import Path
 import os
 
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-SECRET_KEY = os.getenv(
-    "DJANGO_SECRET_KEY",
-    "",
-)
+_secret_key = os.getenv("DJANGO_SECRET_KEY", "").strip()
+if not _secret_key:
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY is required. Set it in .env (see .env.example)."
+    )
+SECRET_KEY = _secret_key
 
 DEBUG = os.getenv("DJANGO_DEBUG", "true").lower() in ("1", "true", "yes")
 
