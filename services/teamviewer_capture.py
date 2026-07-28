@@ -10,7 +10,6 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
 
 from PIL import Image
 
@@ -33,16 +32,155 @@ def _noop(_: str) -> None:
     return None
 
 
+SW_RESTORE = 9
+SW_SHOW = 5
+SW_MAXIMIZE = 3
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
+_SKIP_TV_TITLES = {"teamviewer", "teamviewer authentication"}
+
+
+class _TVWindow:
+    """Lightweight TeamViewer session window handle (avoids stale PyGetWindow objects)."""
+
+    def __init__(self, hwnd: int, title: str) -> None:
+        self._hWnd = hwnd
+        self.title = title
+
+    def activate(self) -> None:
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(self._hWnd):
+            return
+        if user32.IsIconic(self._hWnd):
+            user32.ShowWindow(self._hWnd, SW_RESTORE)
+            time.sleep(0.3)
+        user32.ShowWindow(self._hWnd, SW_SHOW)
+        user32.SetForegroundWindow(self._hWnd)
+
+
+def _get_window_title(hwnd) -> str:
+    user32 = ctypes.windll.user32
+    buf = ctypes.create_unicode_buffer(512)
+    length = user32.GetWindowTextW(hwnd, buf, len(buf))
+    return buf.value if length else ""
+
+
+def _hwnd_rect(hwnd) -> tuple[int, int, int, int]:
+    """Return (left, top, width, height) preferring DWM frame bounds."""
+    user32 = ctypes.windll.user32
+    rect = wintypes.RECT()
+    try:
+        dwmapi = ctypes.windll.dwmapi
+        hr = dwmapi.DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(rect),
+            ctypes.sizeof(rect),
+        )
+        if hr == 0:
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            if w > 0 and h > 0:
+                return rect.left, rect.top, w, h
+    except Exception:  # noqa: BLE001
+        pass
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+
+
+def _hwnd_area(hwnd) -> int:
+    user32 = ctypes.windll.user32
+    if not user32.IsWindow(hwnd):
+        return 0
+    _left, _top, width, height = _hwnd_rect(hwnd)
+    return max(0, width) * max(0, height)
+
+
+def _enum_session_windows(teamviewer_id: str) -> list[tuple[int, str, int]]:
+    """Enumerate visible TeamViewer remote-session top-level windows."""
+    user32 = ctypes.windll.user32
+    clean_id = str(teamviewer_id).replace(" ", "")
+    found: list[tuple[int, str, int]] = []
+
+    def _callback(hwnd, _lp):
+        if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+            return True
+        title = _get_window_title(hwnd).strip()
+        lowered = title.lower()
+        if not title or lowered in _SKIP_TV_TITLES:
+            return True
+        if "teamviewer" not in lowered:
+            return True
+        # Remote session windows look like "<host> - TeamViewer".
+        is_session = " - teamviewer" in lowered or clean_id in title.replace(" ", "")
+        if not is_session:
+            return True
+        found.append((hwnd, title, _hwnd_area(hwnd)))
+        return True
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(EnumWindowsProc(_callback), 0)
+
+    def _rank(item: tuple[int, str, int]) -> tuple[int, int, int]:
+        _hwnd, title, area = item
+        id_match = 1 if clean_id in title.replace(" ", "") else 0
+        has_area = 1 if area >= 200 * 150 else 0
+        return (has_area, id_match, area)
+
+    found.sort(key=_rank, reverse=True)
+    return found
+
+
+def _find_session_window(gw, teamviewer_id: str, *, title_hint: str = "") -> _TVWindow | None:
+    """Return the best TeamViewer session window (fresh EnumWindows scan)."""
+    del gw  # PyGetWindow cache goes stale after login; use Win32 enum instead.
+    windows = _enum_session_windows(teamviewer_id)
+    if title_hint:
+        hinted = [w for w in windows if title_hint in w[1]]
+        if hinted:
+            windows = hinted + [w for w in windows if w not in hinted]
+    for hwnd, title, _area in windows:
+        if ctypes.windll.user32.IsWindow(hwnd):
+            return _TVWindow(hwnd, title)
+    return None
+
+
+def _prepare_window_for_capture(hwnd) -> tuple[int, int, int, int]:
+    """Restore / show the window and wait until it reports a usable size."""
+    user32 = ctypes.windll.user32
+    if not user32.IsWindow(hwnd):
+        raise ValueError("TeamViewer session HWND is no longer valid")
+
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.4)
+    user32.ShowWindow(hwnd, SW_SHOW)
+    user32.ShowWindow(hwnd, SW_MAXIMIZE)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.5)
+
+    last = (0, 0, 0, 0)
+    for _ in range(30):
+        if not user32.IsWindow(hwnd):
+            raise ValueError("TeamViewer session HWND is no longer valid")
+        last = _hwnd_rect(hwnd)
+        _left, _top, width, height = last
+        if width >= 200 and height >= 150:
+            return last
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        time.sleep(0.35)
+
+    _left, _top, width, height = last
+    raise ValueError(f"Invalid window dimensions: {width}x{height}")
+
+
 def _capture_window_printwindow(hwnd, output_path: str) -> str:
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
 
-    rect = wintypes.RECT()
-    user32.GetWindowRect(hwnd, ctypes.byref(rect))
-    width = rect.right - rect.left
-    height = rect.bottom - rect.top
-    if width <= 0 or height <= 0:
-        raise ValueError(f"Invalid window dimensions: {width}x{height}")
+    left, top, width, height = _prepare_window_for_capture(hwnd)
 
     hwnd_dc = user32.GetWindowDC(hwnd)
     mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
@@ -50,63 +188,148 @@ def _capture_window_printwindow(hwnd, output_path: str) -> str:
     old_bmp = gdi32.SelectObject(mem_dc, bitmap)
 
     captured = user32.PrintWindow(hwnd, mem_dc, 2) or user32.PrintWindow(hwnd, mem_dc, 0)
-    if not captured:
+    if captured:
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [
+                ("biSize", wintypes.DWORD),
+                ("biWidth", ctypes.c_long),
+                ("biHeight", ctypes.c_long),
+                ("biPlanes", wintypes.WORD),
+                ("biBitCount", wintypes.WORD),
+                ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD),
+                ("biXPelsPerMeter", ctypes.c_long),
+                ("biYPelsPerMeter", ctypes.c_long),
+                ("biClrUsed", wintypes.DWORD),
+                ("biClrImportant", wintypes.DWORD),
+            ]
+
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth = width
+        bmi.biHeight = -height
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        bmi.biCompression = 0
+
+        pixel_buf = ctypes.create_string_buffer(width * height * 4)
+        gdi32.GetDIBits(mem_dc, bitmap, 0, height, pixel_buf, ctypes.byref(bmi), 0)
         gdi32.SelectObject(mem_dc, old_bmp)
         gdi32.DeleteObject(bitmap)
         gdi32.DeleteDC(mem_dc)
         user32.ReleaseDC(hwnd, hwnd_dc)
-        raise RuntimeError("PrintWindow failed for TeamViewer session window")
 
-    class BITMAPINFOHEADER(ctypes.Structure):
-        _fields_ = [
-            ("biSize", wintypes.DWORD),
-            ("biWidth", ctypes.c_long),
-            ("biHeight", ctypes.c_long),
-            ("biPlanes", wintypes.WORD),
-            ("biBitCount", wintypes.WORD),
-            ("biCompression", wintypes.DWORD),
-            ("biSizeImage", wintypes.DWORD),
-            ("biXPelsPerMeter", ctypes.c_long),
-            ("biYPelsPerMeter", ctypes.c_long),
-            ("biClrUsed", wintypes.DWORD),
-            ("biClrImportant", wintypes.DWORD),
-        ]
+        img = Image.frombuffer("RGBA", (width, height), pixel_buf, "raw", "BGRA", 0, 1)
+        img.save(output_path)
+        return output_path
 
-    bmi = BITMAPINFOHEADER()
-    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bmi.biWidth = width
-    bmi.biHeight = -height
-    bmi.biPlanes = 1
-    bmi.biBitCount = 32
-    bmi.biCompression = 0
-
-    pixel_buf = ctypes.create_string_buffer(width * height * 4)
-    gdi32.GetDIBits(mem_dc, bitmap, 0, height, pixel_buf, ctypes.byref(bmi), 0)
     gdi32.SelectObject(mem_dc, old_bmp)
     gdi32.DeleteObject(bitmap)
     gdi32.DeleteDC(mem_dc)
     user32.ReleaseDC(hwnd, hwnd_dc)
 
-    img = Image.frombuffer("RGBA", (width, height), pixel_buf, "raw", "BGRA", 0, 1)
+    # Fallback: grab the on-screen region (works when PrintWindow returns empty).
+    logger.warning("[TV] PrintWindow failed — falling back to screen region capture")
+    try:
+        from PIL import ImageGrab
+    except ImportError as exc:
+        raise RuntimeError("PrintWindow failed and ImageGrab is unavailable") from exc
+
+    # Re-read bounds in case the window moved while PrintWindow ran.
+    left, top, width, height = _prepare_window_for_capture(hwnd)
+    right, bottom = left + width, top + height
+    try:
+        img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+    except TypeError:
+        # Older Pillow without all_screens=
+        img = ImageGrab.grab(bbox=(left, top, right, bottom))
     img.save(output_path)
     return output_path
 
 
-def _find_session_window(gw, teamviewer_id: str):
-    all_tv = gw.getWindowsWithTitle("TeamViewer")
-    if not all_tv:
-        return None
-    clean_id = str(teamviewer_id).replace(" ", "")
-    skip = {"teamviewer", "teamviewer authentication"}
+def _resolve_capture_window(
+    teamviewer_id: str,
+    *,
+    title_hint: str = "",
+    pinned_hwnd: int | None = None,
+) -> _TVWindow:
+    """Find a live session window suitable for screenshot."""
+    user32 = ctypes.windll.user32
+    if pinned_hwnd and user32.IsWindow(pinned_hwnd):
+        title = _get_window_title(pinned_hwnd).strip()
+        if title and (not title_hint or title_hint in title):
+            area = _hwnd_area(pinned_hwnd)
+            logger.info(
+                "[TV] reusing pinned hwnd=%s title=%r area=%s",
+                pinned_hwnd,
+                title,
+                area,
+            )
+            return _TVWindow(pinned_hwnd, title)
 
-    for w in all_tv:
-        if clean_id in w.title.replace(" ", ""):
-            return w
-    for w in all_tv:
-        stripped = w.title.strip()
-        if stripped and stripped.lower() not in skip:
-            return w
-    return None
+    windows = _enum_session_windows(teamviewer_id)
+    if title_hint:
+        hinted = [w for w in windows if title_hint in w[1]]
+        if hinted:
+            windows = hinted + [w for w in windows if w not in hinted]
+    if not windows and title_hint:
+        # Session title may not include the numeric TV id — match by hint alone.
+        windows = _enum_windows_by_title_hint(title_hint)
+    if not windows:
+        sample = _sample_teamviewer_titles()
+        logger.warning(
+            "[TV] no session window for id=%s hint=%r; visible TV titles=%s",
+            teamviewer_id,
+            title_hint,
+            sample,
+        )
+    for hwnd, title, area in windows:
+        if not user32.IsWindow(hwnd):
+            continue
+        if area >= 200 * 150:
+            return _TVWindow(hwnd, title)
+    for hwnd, title, _area in windows:
+        if user32.IsWindow(hwnd):
+            return _TVWindow(hwnd, title)
+    raise ValueError(f"No TeamViewer session window found for id={teamviewer_id}")
+
+
+def _enum_windows_by_title_hint(title_hint: str) -> list[tuple[int, str, int]]:
+    """Find session windows whose title contains the remembered session name."""
+    if not title_hint:
+        return []
+    user32 = ctypes.windll.user32
+    found: list[tuple[int, str, int]] = []
+
+    def _callback(hwnd, _lp):
+        if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+            return True
+        title = _get_window_title(hwnd).strip()
+        if title_hint in title and "teamviewer" in title.lower():
+            found.append((hwnd, title, _hwnd_area(hwnd)))
+        return True
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(EnumWindowsProc(_callback), 0)
+    found.sort(key=lambda item: item[2], reverse=True)
+    return found
+
+
+def _sample_teamviewer_titles(limit: int = 8) -> list[str]:
+    user32 = ctypes.windll.user32
+    titles: list[str] = []
+
+    def _callback(hwnd, _lp):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = _get_window_title(hwnd).strip()
+        if title and "teamviewer" in title.lower() and title not in titles:
+            titles.append(title)
+        return True
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(EnumWindowsProc(_callback), 0)
+    return titles[:limit]
 
 
 def _clear_password_field(pyautogui) -> None:
@@ -132,12 +355,7 @@ def _attempt_os_passwords(
     passwords: list[str],
     progress: ProgressFn,
 ) -> None:
-    """Try each OS/DragonCam password on the focused password field.
-
-    Remote Ubuntu sessions usually already show user ``dragonadmin`` with focus
-    on the password box. Typing a username first concatenates into the password
-    (e.g. ``dcam`` + ``149@dcam``) and looks like a huge password string.
-    """
+    """Type the camera/OS password on the Ubuntu lock-screen password field."""
     if not passwords:
         return
     for idx, cam_pwd in enumerate(passwords, start=1):
@@ -152,31 +370,21 @@ def _attempt_os_passwords(
             logger.warning("[TV] password attempt %s failed: %s", idx, type(exc).__name__)
 
 
-def _attempt_app_login(
-    pyautogui,
-    username: str,
-    passwords: list[str],
-    progress: ProgressFn,
+def _close_session_window(win, teamviewer_id: str | None = None, *, session_title_hint: str = "") -> None:
+    if win is not None:
+        try:
+            ctypes.windll.user32.PostMessageW(win._hWnd, 0x0010, 0, 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[TV] close session window failed: %s", type(exc).__name__)
+    _close_session_notes(teamviewer_id=teamviewer_id, session_title_hint=session_title_hint)
+
+
+def _close_session_notes(
+    teamviewer_id: str | None = None,
+    timeout_sec: int = 8,
+    *,
+    session_title_hint: str = "",
 ) -> None:
-    """Optional second-stage DragonCam username+password after OS desktop is up."""
-    if not username or not passwords:
-        return
-    progress(f"DragonCam app login as {username}")
-    logger.info("[TV] DragonCam username login user=%s", username)
-    time.sleep(2)
-    try:
-        _type_secret(pyautogui, username)
-        pyautogui.press("tab")
-        time.sleep(0.5)
-        _clear_password_field(pyautogui)
-        _type_secret(pyautogui, passwords[0])
-        pyautogui.press("enter")
-        time.sleep(4)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[TV] DragonCam app login failed: %s", type(exc).__name__)
-
-
-def _close_session_notes(teamviewer_id: str | None = None, timeout_sec: int = 8) -> None:
     user32 = ctypes.windll.user32
     WM_CLOSE = 0x0010
     GW_OWNER = 4
@@ -208,6 +416,8 @@ def _close_session_notes(teamviewer_id: str | None = None, timeout_sec: int = 8)
             close = False
             if "session note" in lowered:
                 close = True
+            elif session_title_hint and session_title_hint in title:
+                close = False  # never close the active remote session by title match
             elif teamviewer_id and str(teamviewer_id).replace(" ", "").lower() in lowered.replace(" ", ""):
                 close = True
             elif lowered == "teamviewer":
@@ -225,21 +435,6 @@ def _close_session_notes(teamviewer_id: str | None = None, timeout_sec: int = 8)
         time.sleep(0.5)
 
 
-def _close_session_window(win, teamviewer_id: str | None = None) -> None:
-    if win is not None:
-        try:
-            ctypes.windll.user32.PostMessageW(win._hWnd, 0x0010, 0, 0)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[TV] close session window failed: %s", type(exc).__name__)
-    _close_session_notes(teamviewer_id=teamviewer_id)
-
-
-def _dismiss_remote_popups(pyautogui, rounds: int = 3, interval: float = 0.8) -> None:
-    for _ in range(rounds):
-        pyautogui.press("escape")
-        time.sleep(interval)
-
-
 def capture_dragoneye_via_teamviewer(
     *,
     teamviewer_id: str,
@@ -247,12 +442,13 @@ def capture_dragoneye_via_teamviewer(
     camera_passwords: list[str],
     output_dir: str | Path,
     filename: str = "de_tv.png",
-    camera_username: str = "",
+    camera_username: str = "",  # unused — kept for call-site compatibility
     teamviewer_path: str = DEFAULT_TEAMVIEWER_PATH,
     wait_for_connection_sec: int = 60,
     on_progress: ProgressFn | None = None,
 ) -> Path:
-    """Connect TeamViewer → type DragonCam credentials → screenshot session window."""
+    """Connect TeamViewer → OS login (if needed) → screenshot session window."""
+    del camera_username  # never type into desktop after OS login
     progress = on_progress or _noop
     try:
         import pyautogui
@@ -316,6 +512,8 @@ def capture_dragoneye_via_teamviewer(
     if not win:
         raise RuntimeError(f"TeamViewer session failed for id={teamviewer_id}")
 
+    session_title_hint = win.title
+    session_hwnd = win._hWnd
     try:
         win.activate()
         time.sleep(3)
@@ -324,36 +522,75 @@ def capture_dragoneye_via_teamviewer(
 
     time.sleep(6)
 
-    # Remote Ubuntu lock/login: user (dragonadmin) is pre-selected; focus is on
-    # the password field. Do NOT type TV_USERNAME here — that was concatenating
-    # into the password (looked like a huge wrong password) and skipping retries.
+    # Remote Ubuntu lock screen: password field is focused. Type camera password once.
     if camera_passwords:
-        progress(f"OS/camera login ({len(camera_passwords)} password tries)")
+        progress(f"OS login ({len(camera_passwords)} password try)")
         _attempt_os_passwords(pyautogui, camera_passwords, progress)
-        # Optional second stage if DragonCam prompts for dcam after desktop loads.
-        if camera_username:
-            _attempt_app_login(pyautogui, camera_username, camera_passwords, progress)
 
-    progress("Dismissing remote popups…")
-    _dismiss_remote_popups(pyautogui)
+    # Do NOT send Escape or type TV_USERNAME — both break the session / desktop.
+    time.sleep(2)
 
     # Re-resolve session window in case the handle changed after login.
     try:
-        refreshed = _find_session_window(gw, teamviewer_id)
+        refreshed = _find_session_window(gw, teamviewer_id, title_hint=session_title_hint)
         if refreshed is not None:
             win = refreshed
-            win.activate()
-            time.sleep(1)
+            session_hwnd = win._hWnd
+            try:
+                win.activate()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[TV] activate before capture failed: %s", type(exc).__name__)
+            time.sleep(1.5)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[TV] refresh session window failed: %s", type(exc).__name__)
 
     progress("Capturing TeamViewer session…")
+    last_err: Exception | None = None
     try:
-        _capture_window_printwindow(win._hWnd, str(filepath))
-    except Exception as exc:
-        raise RuntimeError(f"TeamViewer screenshot failed: {exc}") from exc
+        for attempt in range(1, 6):
+            try:
+                win = _resolve_capture_window(
+                    teamviewer_id,
+                    title_hint=session_title_hint,
+                    pinned_hwnd=session_hwnd,
+                )
+                session_hwnd = win._hWnd
+                try:
+                    win.activate()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[TV] activate on attempt %s failed: %s", attempt, type(exc).__name__)
+                time.sleep(0.8)
+                left, top, width, height = _hwnd_rect(win._hWnd)
+                logger.info(
+                    "[TV] capture attempt %s hwnd=%s title=%r bounds=%sx%s@%s,%s",
+                    attempt,
+                    win._hWnd,
+                    win.title,
+                    width,
+                    height,
+                    left,
+                    top,
+                )
+                _capture_window_printwindow(win._hWnd, str(filepath))
+                last_err = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                logger.warning(
+                    "[TV] capture attempt %s failed: %s: %s",
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                )
+                time.sleep(2.0)
+        if last_err is not None:
+            raise RuntimeError(f"TeamViewer screenshot failed: {last_err}") from last_err
     finally:
-        _close_session_window(win, teamviewer_id=str(teamviewer_id))
+        _close_session_window(
+            win,
+            teamviewer_id=str(teamviewer_id),
+            session_title_hint=session_title_hint,
+        )
 
     logger.info(
         "[TV] saved path=%s elapsed=%.1fs",

@@ -7,7 +7,7 @@ Django web app for **ASE installation camera audits** at Blue Line Solutions. Op
 | Site type | Stack | Env / inputs |
 |-----------|--------|----------------|
 | **LTI / pole (CBW + VNC)** | Chrome (Selenium) for CBW date/time relay UI; VNC for camera layers | `CBW_USERNAME`, `CBW_PASSWORDS`, `TF_VNC_PASSWORD` |
-| **DragonEye** | TeamViewer to DragonCam; FX serial → TeamViewer ID map | `TV_USERNAME`, `TV_PASSWORD` (or `TEAMVIEWER_PASSWORDS`), CSV upload on dashboard or `DragonEye Teamviewer IDs.csv` in project root (gitignored) |
+| **DragonEye** | TeamViewer to DragonCam; FX serial → TeamViewer ID map | `TV_USERNAME`, `TV_PASSWORD` (comma list: try each for TV connect; **last** entry is the in-session camera login), optional `TEAMVIEWER_PASSWORDS`, CSV upload on dashboard or `DragonEye Teamviewer IDs.csv` in project root (gitignored) |
 
 Chrome is required for CBW captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
 
@@ -40,7 +40,7 @@ See `.env.example` for the full list. Required for production use:
 - **Django:** `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`
 - **IMS:** `IMS_BASE_URL`, `IMS_SSO_CLIENT_ID`, `IMS_SSO_CLIENT_SECRET`, `IMS_API_TOKEN`
 - **LTI captures:** `CBW_USERNAME`, `CBW_PASSWORDS`, `TF_VNC_PASSWORD`
-- **DragonEye:** `TV_USERNAME`, `TV_PASSWORD`
+- **DragonEye:** `TV_USERNAME`, `TV_PASSWORD` (connect tries each comma-separated value; camera login uses the last)
 
 Optional: `IMS_SSO_REDIRECT_URI`, `IMS_TLS_VERIFY=false` (dev only), `DST_LOCAL_ADMIN=1` (break-glass Django admin), `AUDIT_MAX_CONCURRENT`, `AUDIT_STEP_CONCURRENT`, `LOG_LEVEL`, `LOG_FILE`, `LOG_TO_FILE`, `TEAMVIEWER_PATH`.
 
