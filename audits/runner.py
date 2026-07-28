@@ -267,16 +267,20 @@ def _run_de_bundle(job_id: int, pole_number: str, output_dir: Path) -> list[str]
         ]
 
     tv_passwords = list(getattr(settings, "TEAMVIEWER_PASSWORDS", []) or [])
-    cam_passwords = list(getattr(settings, "TV_PASSWORDS", []) or [])
+    cam_passwords = list(getattr(settings, "TV_CAMERA_PASSWORDS", []) or [])
+    if not cam_passwords:
+        # Fallback for older settings without TV_CAMERA_PASSWORDS.
+        legacy = list(getattr(settings, "TV_PASSWORDS", []) or [])
+        cam_passwords = [legacy[-1]] if legacy else list(tv_passwords[-1:] if tv_passwords else [])
     cam_user = getattr(settings, "TV_USERNAME", "") or ""
     tv_path = getattr(settings, "TEAMVIEWER_PATH", "") or ""
 
     if not tv_passwords and not cam_passwords:
         return ["TV_PASSWORD / TEAMVIEWER_PASSWORDS not configured in .env"]
 
-    # Connection passwords fall back to camera passwords (cnoc legacy).
+    # Connection: try each TeamViewer password. Camera login: last TV_PASSWORD only.
     connect_passwords = tv_passwords or cam_passwords
-    login_passwords = cam_passwords or tv_passwords
+    login_passwords = cam_passwords
 
     from audits.models import AuditJob
 

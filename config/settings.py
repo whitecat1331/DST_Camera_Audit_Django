@@ -126,11 +126,16 @@ TV_PASSWORDS = [
     if p.strip().strip("'\"")
 ]
 # Optional separate TeamViewer *connection* passwords; defaults to TV_PASSWORDS.
+# Connection tries each entry until a session opens.
 TEAMVIEWER_PASSWORDS = [
     p.strip().strip("'\"")
     for p in os.getenv("TEAMVIEWER_PASSWORDS", "").split(",")
     if p.strip().strip("'\"")
 ] or list(TV_PASSWORDS)
+# In-session OS / DragonCam login always uses the *last* TV_PASSWORD entry
+# (e.g. TV_PASSWORD='conn1,camLogin' → connect may try both; camera uses camLogin).
+_tv_login_source = TV_PASSWORDS or TEAMVIEWER_PASSWORDS
+TV_CAMERA_PASSWORDS = [_tv_login_source[-1]] if _tv_login_source else []
 TEAMVIEWER_PATH = os.getenv(
     "TEAMVIEWER_PATH",
     r"C:\Program Files\TeamViewer\TeamViewer.exe",
