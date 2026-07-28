@@ -8,7 +8,7 @@
   <p class="error">{{ error }}</p>
   {% endif %}
   {% if ims_configured %}
-  <p><a class="btn-primary" href="{% url 'ims_login_start' %}{% if request.GET.next %}?next={{ request.GET.next|urlencode }}{% endif %}">Sign in with IMS</a></p>
+  <p><a class="btn-primary" href="{{ ims_start_url }}">Sign in with IMS</a></p>
   {% else %}
   <p class="error">IMS SSO is not configured. Set IMS_BASE_URL, IMS_SSO_CLIENT_ID, and IMS_SSO_CLIENT_SECRET.</p>
   {% endif %}
