@@ -650,6 +650,32 @@
     });
   }
 
+  function formatOvrcDcamMessage(data) {
+    const results = data.results || [];
+    if (!results.length) return 'Turn On completed.';
+    const parts = results.map(r => {
+      if (r.action === 'already_on') return `${r.fx}: already on`;
+      if (r.action === 'turned_on') return `${r.fx}: successfully turned on`;
+      return `${r.fx}: ${r.action || 'ok'}`;
+    });
+    const allAlready = results.every(r => r.action === 'already_on');
+    const allTurned = results.every(r => r.action === 'turned_on');
+    if (allAlready) return `Already on.\n\n${parts.join('\n')}`;
+    if (allTurned) return `Successfully turned on.\n\n${parts.join('\n')}`;
+    return `Turn On finished.\n\n${parts.join('\n')}`;
+  }
+
+  function formatRelaysMessage(data, pole) {
+    const names = (data.relays || []).join(', ') || 'relays';
+    if (data.action === 'already_on') {
+      return `Pole ${pole}: already on.\n\n${names}`;
+    }
+    if (data.action === 'turned_on') {
+      return `Pole ${pole}: successfully turned on.\n\n${names}`;
+    }
+    return `Pole ${pole}: relays ON.\n\n${names}`;
+  }
+
   document.querySelectorAll('[data-action="relays"]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const pole = btn.dataset.pole;
@@ -667,13 +693,14 @@
           },
           body: JSON.stringify({ pole_number: pole }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           alert(data.error || 'Relay request failed');
         } else {
           const names = (data.relays || []).join(', ') || 'ok';
           btn.title = 'Relays ON: ' + names;
           btn.textContent = 'On';
+          alert(formatRelaysMessage(data, pole));
           setTimeout(() => { btn.textContent = prev; }, 2000);
         }
       } catch (err) {
@@ -718,8 +745,8 @@
           return `${r.fx}: ${r.action || 'ok'}`;
         });
         btn.title = parts.join('; ') || 'DCAM System OK';
-        const anyTurned = (data.results || []).some(r => r.action === 'turned_on');
-        btn.textContent = anyTurned ? 'On' : 'On';
+        btn.textContent = 'On';
+        alert(formatOvrcDcamMessage(data));
         setTimeout(() => { btn.textContent = prev; }, 2500);
       } catch (err) {
         alert(String(err));

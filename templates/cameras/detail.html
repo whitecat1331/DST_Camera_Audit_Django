@@ -308,8 +308,20 @@
           if (statusEl) statusEl.textContent = data.error || 'Failed';
           return;
         }
-        const parts = (data.results || []).map(r => `${r.fx}: ${r.action}`);
-        if (statusEl) statusEl.textContent = parts.join('; ') || 'Done';
+        const results = data.results || [];
+        const parts = results.map(r => {
+          if (r.action === 'already_on') return `${r.fx}: already on`;
+          if (r.action === 'turned_on') return `${r.fx}: successfully turned on`;
+          return `${r.fx}: ${r.action || 'ok'}`;
+        });
+        const statusText = parts.join('; ') || 'Done';
+        if (statusEl) statusEl.textContent = statusText;
+        const allAlready = results.length && results.every(r => r.action === 'already_on');
+        const allTurned = results.length && results.every(r => r.action === 'turned_on');
+        let popup = 'Turn On finished.\n\n' + parts.join('\n');
+        if (allAlready) popup = 'Already on.\n\n' + parts.join('\n');
+        else if (allTurned) popup = 'Successfully turned on.\n\n' + parts.join('\n');
+        alert(popup || 'Turn On completed.');
       } catch (err) {
         alert(String(err));
       } finally {

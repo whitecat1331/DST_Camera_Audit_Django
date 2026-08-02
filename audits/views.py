@@ -563,7 +563,7 @@ def turn_relays(request):
         return JsonResponse({"error": "pole_number is required"}, status=400)
 
     try:
-        relays = turn_all_relays_on(
+        result = turn_all_relays_on(
             pole_number,
             settings.CBW_USERNAME,
             settings.CBW_PASSWORDS,
@@ -578,12 +578,20 @@ def turn_relays(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
     logger.info(
-        "[AUDIT] relays on pole=%s relays=%s user=%s",
+        "[AUDIT] relays %s pole=%s relays=%s user=%s",
+        result.action,
         pole_number,
-        relays,
+        result.relays,
         request.user.get_username(),
     )
-    return JsonResponse({"ok": True, "pole": pole_number, "relays": relays})
+    return JsonResponse(
+        {
+            "ok": True,
+            "pole": pole_number,
+            "action": result.action,
+            "relays": result.relays,
+        }
+    )
 
 
 @login_required
