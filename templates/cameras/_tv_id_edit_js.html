@@ -1,0 +1,76 @@
+<script>
+(function () {
+  const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+  const TV_ID_URL = "{% url 'update_teamviewer_id' %}";
+
+  async function saveTvId(input) {
+    const fx = (input.dataset.fx || '').trim();
+    const lane = (input.dataset.lane || '').trim();
+    const next = (input.value || '').replace(/\s+/g, '').trim();
+    const original = (input.dataset.original || '').trim();
+    if (!fx) return;
+    if (next === original) {
+      input.classList.remove('tv-dirty', 'tv-error', 'tv-saved');
+      return;
+    }
+    input.classList.remove('tv-error', 'tv-saved');
+    input.classList.add('tv-saving');
+    input.disabled = true;
+    try {
+      const res = await fetch(TV_ID_URL, {
+        method: 'POST',
+        headers: {
+          'X-CSRFToken': csrf,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fx_number: fx,
+          lane: lane,
+          teamviewer_id: next,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        input.classList.add('tv-error');
+        alert(data.error || 'Failed to save TeamViewer ID');
+        input.value = original;
+        return;
+      }
+      const saved = (data.teamviewer_id || '').trim();
+      input.value = saved;
+      input.dataset.original = saved;
+      input.classList.remove('tv-dirty');
+      input.classList.add('tv-saved');
+      setTimeout(() => input.classList.remove('tv-saved'), 1200);
+    } catch (err) {
+      input.classList.add('tv-error');
+      alert(String(err));
+      input.value = original;
+    } finally {
+      input.disabled = false;
+      input.classList.remove('tv-saving');
+    }
+  }
+
+  document.querySelectorAll('.tv-id-input').forEach((input) => {
+    input.addEventListener('input', () => {
+      const cur = (input.value || '').replace(/\s+/g, '').trim();
+      const original = (input.dataset.original || '').trim();
+      input.classList.toggle('tv-dirty', cur !== original);
+      input.classList.remove('tv-error', 'tv-saved');
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        input.blur();
+      } else if (e.key === 'Escape') {
+        input.value = input.dataset.original || '';
+        input.classList.remove('tv-dirty', 'tv-error', 'tv-saved');
+        input.blur();
+      }
+    });
+    input.addEventListener('blur', () => saveTvId(input));
+  });
+})();
+</script>

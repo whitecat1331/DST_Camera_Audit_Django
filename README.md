@@ -7,9 +7,9 @@ Django web app for **ASE installation camera audits** at Blue Line Solutions. Op
 | Site type | Stack | Env / inputs |
 |-----------|--------|----------------|
 | **LTI / pole (CBW + VNC)** | Chrome (Selenium) for CBW date/time relay UI; VNC for camera layers | `CBW_USERNAME`, `CBW_PASSWORDS`, `TF_VNC_PASSWORD` |
-| **DragonEye** | TeamViewer to DragonCam; FX serial → TeamViewer ID map | `TV_USERNAME`, `TV_PASSWORD` (comma list: try each for TV connect; **last** entry is the in-session camera login), optional `TEAMVIEWER_PASSWORDS`, CSV upload on dashboard or `DragonEye Teamviewer IDs.csv` in project root (gitignored) |
+| **DragonEye** | TeamViewer to DragonCam; FX serial → TeamViewer ID map; **OvrC** local date/time + WattBox **DCAM System** Turn On (only if OFF) | `TV_USERNAME`, `TV_PASSWORD` (comma list: try each for TV connect; **last** entry is the in-session camera login), optional `TEAMVIEWER_PASSWORDS`, CSV upload on dashboard or `DragonEye Teamviewer IDs.csv` in project root (gitignored); `OVRC_USERNAME`, `OVRC_PASSWORD` |
 
-Chrome is required for CBW captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
+Chrome is required for CBW and OvrC captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
 
 ## Setup
 
@@ -41,12 +41,13 @@ See `.env.example` for the full list. Required for production use:
 - **IMS:** `IMS_BASE_URL`, `IMS_SSO_CLIENT_ID`, `IMS_SSO_CLIENT_SECRET`, `IMS_API_TOKEN`
 - **LTI captures:** `CBW_USERNAME`, `CBW_PASSWORDS`, `TF_VNC_PASSWORD`
 - **DragonEye:** `TV_USERNAME`, `TV_PASSWORD` (connect tries each comma-separated value; camera login uses the last)
+- **OvrC (FX local time):** `OVRC_USERNAME`, `OVRC_PASSWORD` (optional `OVRC_BASE_URL`)
 
 Optional: `IMS_SSO_REDIRECT_URI`, `IMS_TLS_VERIFY=false` (dev only), `DST_LOCAL_ADMIN=1` (break-glass Django admin), `AUDIT_MAX_CONCURRENT`, `AUDIT_STEP_CONCURRENT`, `LOG_LEVEL`, `LOG_FILE`, `LOG_TO_FILE`, `TEAMVIEWER_PATH`.
 
 ### Logging
 
-Bracket prefixes match sibling apps (`[INIT]`, `[HTTP]`, `[AUTH]`, `[IMS]`, `[SYNC]`, `[AUDIT]`, `[CBW]`, `[VNC]`, `[TV]`, `[DE]`). Default log file: `logs/dst.log` (rotating; directory is gitignored).
+Bracket prefixes match sibling apps (`[INIT]`, `[HTTP]`, `[AUTH]`, `[IMS]`, `[SYNC]`, `[AUDIT]`, `[CBW]`, `[VNC]`, `[TV]`, `[DE]`, `[OVRC]`). Default log file: `logs/dst.log` (rotating; directory is gitignored).
 
 ## Run
 

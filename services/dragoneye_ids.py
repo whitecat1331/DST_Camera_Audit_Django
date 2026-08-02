@@ -127,6 +127,84 @@ def mappings_for_fx(fx_number: str) -> list:
     return list(DragonEyeTeamViewerId.objects.filter(fx_number=fx).order_by("lane"))
 
 
+def upsert_teamviewer_id(
+    *,
+    fx_number: str,
+    lane: str = "",
+    teamviewer_id: str,
+    label: str = "",
+) -> dict:
+    """Create/update/delete one FX(+lane) → TeamViewer ID mapping.
+
+    Empty teamviewer_id deletes the mapping row when present.
+    """
+    from cameras.models import DragonEyeTeamViewerId
+
+    fx = (fx_number or "").strip().upper()
+    lane_norm = (lane or "").strip().upper()
+    tv = re.sub(r"\s+", "", (teamviewer_id or "").strip())
+
+    if not fx or not re.fullmatch(r"FX\d+", fx):
+        raise ValueError("fx_number must look like FX1234")
+    if lane_norm and not re.fullmatch(r"L\d+", lane_norm):
+        raise ValueError("lane must look like L1 or L2")
+
+    existing = DragonEyeTeamViewerId.objects.filter(fx_number=fx, lane=lane_norm).first()
+
+    if not tv:
+        if existing is None:
+            return {
+                "ok": True,
+                "action": "noop",
+                "fx_number": fx,
+                "lane": lane_norm,
+                "teamviewer_id": "",
+            }
+        existing.delete()
+        logger.info("[DE] deleted TeamViewer ID fx=%s lane=%s", fx, lane_norm or "-")
+        return {
+            "ok": True,
+            "action": "deleted",
+            "fx_number": fx,
+            "lane": lane_norm,
+            "teamviewer_id": "",
+        }
+
+    if not tv.isdigit():
+        raise ValueError("TeamViewer ID must be numeric")
+
+    defaults = {
+        "teamviewer_id": tv,
+        "source_filename": "manual-edit",
+    }
+    if label.strip():
+        defaults["label"] = label.strip()[:255]
+    elif existing is None:
+        defaults["label"] = f"{fx} {lane_norm}".strip()
+
+    obj, created = DragonEyeTeamViewerId.objects.update_or_create(
+        fx_number=fx,
+        lane=lane_norm,
+        defaults=defaults,
+    )
+    action = "created" if created else "updated"
+    logger.info(
+        "[DE] %s TeamViewer ID fx=%s lane=%s tv=%s",
+        action,
+        fx,
+        lane_norm or "-",
+        tv,
+    )
+    return {
+        "ok": True,
+        "action": action,
+        "fx_number": obj.fx_number,
+        "lane": obj.lane,
+        "teamviewer_id": obj.teamviewer_id,
+        "thumb_key": obj.thumb_key,
+    }
+
+
 def ensure_default_csv_loaded(base_dir: Path) -> dict[str, int] | None:
     """If DB empty, load project-root DragonEye Teamviewer IDs.csv when present."""
     from cameras.models import DragonEyeTeamViewerId

@@ -6,15 +6,20 @@ class AuditJob(models.Model):
     class DeviceType(models.TextChoices):
         CBW = "cbw", "CBW"
         TF_VNC = "tf_vnc", "TF VNC"
+        VNC_BUNDLE = "vnc_bundle", "VNC L1/L2"
         POLE_BUNDLE = "pole_bundle", "Pole capture (CBW + VNC L1/L2)"
         DE_TV = "de_tv", "DragonEye TeamViewer"
         DE_BUNDLE = "de_bundle", "DragonEye capture (TeamViewer lanes)"
+        OVRC = "ovrc", "OvrC local time"
+        VBE_DAILY = "vbe_daily", "VBE Daily Checks (one site)"
+        VBE_DAILY_ALL = "vbe_daily_all", "VBE Daily Checks (all sites)"
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         RUNNING = "running", "Running"
         SUCCEEDED = "succeeded", "Succeeded"
         FAILED = "failed", "Failed"
+        CANCELLED = "cancelled", "Cancelled"
 
     pole_number = models.CharField(max_length=64, db_index=True)
     target_host = models.CharField(max_length=64, blank=True)

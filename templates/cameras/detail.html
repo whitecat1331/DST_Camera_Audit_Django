@@ -69,17 +69,50 @@
 
     {% if can_audit %}
     <h2>Run audit</h2>
-    <form method="post" action="{% url 'audit_start' %}" class="stack">
+    {% if installation.is_dragoneye %}
+    <div class="stack detail-capture-actions">
+      <button type="button" class="btn-fire" id="detail-tv"
+        data-pole="{% firstof installation.pole_number installation.identifier %}"
+        data-installation-id="{{ installation.pk }}">TV Capture</button>
+      <button type="button" class="btn-secondary" id="detail-ovrc"
+        data-pole="{% firstof installation.pole_number installation.identifier %}"
+        data-installation-id="{{ installation.pk }}"
+        {% if not installation.fx_number %}disabled{% endif %}>OvrC Time</button>
+      {% if installation.is_vbe %}
+      <button type="button" class="btn-daily" id="detail-vbe"
+        data-pole="{% firstof installation.identifier installation.pole_number %}"
+        data-installation-id="{{ installation.pk }}">VBE Check</button>
+      {% endif %}
+      <button type="button" class="btn-secondary" id="detail-ovrc-dcam"
+        title="Turn OvrC WattBox DCAM System ON (only if currently OFF)"
+        data-pole="{% firstof installation.pole_number installation.identifier %}"
+        data-installation-id="{{ installation.pk }}"
+        {% if not installation.fx_number %}disabled{% endif %}>Turn On</button>
+      <p id="detail-capture-status" class="cell-muted" hidden></p>
+    </div>
+    {% else %}
+    <div class="stack detail-capture-actions">
+      <button type="button" class="btn-fire" id="detail-cbw"
+        data-pole="{{ installation.pole_number }}"
+        data-installation-id="{{ installation.pk }}"
+        {% if not installation.pole_number %}disabled{% endif %}>CBW Capture</button>
+      <button type="button" class="btn-fire" id="detail-vnc"
+        data-pole="{{ installation.pole_number }}"
+        data-installation-id="{{ installation.pk }}"
+        {% if not installation.pole_number %}disabled{% endif %}>VNC Capture</button>
+      <p id="detail-capture-status" class="cell-muted" hidden></p>
+    </div>
+    <form method="post" action="{% url 'audit_start' %}" class="stack detail-advanced-audit">
       {% csrf_token %}
       <input type="hidden" name="installation_id" value="{{ installation.pk }}">
       <input type="hidden" name="pole_number" value="{{ installation.pole_number }}">
       <input type="hidden" name="next" value="{% url 'camera_detail' installation.pk %}">
       <label>
-        Device
+        Advanced
         <select name="device_type" required>
           <option value="pole_bundle" selected>Full pole (CBW + VNC L1/L2)</option>
           <option value="cbw">CBW only (Date/Time)</option>
-          <option value="tf_vnc">TF VNC only</option>
+          <option value="tf_vnc">TF VNC only (L1)</option>
         </select>
       </label>
       <label>
@@ -92,6 +125,7 @@
       <button type="submit">Start audit</button>
     </form>
     {% endif %}
+    {% endif %}
   </section>
 </div>
 
@@ -102,7 +136,7 @@
     <section class="device-layer {% if layer.matched %}matched{% endif %}">
       <div class="layer-body">
         <div class="layer-label">{{ layer.label }}</div>
-        <div class="layer-ip"><code>{{ layer.ip|default:"—" }}</code></div>
+        <div class="layer-ip">{% include "cameras/_tv_id_field.html" %}</div>
         {% if layer.ds_number or layer.device %}
         <div class="layer-device">
           <strong>{% firstof layer.display_name layer.ds_number "Device" %}</strong>
@@ -156,4 +190,134 @@
   <h2>Recent audits for this pole</h2>
   {% include "audits/_job_table.html" with jobs=recent_jobs %}
 </section>
+{% endblock %}
+
+{% block extra_js %}
+{% include "cameras/_tv_id_edit_js.html" %}
+<script>
+(function () {
+  const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+  const CAPTURE_URL = "{% url 'capture_pole' %}";
+  const VBE_CHECK_URL = "{% url 'vbe_daily_check' %}";
+  const OVRC_DCAM_URL = "{% url 'turn_ovrc_dcam' %}";
+  const statusEl = document.getElementById('detail-capture-status');
+
+  async function poll(statusUrl) {
+    for (let i = 0; i < 180; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      const res = await fetch(statusUrl, { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent = data.progress || data.message || data.status || 'Running…';
+      }
+      if (data.status === 'succeeded' || data.status === 'failed' || data.status === 'cancelled') {
+        if (data.status === 'failed') {
+          alert(data.error_message || data.message || 'Capture failed');
+        }
+        if (data.status === 'succeeded') {
+          window.location.reload();
+        }
+        return;
+      }
+    }
+    alert('Timed out waiting for status');
+  }
+
+  async function startMode(btn, mode, url) {
+    if (!btn || btn.disabled) return;
+    const pole = btn.dataset.pole || '';
+    const installationId = btn.dataset.installationId || '';
+    const idle = btn.textContent.trim();
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      const payload = { mode };
+      if (pole) payload.pole_number = pole;
+      if (installationId) payload.installation_id = installationId;
+      const res = await fetch(url || CAPTURE_URL, {
+        method: 'POST',
+        headers: {
+          'X-CSRFToken': csrf,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(mode === 'vbe' ? { installation_id: installationId } : payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(data.error || 'Failed to start');
+        btn.disabled = false;
+        btn.textContent = idle;
+        return;
+      }
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent = 'Starting…';
+      }
+      await poll(data.status_url);
+      btn.disabled = false;
+      btn.textContent = idle;
+    } catch (err) {
+      alert(String(err));
+      btn.disabled = false;
+      btn.textContent = idle;
+    }
+  }
+
+  const tv = document.getElementById('detail-tv');
+  if (tv) tv.addEventListener('click', () => startMode(tv, 'tv'));
+  const ovrc = document.getElementById('detail-ovrc');
+  if (ovrc) ovrc.addEventListener('click', () => startMode(ovrc, 'ovrc'));
+  const vbe = document.getElementById('detail-vbe');
+  if (vbe) vbe.addEventListener('click', () => startMode(vbe, 'vbe', VBE_CHECK_URL));
+  const cbw = document.getElementById('detail-cbw');
+  if (cbw) cbw.addEventListener('click', () => startMode(cbw, 'cbw'));
+  const vnc = document.getElementById('detail-vnc');
+  if (vnc) vnc.addEventListener('click', () => startMode(vnc, 'vnc'));
+
+  const dcam = document.getElementById('detail-ovrc-dcam');
+  if (dcam) {
+    dcam.addEventListener('click', async () => {
+      const pole = dcam.dataset.pole || '';
+      const installationId = dcam.dataset.installationId || '';
+      const idle = dcam.textContent.trim();
+      dcam.disabled = true;
+      dcam.textContent = '…';
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent = 'OvrC DCAM Turn On…';
+      }
+      try {
+        const payload = {};
+        if (pole) payload.pole_number = pole;
+        if (installationId) payload.installation_id = installationId;
+        const res = await fetch(OVRC_DCAM_URL, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': csrf,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(data.error || 'OvrC Turn On failed');
+          if (statusEl) statusEl.textContent = data.error || 'Failed';
+          return;
+        }
+        const parts = (data.results || []).map(r => `${r.fx}: ${r.action}`);
+        if (statusEl) statusEl.textContent = parts.join('; ') || 'Done';
+      } catch (err) {
+        alert(String(err));
+      } finally {
+        dcam.disabled = false;
+        dcam.textContent = idle;
+      }
+    });
+  }
+})();
+</script>
 {% endblock %}

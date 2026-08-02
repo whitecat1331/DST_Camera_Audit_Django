@@ -32,7 +32,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "cameras",
-    "audits",
+    "audits.apps.AuditsConfig",
 ]
 
 MIDDLEWARE = [
@@ -140,6 +140,17 @@ TEAMVIEWER_PATH = os.getenv(
     "TEAMVIEWER_PATH",
     r"C:\Program Files\TeamViewer\TeamViewer.exe",
 )
+
+# OvrC portal — FX customer dashboard local date/time (Selenium)
+OVRC_USERNAME = (os.getenv("OVRC_USERNAME", "") or "").strip().strip("'\"")
+OVRC_PASSWORD = (os.getenv("OVRC_PASSWORD", "") or "").strip().strip("'\"")
+OVRC_BASE_URL = (
+    os.getenv("OVRC_BASE_URL", "https://app.ovrc.com") or "https://app.ovrc.com"
+).rstrip("/")
+
+# VBE Daily Checks export root (OneDrive / shared folder).
+# Example: C:\Users\<you>\Blue Line Solutions, LLC\VBE Daily Checks
+VBE_DAILY_CHECKS_ROOT = os.getenv("VBE_DAILY_CHECKS_ROOT", "")
 
 AUDIT_MAX_CONCURRENT = int(os.getenv("AUDIT_MAX_CONCURRENT", "2"))
 # Parallel CBW + VNC lane captures within a single pole_bundle job.

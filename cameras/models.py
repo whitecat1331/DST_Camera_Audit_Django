@@ -83,21 +83,48 @@ class Installation(models.Model):
     @property
     def is_dragoneye(self) -> bool:
         platform = (self.primary_platform or "").strip().upper()
-        if platform in {"DE", "DRAGONEYE", "DRAGON EYE"}:
+        # VBE parents host DragonEye (FX) cameras on child enclosures.
+        if platform in {"DE", "DRAGONEYE", "DRAGON EYE", "VBE"}:
             return True
         vendor = (self.vendor or "").strip().lower()
         return "dragoneye" in vendor or "dragon eye" in vendor
 
     @property
+    def is_vbe(self) -> bool:
+        platform = (self.primary_platform or "").strip().upper()
+        if platform == "VBE":
+            return True
+        ident = (self.identifier or "").strip().upper()
+        return ident.startswith("I-VBE-") or ident.startswith("VBE")
+
+    @property
     def fx_number(self) -> str | None:
-        """Normalize serial / camera fields to FX#### when present."""
+        """First FX#### found on this installation (serial / cameras / identifier)."""
+        numbers = self.fx_numbers
+        return numbers[0] if numbers else None
+
+    @property
+    def fx_numbers(self) -> list[str]:
+        """All distinct FX#### values from serial, cameras, identifier, and devices."""
         import re
 
-        for raw in (self.serial_number, self.camera_a, self.camera_b, self.identifier):
-            m = re.search(r"(FX\d+)", (raw or "").upper())
-            if m:
-                return m.group(1)
-        return None
+        found: list[str] = []
+        seen: set[str] = set()
+
+        def add_from(raw: str | None) -> None:
+            for m in re.finditer(r"(FX\d+)", (raw or "").upper()):
+                fx = m.group(1)
+                if fx not in seen:
+                    seen.add(fx)
+                    found.append(fx)
+
+        for raw in (self.serial_number, self.camera_a, self.camera_b, self.camera_c, self.identifier):
+            add_from(raw)
+        if self.pk:
+            for d in self.devices.all():
+                add_from(d.unit_serial)
+                add_from(d.name)
+        return found
 
 
 class DragonEyeTeamViewerId(models.Model):
