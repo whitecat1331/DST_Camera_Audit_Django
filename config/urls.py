@@ -3,6 +3,7 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
+from audits import explorer_views
 from cameras import auth_views, views as camera_views
 
 urlpatterns = [
@@ -14,6 +15,8 @@ urlpatterns = [
     path("", camera_views.dashboard, name="dashboard"),
     path("cameras/", include("cameras.urls")),
     path("audits/", include("audits.urls")),
+    path("explorer/", explorer_views.capture_explorer, name="capture_explorer"),
+    path("explorer/file/", explorer_views.capture_explorer_file, name="capture_explorer_file"),
     path("map/", camera_views.camera_map, name="map"),
     path("sync/", camera_views.sync_installations_view, name="sync_installations"),
     path(
