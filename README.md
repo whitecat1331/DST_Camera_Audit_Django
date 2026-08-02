@@ -9,6 +9,16 @@ Django web app for **ASE installation camera audits** at Blue Line Solutions. Op
 | **LTI / pole (CBW + VNC)** | Chrome (Selenium) for CBW date/time relay UI; VNC for camera layers | `CBW_USERNAME`, `CBW_PASSWORDS`, `TF_VNC_PASSWORD` |
 | **DragonEye** | TeamViewer to DragonCam; FX serial → TeamViewer ID map; **OvrC** local date/time + WattBox **DCAM System** Turn On (only if OFF) | `TV_USERNAME`, `TV_PASSWORD` (comma list: try each for TV connect; **last** entry is the in-session camera login), optional `TEAMVIEWER_PASSWORDS`, CSV upload on dashboard or `DragonEye Teamviewer IDs.csv` in project root (gitignored); `OVRC_USERNAME`, `OVRC_PASSWORD` |
 
+### DST Audit (fleet)
+
+`/audits/dst/` orchestrates a full DST timezone audit for **selected** sites (checkboxes on the eligible list; Select all / LTI only / DE only helpers):
+
+1. **Power on** selected sites (CBW relays for LTI; OvrC WattBox DCAM for DE/FX)
+2. **Settle** wait (`DST_POWER_SETTLE_SECONDS`, default 90s) for cameras to boot
+3. **Capture** each selected site — LTI: CBW + VNC; DE/FX: TeamViewer + OvrC — and record a **wall-clock timestamp** per screenshot (`capture_timestamps.txt` + UI)
+
+Compare device clocks in the screenshots to the capture timestamps (LTI: CBW ≈ VNC ≈ wall time; DE/FX: TeamViewer ≈ OvrC ≈ wall time). Progress bars and cancel are on the DST Audit page; terminal logs use `[DST]` / `[AUDIT]`.
+
 Chrome is required for CBW and OvrC captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
 
 ## Setup
@@ -43,11 +53,11 @@ See `.env.example` for the full list. Required for production use:
 - **DragonEye:** `TV_USERNAME`, `TV_PASSWORD` (connect tries each comma-separated value; camera login uses the last)
 - **OvrC (FX local time):** `OVRC_USERNAME`, `OVRC_PASSWORD` (optional `OVRC_BASE_URL`)
 
-Optional: `IMS_SSO_REDIRECT_URI`, `IMS_TLS_VERIFY=false` (dev only), `DST_LOCAL_ADMIN=1` (break-glass Django admin), `AUDIT_MAX_CONCURRENT`, `AUDIT_STEP_CONCURRENT`, `LOG_LEVEL`, `LOG_FILE`, `LOG_TO_FILE`, `TEAMVIEWER_PATH`.
+Optional: `IMS_SSO_REDIRECT_URI`, `IMS_TLS_VERIFY=false` (dev only), `DST_LOCAL_ADMIN=1` (break-glass Django admin), `AUDIT_MAX_CONCURRENT`, `AUDIT_STEP_CONCURRENT`, `DST_POWER_SETTLE_SECONDS`, `LOG_LEVEL`, `LOG_FILE`, `LOG_TO_FILE`, `TEAMVIEWER_PATH`.
 
 ### Logging
 
-Bracket prefixes match sibling apps (`[INIT]`, `[HTTP]`, `[AUTH]`, `[IMS]`, `[SYNC]`, `[AUDIT]`, `[CBW]`, `[VNC]`, `[TV]`, `[DE]`, `[OVRC]`). Default log file: `logs/dst.log` (rotating; directory is gitignored).
+Bracket prefixes match sibling apps (`[INIT]`, `[HTTP]`, `[AUTH]`, `[IMS]`, `[SYNC]`, `[AUDIT]`, `[DST]`, `[CBW]`, `[VNC]`, `[TV]`, `[DE]`, `[OVRC]`). Default log file: `logs/dst.log` (rotating; directory is gitignored).
 
 ## Run
 
@@ -74,6 +84,7 @@ Open http://127.0.0.1:8000/ and **Sign in with IMS**.
 | `/cameras/<id>/` | Detail, audit controls |
 | `/map/` | Folium map |
 | `/audits/`, `/audits/<id>/` | Job list and status + screenshots |
+| `/audits/dst/` | DST Audit orchestration (power-on → capture + timestamps) |
 | `/sync/` | POST re-sync from IMS |
 | `/accounts/ims/start/`, `/accounts/ims/callback/` | IMS SSO |
 
