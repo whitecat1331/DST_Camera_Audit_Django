@@ -6,20 +6,58 @@
 <p class="lede">
   <span class="badge status-{{ job.status }}">{{ job.get_status_display }}</span>
   {{ job.get_device_type_display }} · pole {{ job.pole_number }} · <code>{{ job.target_host }}</code>
+  {% if job.device_type == "dst_audit" %}
+  · <a href="{% url 'dst_audit' %}?job={{ job.pk }}">Open DST Audit console</a>
+  {% endif %}
 </p>
 
+{% if progress_display %}
+<p class="dst-message">{{ progress_display }}</p>
+{% endif %}
+
 <dl class="kv">
-  <dt>Created</dt><dd>{{ job.created_at }}{% if job.created_by %} by {{ job.created_by.username }}{% endif %}</dd>
-  <dt>Started</dt><dd>{{ job.started_at|default:"—" }}</dd>
-  <dt>Finished</dt><dd>{{ job.finished_at|default:"—" }}</dd>
+  <dt>Created</dt><dd>{{ created_est|default:job.created_at }}{% if job.created_by %} by {{ job.created_by.username }}{% endif %}</dd>
+  <dt>Started</dt><dd>{{ started_est|default:job.started_at|default:"—" }}</dd>
+  <dt>Finished</dt><dd>{{ finished_est|default:job.finished_at|default:"—" }}</dd>
+  {% if ovrc_timestamp %}
+  <dt>OvrC device time</dt><dd><code>{{ ovrc_timestamp }}</code></dd>
+  {% endif %}
+  {% if job.parent_job_id %}
+  <dt>Parent</dt><dd><a href="{% url 'audit_detail' job.parent_job_id %}">Audit #{{ job.parent_job_id }}</a></dd>
+  {% endif %}
   {% if job.error_message %}
   <dt>Error</dt><dd class="error">{{ job.error_message }}</dd>
   {% endif %}
 </dl>
 
 {% if job.status == "pending" or job.status == "running" %}
-<p class="lede">Job still running — refresh this page for updates.</p>
+<div class="dst-actions dst-detail-actions">
+  <button type="button" class="btn-danger" id="job-cancel-btn">Cancel</button>
+</div>
+<p class="lede">Job still running — this page refreshes every 5s. Prefer the <a href="{% url 'dst_audit' %}?job={{ job.pk }}">DST Audit console</a> for live progress.</p>
 <meta http-equiv="refresh" content="5">
+{% endif %}
+
+{% if job.device_type == "dst_audit" %}
+<section>
+  <h2>Installations audited</h2>
+  <p class="lede muted">Open a site to view its captures.</p>
+  <ul class="dst-recent">
+    {% for child in job.child_jobs.all %}
+    <li>
+      <a href="{% url 'audit_detail' child.pk %}" class="dst-recent-link">
+        <span class="dst-recent-id">#{{ child.pk }}</span>
+        <span class="dst-recent-site">{{ child.pole_number }}</span>
+        <span class="badge kind-{{ child.target_host }}">{{ child.target_host|upper }}</span>
+        <span class="badge status-{{ child.status }}">{{ child.get_status_display }}</span>
+        <span class="muted">{% if child.error_message %}Done with warnings{% elif child.status == "succeeded" %}Done{% else %}{{ child.progress_message }}{% endif %}</span>
+      </a>
+    </li>
+    {% empty %}
+    <li class="muted">No site jobs yet.</li>
+    {% endfor %}
+  </ul>
+</section>
 {% endif %}
 
 <section>
@@ -27,14 +65,72 @@
   <div class="shot-grid">
     {% for shot in job.screenshots.all %}
     <figure class="shot">
-      <a href="{{ shot.image.url }}" target="_blank" rel="noopener">
+      <button type="button" class="thumb-btn shot-thumb-btn" data-full="{{ shot.image.url }}" title="Expand {{ shot.label }}">
         <img src="{{ shot.image.url }}" alt="{{ shot.label }}">
-      </a>
-      <figcaption>{{ shot.label }}</figcaption>
+      </button>
+      <figcaption>
+        {{ shot.label }}
+        {% if not hide_shot_timestamps %}
+        <span class="shot-ts">{{ shot.created_at|date:"Y-m-d H:i:s T" }}</span>
+        {% endif %}
+      </figcaption>
     </figure>
     {% empty %}
     <p>No screenshots yet.</p>
     {% endfor %}
   </div>
 </section>
+
+<dialog id="thumb-modal" class="thumb-modal">
+  <form method="dialog"><button class="modal-close" value="close" aria-label="Close">×</button></form>
+  <img id="thumb-modal-img" alt="Capture preview">
+</dialog>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  const modal = document.getElementById("thumb-modal");
+  const modalImg = document.getElementById("thumb-modal-img");
+  if (modal && modalImg) {
+    document.querySelectorAll(".thumb-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        modalImg.src = btn.dataset.full || "";
+        modalImg.alt = btn.title || "Capture preview";
+        modal.showModal();
+      });
+    });
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) modal.close();
+    });
+  }
+})();
+</script>
+{% if job.status == "pending" or job.status == "running" %}
+<script>
+(function () {
+  const btn = document.getElementById("job-cancel-btn");
+  if (!btn) return;
+  const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  btn.addEventListener("click", async () => {
+    if (!confirm("Cancel this audit job?")) return;
+    btn.disabled = true;
+    btn.textContent = "Cancelling…";
+    try {
+      const res = await fetch("{% url 'audit_cancel' pk=job.pk %}", {
+        method: "POST",
+        headers: { "X-CSRFToken": CSRF, Accept: "application/json" },
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "cancel failed");
+      location.reload();
+    } catch (err) {
+      alert(err.message);
+      btn.disabled = false;
+      btn.textContent = "Cancel";
+    }
+  });
+})();
+</script>
+{% endif %}
 {% endblock %}

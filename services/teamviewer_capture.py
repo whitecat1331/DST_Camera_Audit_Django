@@ -360,10 +360,96 @@ def _type_secret(pyautogui, text: str) -> None:
     pyautogui.write(str(text), interval=0.05)
 
 
+def _grab_session_image(hwnd) -> Image.Image | None:
+    """Fast on-screen grab of a TeamViewer session window (for reconnect checks)."""
+    left, top, width, height = _hwnd_rect(hwnd)
+    if width < 80 or height < 80:
+        return None
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        return None
+    bbox = (left, top, left + width, top + height)
+    try:
+        return ImageGrab.grab(bbox=bbox, all_screens=True)
+    except TypeError:
+        return ImageGrab.grab(bbox=bbox)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[TV] session grab failed: %s", type(exc).__name__)
+        return None
+
+
+def _looks_like_reconnect_dialog(img: Image.Image) -> bool:
+    """Heuristic: TeamViewer 'connection lost' card is a bright white centered panel."""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    if w < 100 or h < 100:
+        return False
+    crop = rgb.crop((int(w * 0.28), int(h * 0.32), int(w * 0.72), int(h * 0.68)))
+    pixels = list(crop.getdata())
+    if not pixels:
+        return False
+    bright = sum(1 for r, g, b in pixels if r >= 235 and g >= 235 and b >= 235)
+    return (bright / len(pixels)) >= 0.22
+
+
+def _focus_remote_desktop(pyautogui, hwnd) -> None:
+    """Click into the remote desktop area so the Ubuntu lock-screen field gets focus."""
+    left, top, width, height = _hwnd_rect(hwnd)
+    if width < 80 or height < 80:
+        return
+    # Skip TeamViewer chrome (title + toolbar); click mid-lower remote content.
+    x = left + width // 2
+    y = top + int(height * 0.58)
+    try:
+        pyautogui.click(x, y)
+        time.sleep(0.35)
+        # Second click near typical password-field band on GNOME lock screens.
+        pyautogui.click(x, top + int(height * 0.72))
+        time.sleep(0.35)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[TV] focus click failed: %s", type(exc).__name__)
+
+
+def _wait_until_session_interactive(
+    hwnd,
+    should_cancel: CancelFn | None,
+    *,
+    timeout_sec: float = 50,
+    progress: ProgressFn | None = None,
+) -> bool:
+    """Wait out TeamViewer 'connection lost / reconnecting' overlays."""
+    deadline = time.time() + timeout_sec
+    saw_dialog = False
+    while time.time() < deadline:
+        if should_cancel and should_cancel():
+            raise CaptureCancelled("TeamViewer capture cancelled")
+        if not ctypes.windll.user32.IsWindow(hwnd):
+            return False
+        img = _grab_session_image(hwnd)
+        if img is not None and _looks_like_reconnect_dialog(img):
+            saw_dialog = True
+            if progress:
+                progress("Waiting for TeamViewer reconnect…")
+            logger.info("[TV] reconnect dialog detected — waiting")
+            _sleep_cancellable(2.0, should_cancel)
+            continue
+        if img is not None:
+            if saw_dialog:
+                logger.info("[TV] reconnect dialog cleared")
+                _sleep_cancellable(1.5, should_cancel)
+            return True
+        _sleep_cancellable(1.0, should_cancel)
+    logger.warning("[TV] session still not interactive after %.0fs", timeout_sec)
+    return False
+
+
 def _attempt_os_passwords(
     pyautogui,
     passwords: list[str],
     progress: ProgressFn,
+    *,
+    hwnd: int | None = None,
 ) -> None:
     """Type the camera/OS password on the Ubuntu lock-screen password field."""
     if not passwords:
@@ -372,10 +458,12 @@ def _attempt_os_passwords(
         progress(f"Login password {idx}/{len(passwords)}")
         logger.info("[TV] login password attempt %s/%s len=%s", idx, len(passwords), len(cam_pwd))
         try:
+            if hwnd is not None:
+                _focus_remote_desktop(pyautogui, hwnd)
             _clear_password_field(pyautogui)
             _type_secret(pyautogui, cam_pwd)
             pyautogui.press("enter")
-            time.sleep(5)
+            time.sleep(7)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[TV] password attempt %s failed: %s", idx, type(exc).__name__)
 
@@ -585,17 +673,43 @@ def capture_dragoneye_via_teamviewer(
         except Exception as exc:  # noqa: BLE001
             logger.warning("[TV] activate failed: %s", type(exc).__name__)
 
-        _sleep_cancellable(6, should_cancel)
+        progress("Waiting for remote session to stabilize…")
+        if not _wait_until_session_interactive(
+            session_hwnd,
+            should_cancel,
+            timeout_sec=55,
+            progress=progress,
+        ):
+            raise RuntimeError(
+                f"TeamViewer session unstable (reconnect) for id={teamviewer_id}"
+            )
 
-        # Remote Ubuntu lock screen: password field is focused. Type camera password once.
+        _focus_remote_desktop(pyautogui, session_hwnd)
+        _sleep_cancellable(1.5, should_cancel)
+
+        # Remote Ubuntu lock screen: wake field, then try OS passwords (preferred last first).
         if camera_passwords:
             if _cancelled():
                 raise CaptureCancelled("TeamViewer capture cancelled")
             progress(f"OS login ({len(camera_passwords)} password try)")
-            _attempt_os_passwords(pyautogui, camera_passwords, progress)
+            _attempt_os_passwords(
+                pyautogui,
+                camera_passwords,
+                progress,
+                hwnd=session_hwnd,
+            )
 
         # Do NOT send Escape or type TV_USERNAME — both break the session / desktop.
-        _sleep_cancellable(2, should_cancel)
+        _sleep_cancellable(3, should_cancel)
+
+        # Login / unlock can drop the TeamViewer stream briefly — wait it out.
+        progress("Waiting after OS login…")
+        _wait_until_session_interactive(
+            session_hwnd,
+            should_cancel,
+            timeout_sec=40,
+            progress=progress,
+        )
 
         # Re-resolve session window in case the handle changed after login.
         try:
@@ -644,6 +758,15 @@ def capture_dragoneye_via_teamviewer(
                     top,
                 )
                 _capture_window_printwindow(win._hWnd, str(filepath))
+                # Reject captures that still show the reconnect overlay.
+                try:
+                    saved = Image.open(filepath)
+                    if _looks_like_reconnect_dialog(saved):
+                        raise RuntimeError("capture still shows TeamViewer reconnect dialog")
+                except RuntimeError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[TV] post-capture check skipped: %s", type(exc).__name__)
                 last_err = None
                 break
             except CaptureCancelled:

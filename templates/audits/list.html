@@ -3,6 +3,11 @@
 {% block content %}
 <h1>Audit jobs</h1>
 
+<p class="lede">
+  For the full fleet timezone audit (power on → capture with timestamps), use
+  <a href="{% url 'dst_audit' %}">DST Audit</a>.
+</p>
+
 {% if can_audit %}
 <section class="panel">
   <h2>Start audit</h2>

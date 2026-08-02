@@ -13,8 +13,11 @@ class AuditsConfig(AppConfig):
     name = "audits"
 
     def ready(self) -> None:
-        # Django runserver spawns a parent + child; only reap once in the child.
-        if "runserver" in sys.argv and os.environ.get("RUN_MAIN") != "true":
+        # Only reap in the runserver reloader child — never from shell/migrate/check
+        # (those would mark live runserver jobs as failed).
+        if "runserver" not in sys.argv:
+            return
+        if os.environ.get("RUN_MAIN") != "true":
             return
 
         def _reap() -> None:

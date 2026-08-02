@@ -13,6 +13,8 @@ class AuditJob(models.Model):
         OVRC = "ovrc", "OvrC local time"
         VBE_DAILY = "vbe_daily", "VBE Daily Checks (one site)"
         VBE_DAILY_ALL = "vbe_daily_all", "VBE Daily Checks (all sites)"
+        DST_AUDIT = "dst_audit", "DST Audit (all sites)"
+        DST_SITE = "dst_site", "DST Audit (one site)"
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -38,6 +40,13 @@ class AuditJob(models.Model):
         null=True,
         blank=True,
         related_name="audit_jobs",
+    )
+    parent_job = models.ForeignKey(
+        "self",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="child_jobs",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)

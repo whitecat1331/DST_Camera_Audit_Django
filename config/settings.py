@@ -132,10 +132,16 @@ TEAMVIEWER_PASSWORDS = [
     for p in os.getenv("TEAMVIEWER_PASSWORDS", "").split(",")
     if p.strip().strip("'\"")
 ] or list(TV_PASSWORDS)
-# In-session OS / DragonCam login always uses the *last* TV_PASSWORD entry
-# (e.g. TV_PASSWORD='conn1,camLogin' → connect may try both; camera uses camLogin).
+# In-session OS login: prefer the *last* TV_PASSWORD entry, then try the rest
+# (e.g. TV_PASSWORD='tvConn,osLogin' → connect tries both; OS tries osLogin then tvConn).
 _tv_login_source = TV_PASSWORDS or TEAMVIEWER_PASSWORDS
-TV_CAMERA_PASSWORDS = [_tv_login_source[-1]] if _tv_login_source else []
+if _tv_login_source:
+    _preferred_login = _tv_login_source[-1]
+    TV_CAMERA_PASSWORDS = [_preferred_login] + [
+        p for p in _tv_login_source if p != _preferred_login
+    ]
+else:
+    TV_CAMERA_PASSWORDS = []
 TEAMVIEWER_PATH = os.getenv(
     "TEAMVIEWER_PATH",
     r"C:\Program Files\TeamViewer\TeamViewer.exe",
@@ -155,6 +161,10 @@ VBE_DAILY_CHECKS_ROOT = os.getenv("VBE_DAILY_CHECKS_ROOT", "")
 AUDIT_MAX_CONCURRENT = int(os.getenv("AUDIT_MAX_CONCURRENT", "2"))
 # Parallel CBW + VNC lane captures within a single pole_bundle job.
 AUDIT_STEP_CONCURRENT = int(os.getenv("AUDIT_STEP_CONCURRENT", "3"))
+# Max seconds a queued job will wait for a free worker slot.
+AUDIT_SLOT_WAIT_SECONDS = int(os.getenv("AUDIT_SLOT_WAIT_SECONDS", "300"))
+# After DST Audit turns cameras on, wait before starting captures (boot settle).
+DST_POWER_SETTLE_SECONDS = int(os.getenv("DST_POWER_SETTLE_SECONDS", "90"))
 
 from config.logging import build_logging_config  # noqa: E402
 
