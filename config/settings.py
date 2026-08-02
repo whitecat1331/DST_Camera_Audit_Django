@@ -32,7 +32,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "cameras",
-    "audits",
+    "audits.apps.AuditsConfig",
 ]
 
 MIDDLEWARE = [
