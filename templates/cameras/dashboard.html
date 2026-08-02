@@ -25,25 +25,19 @@
   </div>
 </div>
 
-<p class="lede"><a href="{% url 'camera_list' %}">Browse installations →</a></p>
-
-{% if can_sync %}
-<form method="post" action="{% url 'sync_installations' %}" class="filters">
-  {% csrf_token %}
-  <button type="submit">Sync from IMS</button>
-  {% if last_sync %}<span class="lede">Last sync: {{ last_sync }}{% if sync_counts %} ({{ sync_counts }}){% endif %}</span>{% endif %}
-</form>
-{% elif last_sync %}
-<p class="lede">Last IMS sync: {{ last_sync }}</p>
-{% endif %}
+<p class="lede">
+  <a href="{% url 'camera_list' %}">Browse installations →</a>
+  · <a href="{% url 'capture_explorer' %}">Open captures explorer →</a>
+</p>
 
 {% if can_audit %}
 <section class="panel">
   <h2>DragonEye TeamViewer IDs</h2>
   <p class="lede">
     Upload <code>DragonEye Teamviewer IDs.csv</code> to map each FX serial to its TeamViewer ID
-    (and L1/L2 lanes). Capture on DE sites uses this table, then logs into DragonCam with
-    <code>TV_USERNAME</code> / <code>TV_PASSWORD</code> from <code>.env</code>.
+    (and L1/L2 lanes), or edit IDs directly on installation TeamViewer layers.
+    FX cards expose <strong>TV</strong>, <strong>OvrC</strong>, and (for VBE sites) <strong>VBE</strong> capture buttons.
+    TV uses <code>TV_USERNAME</code> / <code>TV_PASSWORD</code>; OvrC uses <code>OVRC_USERNAME</code> / <code>OVRC_PASSWORD</code>.
   </p>
   <form method="post" action="{% url 'upload_dragoneye_tv_csv' %}" enctype="multipart/form-data" class="filters">
     {% csrf_token %}
