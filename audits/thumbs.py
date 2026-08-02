@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
+from django.db.models import Max
+
 from audits.models import AuditJob, AuditScreenshot
 
 THUMB_LABELS = ("cbw", "vnc_l1", "vnc_l2", "de_tv", "de_l1", "de_l2", "de_l3")
@@ -12,6 +16,8 @@ def normalize_thumb_label(shot: AuditScreenshot) -> str | None:
     if label in THUMB_LABELS:
         return label
     if label.startswith("de_l") and label[4:].isdigit():
+        return label
+    if label.startswith("ovrc_"):
         return label
     if label in {"date_time", "date/time"}:
         return "cbw"
@@ -45,3 +51,21 @@ def latest_thumbs_for_poles(poles: list[str]) -> dict[str, dict[str, AuditScreen
         if key and key not in out[pole]:
             out[pole][key] = shot
     return out
+
+
+def latest_vbe_check_at_for_keys(keys: list[str]) -> dict[str, datetime]:
+    """Return {identifier_or_pole: finished_at} for the latest succeeded VBE Daily Check."""
+    keys = [k.strip() for k in keys if (k or "").strip()]
+    if not keys:
+        return {}
+    rows = (
+        AuditJob.objects.filter(
+            device_type=AuditJob.DeviceType.VBE_DAILY,
+            status=AuditJob.Status.SUCCEEDED,
+            pole_number__in=keys,
+            finished_at__isnull=False,
+        )
+        .values("pole_number")
+        .annotate(last=Max("finished_at"))
+    )
+    return {row["pole_number"]: row["last"] for row in rows if row["last"]}
