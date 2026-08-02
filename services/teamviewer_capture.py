@@ -16,8 +16,13 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[str], None]
+CancelFn = Callable[[], bool]
 
 DEFAULT_TEAMVIEWER_PATH = r"C:\Program Files\TeamViewer\TeamViewer.exe"
+
+
+class CaptureCancelled(Exception):
+    """Raised when an audit cancel was requested mid-TeamViewer capture."""
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -96,10 +101,13 @@ def _hwnd_area(hwnd) -> int:
     return max(0, width) * max(0, height)
 
 
-def _enum_session_windows(teamviewer_id: str) -> list[tuple[int, str, int]]:
-    """Enumerate visible TeamViewer remote-session top-level windows."""
+def _enum_session_windows(teamviewer_id: str = "") -> list[tuple[int, str, int]]:
+    """Enumerate visible TeamViewer remote-session top-level windows.
+
+    When teamviewer_id is empty, returns every remote session window.
+    """
     user32 = ctypes.windll.user32
-    clean_id = str(teamviewer_id).replace(" ", "")
+    clean_id = str(teamviewer_id or "").replace(" ", "")
     found: list[tuple[int, str, int]] = []
 
     def _callback(hwnd, _lp):
@@ -112,7 +120,9 @@ def _enum_session_windows(teamviewer_id: str) -> list[tuple[int, str, int]]:
         if "teamviewer" not in lowered:
             return True
         # Remote session windows look like "<host> - TeamViewer".
-        is_session = " - teamviewer" in lowered or clean_id in title.replace(" ", "")
+        is_session = " - teamviewer" in lowered
+        if clean_id:
+            is_session = is_session or clean_id in title.replace(" ", "")
         if not is_session:
             return True
         found.append((hwnd, title, _hwnd_area(hwnd)))
@@ -370,6 +380,49 @@ def _attempt_os_passwords(
             logger.warning("[TV] password attempt %s failed: %s", idx, type(exc).__name__)
 
 
+def _sleep_cancellable(seconds: float, should_cancel: CancelFn | None, *, chunk: float = 0.4) -> None:
+    """Sleep in short chunks so cancel can interrupt long waits."""
+    if seconds <= 0:
+        return
+    deadline = time.time() + seconds
+    while True:
+        if should_cancel and should_cancel():
+            raise CaptureCancelled("TeamViewer capture cancelled")
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(chunk, remaining))
+
+
+def cleanup_teamviewer_ui(*, teamviewer_id: str | None = None) -> int:
+    """Best-effort close remote sessions and session-note dialogs.
+
+    Used on cancel / teardown. Returns number of session windows closed.
+    """
+    user32 = ctypes.windll.user32
+    WM_CLOSE = 0x0010
+    closed = 0
+    windows = _enum_session_windows(teamviewer_id or "")
+    for hwnd, title, _area in windows:
+        try:
+            if user32.IsWindow(hwnd):
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                closed += 1
+                logger.info("[TV] cleanup closed session hwnd=%s title=%r", hwnd, title)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[TV] cleanup close failed: %s", type(exc).__name__)
+    try:
+        _close_session_notes(
+            teamviewer_id=teamviewer_id,
+            timeout_sec=6,
+            session_title_hint="",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[TV] cleanup notes failed: %s", type(exc).__name__)
+    logger.info("[TV] cleanup done closed=%s id=%r", closed, teamviewer_id)
+    return closed
+
+
 def _close_session_window(win, teamviewer_id: str | None = None, *, session_title_hint: str = "") -> None:
     if win is not None:
         try:
@@ -446,10 +499,15 @@ def capture_dragoneye_via_teamviewer(
     teamviewer_path: str = DEFAULT_TEAMVIEWER_PATH,
     wait_for_connection_sec: int = 60,
     on_progress: ProgressFn | None = None,
+    should_cancel: CancelFn | None = None,
 ) -> Path:
     """Connect TeamViewer → OS login (if needed) → screenshot session window."""
     del camera_username  # never type into desktop after OS login
     progress = on_progress or _noop
+
+    def _cancelled() -> bool:
+        return bool(should_cancel and should_cancel())
+
     try:
         import pyautogui
         import pygetwindow as gw
@@ -474,80 +532,94 @@ def capture_dragoneye_via_teamviewer(
     t0 = time.perf_counter()
     logger.info("[TV] connect id=%s passwords=%s", teamviewer_id, len(teamviewer_passwords))
 
-    for idx, tv_pwd in enumerate(teamviewer_passwords, start=1):
-        progress(f"TeamViewer connect {teamviewer_id} (try {idx}/{len(teamviewer_passwords)})")
-        try:
-            proc = subprocess.Popen(
-                [teamviewer_path, "-i", str(teamviewer_id), "--Password", str(tv_pwd)]
-            )
-        except OSError as exc:
-            logger.warning("[TV] launch failed: %s", type(exc).__name__)
-            continue
-
-        time.sleep(10)
-        if proc.poll() is not None and proc.returncode != 0:
-            logger.info("[TV] process exited early code=%s", proc.returncode)
-            continue
-
-        elapsed = 0
-        win = None
-        while elapsed < wait_for_connection_sec:
-            win = _find_session_window(gw, teamviewer_id)
-            if win:
-                break
-            if proc.poll() is not None and proc.returncode != 0:
-                break
-            time.sleep(2)
-            elapsed += 2
-
-        if win:
-            logger.info("[TV] session window='%s'", win.title)
-            break
-
-        if proc and proc.poll() is None:
-            proc.terminate()
-        win = None
-        logger.info("[TV] password try %s failed for id=%s", idx, teamviewer_id)
-
-    if not win:
-        raise RuntimeError(f"TeamViewer session failed for id={teamviewer_id}")
-
-    session_title_hint = win.title
-    session_hwnd = win._hWnd
     try:
-        win.activate()
-        time.sleep(3)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[TV] activate failed: %s", type(exc).__name__)
-
-    time.sleep(6)
-
-    # Remote Ubuntu lock screen: password field is focused. Type camera password once.
-    if camera_passwords:
-        progress(f"OS login ({len(camera_passwords)} password try)")
-        _attempt_os_passwords(pyautogui, camera_passwords, progress)
-
-    # Do NOT send Escape or type TV_USERNAME — both break the session / desktop.
-    time.sleep(2)
-
-    # Re-resolve session window in case the handle changed after login.
-    try:
-        refreshed = _find_session_window(gw, teamviewer_id, title_hint=session_title_hint)
-        if refreshed is not None:
-            win = refreshed
-            session_hwnd = win._hWnd
+        for idx, tv_pwd in enumerate(teamviewer_passwords, start=1):
+            if _cancelled():
+                raise CaptureCancelled("TeamViewer capture cancelled")
+            progress(f"TeamViewer connect {teamviewer_id} (try {idx}/{len(teamviewer_passwords)})")
             try:
-                win.activate()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[TV] activate before capture failed: %s", type(exc).__name__)
-            time.sleep(1.5)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[TV] refresh session window failed: %s", type(exc).__name__)
+                proc = subprocess.Popen(
+                    [teamviewer_path, "-i", str(teamviewer_id), "--Password", str(tv_pwd)]
+                )
+            except OSError as exc:
+                logger.warning("[TV] launch failed: %s", type(exc).__name__)
+                continue
 
-    progress("Capturing TeamViewer session…")
-    last_err: Exception | None = None
-    try:
+            _sleep_cancellable(10, should_cancel)
+            if proc.poll() is not None and proc.returncode != 0:
+                logger.info("[TV] process exited early code=%s", proc.returncode)
+                continue
+
+            elapsed = 0
+            win = None
+            while elapsed < wait_for_connection_sec:
+                if _cancelled():
+                    raise CaptureCancelled("TeamViewer capture cancelled")
+                win = _find_session_window(gw, teamviewer_id)
+                if win:
+                    break
+                if proc.poll() is not None and proc.returncode != 0:
+                    break
+                _sleep_cancellable(2, should_cancel)
+                elapsed += 2
+
+            if win:
+                logger.info("[TV] session window='%s'", win.title)
+                break
+
+            if proc and proc.poll() is None:
+                proc.terminate()
+            win = None
+            logger.info("[TV] password try %s failed for id=%s", idx, teamviewer_id)
+
+        if not win:
+            raise RuntimeError(f"TeamViewer session failed for id={teamviewer_id}")
+
+        session_title_hint = win.title
+        session_hwnd = win._hWnd
+        try:
+            win.activate()
+            _sleep_cancellable(3, should_cancel)
+        except CaptureCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[TV] activate failed: %s", type(exc).__name__)
+
+        _sleep_cancellable(6, should_cancel)
+
+        # Remote Ubuntu lock screen: password field is focused. Type camera password once.
+        if camera_passwords:
+            if _cancelled():
+                raise CaptureCancelled("TeamViewer capture cancelled")
+            progress(f"OS login ({len(camera_passwords)} password try)")
+            _attempt_os_passwords(pyautogui, camera_passwords, progress)
+
+        # Do NOT send Escape or type TV_USERNAME — both break the session / desktop.
+        _sleep_cancellable(2, should_cancel)
+
+        # Re-resolve session window in case the handle changed after login.
+        try:
+            refreshed = _find_session_window(gw, teamviewer_id, title_hint=session_title_hint)
+            if refreshed is not None:
+                win = refreshed
+                session_hwnd = win._hWnd
+                try:
+                    win.activate()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[TV] activate before capture failed: %s", type(exc).__name__)
+                _sleep_cancellable(1.5, should_cancel)
+        except CaptureCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[TV] refresh session window failed: %s", type(exc).__name__)
+
+        if _cancelled():
+            raise CaptureCancelled("TeamViewer capture cancelled")
+        progress("Capturing TeamViewer session…")
+        last_err: Exception | None = None
         for attempt in range(1, 6):
+            if _cancelled():
+                raise CaptureCancelled("TeamViewer capture cancelled")
             try:
                 win = _resolve_capture_window(
                     teamviewer_id,
@@ -559,7 +631,7 @@ def capture_dragoneye_via_teamviewer(
                     win.activate()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[TV] activate on attempt %s failed: %s", attempt, type(exc).__name__)
-                time.sleep(0.8)
+                _sleep_cancellable(0.8, should_cancel)
                 left, top, width, height = _hwnd_rect(win._hWnd)
                 logger.info(
                     "[TV] capture attempt %s hwnd=%s title=%r bounds=%sx%s@%s,%s",
@@ -574,6 +646,8 @@ def capture_dragoneye_via_teamviewer(
                 _capture_window_printwindow(win._hWnd, str(filepath))
                 last_err = None
                 break
+            except CaptureCancelled:
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 logger.warning(
@@ -582,15 +656,30 @@ def capture_dragoneye_via_teamviewer(
                     type(exc).__name__,
                     exc,
                 )
-                time.sleep(2.0)
+                _sleep_cancellable(2.0, should_cancel)
         if last_err is not None:
             raise RuntimeError(f"TeamViewer screenshot failed: {last_err}") from last_err
+    except CaptureCancelled:
+        logger.info("[TV] cancelled id=%s — cleaning up", teamviewer_id)
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        cleanup_teamviewer_ui(teamviewer_id=str(teamviewer_id))
+        raise
     finally:
-        _close_session_window(
-            win,
-            teamviewer_id=str(teamviewer_id),
-            session_title_hint=session_title_hint,
-        )
+        # Normal path closes the session after a successful (or failed) capture attempt.
+        # Cancel path already cleaned up above; skip double-close when cancelled.
+        if not _cancelled() and win is not None:
+            try:
+                _close_session_window(
+                    win,
+                    teamviewer_id=str(teamviewer_id),
+                    session_title_hint=getattr(win, "title", "") or "",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[TV] final close failed: %s", type(exc).__name__)
 
     logger.info(
         "[TV] saved path=%s elapsed=%.1fs",
