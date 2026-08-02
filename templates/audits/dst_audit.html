@@ -1,0 +1,928 @@
+{% extends "base.html" %}
+{% block title %}DST Audit — DST Camera Audit{% endblock %}
+{% block container_class %}wide{% endblock %}
+{% block content %}
+<div class="browse-head">
+  <div>
+    <h1>DST Audit</h1>
+    <p class="lede">
+      Fleet timezone audit — select the sites to include, turn those cameras on,
+      wait for boot, then capture LTI (CBW + VNC) and DE/FX (TeamViewer + OvrC)
+      with wall-clock timestamps so device clocks can be compared to capture time.
+    </p>
+  </div>
+  <div class="browse-head-actions">
+    <a class="btn-secondary" href="{% url 'audit_list' %}">All audit jobs</a>
+  </div>
+</div>
+
+<section class="panel dst-panel">
+  <h2>Run configuration</h2>
+  <form method="get" class="filters dst-filters" id="dst-filters">
+    {% if request.GET.job %}<input type="hidden" name="job" value="{{ request.GET.job }}">{% endif %}
+    <label class="dst-filter-search">Search
+      <input type="search" name="q" value="{{ q }}"
+        placeholder="Pole, identifier, serial, FX, agency…"
+        autofocus>
+    </label>
+    <label>Scope
+      <select name="scope" onchange="this.form.submit()">
+        <option value="all" {% if scope == "all" %}selected{% endif %}>All eligible (LTI + DE/FX)</option>
+        <option value="lti" {% if scope == "lti" %}selected{% endif %}>LTI / DS only</option>
+        <option value="de" {% if scope == "de" %}selected{% endif %}>DE / FX only</option>
+      </select>
+    </label>
+    <label>State
+      <select name="state" onchange="this.form.submit()">
+        <option value="">All states</option>
+        {% for s in states %}
+        <option value="{{ s }}" {% if state == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Agency
+      <select name="agency" onchange="this.form.submit()">
+        <option value="">All agencies</option>
+        {% for a in agencies %}
+        <option value="{{ a }}" {% if agency == a %}selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <div class="dst-filter-actions">
+      <button type="submit">Filter</button>
+      {% if has_filters %}
+      <a class="btn-secondary" href="{% url 'dst_audit' %}{% if request.GET.job %}?job={{ request.GET.job }}{% endif %}">Clear</a>
+      {% endif %}
+    </div>
+  </form>
+
+  <div class="dst-stats">
+    <div class="dst-stat">
+      <span class="dst-stat-n" id="dst-selected-count">0</span>
+      <span class="dst-stat-l">selected</span>
+    </div>
+    <div class="dst-stat">
+      <span class="dst-stat-n">{{ site_count }}</span>
+      <span class="dst-stat-l">listed</span>
+    </div>
+    <div class="dst-stat">
+      <span class="dst-stat-n">{{ lti_count }}</span>
+      <span class="dst-stat-l">LTI (CBW+VNC)</span>
+    </div>
+    <div class="dst-stat">
+      <span class="dst-stat-n">{{ de_count }}</span>
+      <span class="dst-stat-l">DE/FX (TV+OvrC)</span>
+    </div>
+    <div class="dst-stat">
+      <span class="dst-stat-n">{{ settle_seconds }}s</span>
+      <span class="dst-stat-l">boot settle</span>
+    </div>
+  </div>
+
+  <ol class="dst-phases-legend">
+    <li><strong>Phase 1</strong> — Power on all selected: CBW relays (LTI) + one OvrC pass for every FX DCAM</li>
+    <li><strong>Phase 2</strong> — Wait {{ settle_seconds }}s for cameras to boot (skipped if already on)</li>
+    <li><strong>Phase 3</strong> — Capture each site (TV / CBW+VNC), then one OvrC pass for all local times</li>
+  </ol>
+
+  {% if can_audit %}
+  <div class="dst-actions">
+    <button type="button" class="btn-fire" id="dst-start-btn" disabled>
+      {% if active_job %}DST Audit running…{% else %}Start DST Audit (0){% endif %}
+    </button>
+    <button type="button" class="btn-danger" id="dst-cancel-btn" hidden>Cancel audit</button>
+    <a class="btn-secondary" id="dst-detail-link" href="#" hidden>Open job detail</a>
+  </div>
+  {% else %}
+  <p class="lede">Technician role required to start a DST Audit.</p>
+  {% endif %}
+</section>
+
+<section class="panel dst-panel" id="dst-live" {% if not active_job %}hidden{% endif %}>
+  <div class="dst-live-head">
+    <h2>Live progress</h2>
+    <span class="badge" id="dst-status-badge">—</span>
+    <span class="muted" id="dst-elapsed"></span>
+  </div>
+  <p class="dst-message" id="dst-message">Starting…</p>
+
+  <div class="dst-progress-wrap">
+    <div class="dst-progress-meta">
+      <span id="dst-phase-label">Queued</span>
+      <span id="dst-percent-label">0%</span>
+    </div>
+    <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="progress-bar-fill" id="dst-progress-fill"></div>
+    </div>
+  </div>
+
+  <div class="dst-phase-pills">
+    <span class="dst-pill" data-phase="power_on">1 · Power on</span>
+    <span class="dst-pill" data-phase="settle">2 · Settle</span>
+    <span class="dst-pill" data-phase="capture">3 · Capture</span>
+  </div>
+
+  <h3>Per-site status</h3>
+  <div class="table-scroll">
+    <table class="data-table" id="dst-sites-table">
+      <thead>
+        <tr>
+          <th>Site</th>
+          <th>Kind</th>
+          <th>Status</th>
+          <th>Shots</th>
+          <th>Message</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="dst-sites-body">
+        <tr><td colspan="6" class="muted">Waiting for site jobs…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel dst-panel">
+  <div class="dst-sites-head">
+    <h2>Eligible sites ({{ site_count }})</h2>
+    {% if can_audit and site_count %}
+    <div class="dst-select-actions">
+      <button type="button" class="btn-secondary" id="dst-select-all">Select all</button>
+      <button type="button" class="btn-secondary" id="dst-select-none" title="Clear all selected sites, including ones from other searches">Clear selection</button>
+      <button type="button" class="btn-secondary" id="dst-select-lti">LTI only</button>
+      <button type="button" class="btn-secondary" id="dst-select-de">DE/FX only</button>
+      <span class="muted" id="dst-select-hint">Check listed sites to include, then start.</span>
+    </div>
+    {% endif %}
+  </div>
+  <div class="table-scroll dst-eligible-scroll">
+    <table class="data-table" id="dst-eligible-table">
+      <thead>
+        <tr>
+          <th class="col-check">
+            {% if can_audit and site_count %}
+            <input type="checkbox" id="dst-check-all" title="Select all listed sites" aria-label="Select all">
+            {% endif %}
+          </th>
+          <th>Pole</th>
+          <th>Identifier</th>
+          <th>Serials</th>
+          <th>Platform</th>
+          <th>Kind</th>
+          <th>State</th>
+          <th>Agency</th>
+          <th>FX</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in sites %}
+        <tr data-kind="{{ s.kind }}"
+            data-id="{{ s.id }}"
+            data-pole="{{ s.pole|default:'' }}"
+            data-identifier="{{ s.identifier|default:'' }}"
+            data-serials="{{ s.serials|default:'' }}"
+            data-platform="{{ s.platform|default:'' }}"
+            data-state="{{ s.state|default:'' }}"
+            data-agency="{{ s.agency|default:'' }}"
+            data-fx="{{ s.fx|default:'' }}">
+          <td class="col-check">
+            {% if can_audit %}
+            <input type="checkbox" class="dst-site-check" name="installation_ids"
+              value="{{ s.id }}" data-kind="{{ s.kind }}"
+              aria-label="Select {{ s.identifier|default:s.pole }}">
+            {% endif %}
+          </td>
+          <td>{{ s.pole|default:"—" }}</td>
+          <td><a href="{% url 'camera_detail' s.id %}">{{ s.identifier|default:"—" }}</a></td>
+          <td class="dst-serials">{% if s.serials %}{{ s.serials }}{% else %}—{% endif %}</td>
+          <td>{{ s.platform|default:"—" }}</td>
+          <td><span class="badge kind-{{ s.kind }}">{{ s.kind|upper }}</span></td>
+          <td>{{ s.state|default:"—" }}</td>
+          <td>{{ s.agency|default:"—" }}</td>
+          <td>{{ s.fx|default:"—" }}</td>
+        </tr>
+        {% empty %}
+        <tr><td colspan="9" class="muted">No eligible sites for this filter. Sync from IMS or widen filters.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel dst-panel" id="dst-selected-panel">
+  <div class="dst-sites-head">
+    <h2>Selected for audit <span class="muted" id="dst-selected-panel-count">(0)</span></h2>
+    {% if can_audit %}
+    <div class="dst-select-actions">
+      <button type="button" class="btn-secondary" id="dst-selected-clear"
+        title="Clear all selected sites">Clear selection</button>
+    </div>
+    {% endif %}
+  </div>
+  <p class="lede muted" id="dst-selected-empty">
+    Nothing selected yet. Check sites above — picks stay here across searches.
+  </p>
+  <div class="table-scroll" id="dst-selected-wrap" hidden>
+    <table class="data-table" id="dst-selected-table">
+      <thead>
+        <tr>
+          <th>Pole</th>
+          <th>Identifier</th>
+          <th>Serials</th>
+          <th>Kind</th>
+          <th>State</th>
+          <th>Agency</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="dst-selected-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel dst-panel" id="dst-recent-panel">
+  <h2>Recent DST Audits</h2>
+  <p class="lede muted" id="dst-recent-empty" {% if recent_jobs %}hidden{% endif %}>
+    No DST audits yet. Start one above and it will appear here when finished.
+  </p>
+  <ul class="dst-recent" id="dst-recent-list">
+    {% for j in recent_jobs %}
+    <li class="dst-recent-group" data-job-id="{{ j.id }}">
+      <button type="button" class="dst-recent-toggle" aria-expanded="false"
+        data-job-id="{{ j.id }}">
+        <span class="dst-recent-chevron" aria-hidden="true">▸</span>
+        <span class="dst-recent-id">{{ j.label }}</span>
+        <span class="dst-recent-site">{{ j.sites_summary }}</span>
+        <span class="badge status-{{ j.status }}">{{ j.status_display }}</span>
+        <span class="muted">{{ j.site_count }} site{{ j.site_count|pluralize }} · {{ j.when_display }} · {{ j.message }}</span>
+      </button>
+      <ul class="dst-recent-children" hidden>
+        {% for c in j.children %}
+        <li>
+          <a href="{{ c.detail_url }}" class="dst-recent-child-link">
+            <span class="dst-recent-id">{{ c.label }}</span>
+            <span class="dst-recent-site">{{ c.site }}</span>
+            {% if c.kind %}<span class="badge kind-{{ c.kind }}">{{ c.kind|upper }}</span>{% endif %}
+            <span class="badge status-{{ c.status }}">{{ c.status_display }}</span>
+            <span class="muted">{{ c.shot_count }} shot{{ c.shot_count|pluralize }} · {{ c.message }}</span>
+          </a>
+        </li>
+        {% empty %}
+        <li class="muted">No site captures yet.</li>
+        {% endfor %}
+      </ul>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  const START_URL = "{% url 'dst_audit_start' %}";
+  const RECENT_URL = "{% url 'dst_recent_audits' %}";
+  const CANCEL_TMPL = "{% url 'audit_cancel' pk=0 %}".replace("/0/", "/{id}/");
+  const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  const canAudit = {{ can_audit|yesno:"true,false" }};
+  const FILTERS = {
+    scope: "{{ scope|escapejs }}",
+    state: "{{ state|escapejs }}",
+    agency: "{{ agency|escapejs }}",
+  };
+  const activeJobId = {% if active_job %}{{ active_job.pk }}{% else %}null{% endif %};
+  const urlJob = new URLSearchParams(window.location.search).get("job");
+
+  const startBtn = document.getElementById("dst-start-btn");
+  const cancelBtn = document.getElementById("dst-cancel-btn");
+  const detailLink = document.getElementById("dst-detail-link");
+  const live = document.getElementById("dst-live");
+  const msgEl = document.getElementById("dst-message");
+  const badgeEl = document.getElementById("dst-status-badge");
+  const elapsedEl = document.getElementById("dst-elapsed");
+  const fillEl = document.getElementById("dst-progress-fill");
+  const phaseLabel = document.getElementById("dst-phase-label");
+  const percentLabel = document.getElementById("dst-percent-label");
+  const sitesBody = document.getElementById("dst-sites-body");
+  const pills = document.querySelectorAll(".dst-pill");
+  const selectedCountEl = document.getElementById("dst-selected-count");
+  const selectHintEl = document.getElementById("dst-select-hint");
+  const checkAll = document.getElementById("dst-check-all");
+  const selectedBody = document.getElementById("dst-selected-body");
+  const selectedWrap = document.getElementById("dst-selected-wrap");
+  const selectedEmpty = document.getElementById("dst-selected-empty");
+  const selectedPanelCount = document.getElementById("dst-selected-panel-count");
+  const siteChecks = () => Array.from(document.querySelectorAll(".dst-site-check"));
+
+  const SELECTION_KEY = "dst_audit_selected_sites_v2";
+  const SELECTION_KEY_LEGACY = "dst_audit_selected_ids";
+  let jobId = activeJobId || (urlJob ? parseInt(urlJob, 10) : null);
+  let pollTimer = null;
+  let cancelling = false;
+
+  function loadSelectionMap() {
+    const map = new Map();
+    try {
+      const raw = sessionStorage.getItem(SELECTION_KEY);
+      if (raw) {
+        const obj = JSON.parse(raw);
+        if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+          Object.entries(obj).forEach(([k, v]) => {
+            const id = parseInt(k, 10);
+            if (Number.isNaN(id) || !v || typeof v !== "object") return;
+            map.set(id, {
+              id,
+              pole: String(v.pole || ""),
+              identifier: String(v.identifier || ""),
+              serials: String(v.serials || ""),
+              platform: String(v.platform || ""),
+              kind: String(v.kind || ""),
+              state: String(v.state || ""),
+              agency: String(v.agency || ""),
+              fx: String(v.fx || ""),
+            });
+          });
+          return map;
+        }
+      }
+      // Migrate legacy ID-only list.
+      const legacy = sessionStorage.getItem(SELECTION_KEY_LEGACY);
+      if (legacy) {
+        const arr = JSON.parse(legacy);
+        (Array.isArray(arr) ? arr : []).forEach((n) => {
+          const id = parseInt(n, 10);
+          if (!Number.isNaN(id)) {
+            map.set(id, {
+              id,
+              pole: String(id),
+              identifier: "",
+              serials: "",
+              platform: "",
+              kind: "",
+              state: "",
+              agency: "",
+              fx: "",
+            });
+          }
+        });
+      }
+    } catch (_err) {
+      /* ignore */
+    }
+    return map;
+  }
+
+  function saveSelectionMap(map) {
+    try {
+      const obj = {};
+      map.forEach((meta, id) => {
+        obj[String(id)] = meta;
+      });
+      sessionStorage.setItem(SELECTION_KEY, JSON.stringify(obj));
+      sessionStorage.removeItem(SELECTION_KEY_LEGACY);
+    } catch (_err) {
+      /* ignore quota / private mode */
+    }
+  }
+
+  let selectedMap = loadSelectionMap();
+
+  function cancelUrl(id) {
+    return CANCEL_TMPL.replace("{id}", String(id));
+  }
+
+  function selectedIds() {
+    return Array.from(selectedMap.keys());
+  }
+
+  function metaFromRow(row, id, kind) {
+    if (!row) {
+      return {
+        id,
+        pole: String(id),
+        identifier: "",
+        serials: "",
+        platform: "",
+        kind: kind || "",
+        state: "",
+        agency: "",
+        fx: "",
+      };
+    }
+    return {
+      id,
+      pole: row.dataset.pole || String(id),
+      identifier: row.dataset.identifier || "",
+      serials: row.dataset.serials || "",
+      platform: row.dataset.platform || "",
+      kind: row.dataset.kind || kind || "",
+      state: row.dataset.state || "",
+      agency: row.dataset.agency || "",
+      fx: row.dataset.fx || "",
+    };
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function applySelectionToChecks() {
+    siteChecks().forEach((el) => {
+      const id = parseInt(el.value, 10);
+      el.checked = selectedMap.has(id);
+    });
+  }
+
+  function syncSelectionFromChecks() {
+    // Merge visible checkbox state into the persisted map (keep off-list picks).
+    siteChecks().forEach((el) => {
+      const id = parseInt(el.value, 10);
+      if (Number.isNaN(id)) return;
+      const row = el.closest("tr");
+      if (el.checked) {
+        selectedMap.set(id, metaFromRow(row, id, el.dataset.kind));
+      } else {
+        selectedMap.delete(id);
+      }
+    });
+    saveSelectionMap(selectedMap);
+    syncSelectionUi();
+  }
+
+  function removeSelectedId(id) {
+    selectedMap.delete(id);
+    saveSelectionMap(selectedMap);
+    applySelectionToChecks();
+    syncSelectionUi();
+  }
+
+  function renderSelectedCart() {
+    if (!selectedBody) return;
+    const rows = Array.from(selectedMap.values()).sort((a, b) => {
+      const pa = a.pole || "";
+      const pb = b.pole || "";
+      return pa.localeCompare(pb, undefined, { numeric: true });
+    });
+    if (selectedPanelCount) {
+      selectedPanelCount.textContent = `(${rows.length})`;
+    }
+    if (!rows.length) {
+      if (selectedEmpty) selectedEmpty.hidden = false;
+      if (selectedWrap) selectedWrap.hidden = true;
+      selectedBody.innerHTML = "";
+      return;
+    }
+    if (selectedEmpty) selectedEmpty.hidden = true;
+    if (selectedWrap) selectedWrap.hidden = false;
+    selectedBody.innerHTML = rows
+      .map((s) => {
+        const kind = (s.kind || "?").toUpperCase();
+        const badge = s.kind
+          ? `<span class="badge kind-${escapeHtml(s.kind)}">${escapeHtml(kind)}</span>`
+          : "—";
+        const removeBtn = canAudit
+          ? `<button type="button" class="btn-secondary dst-selected-remove" data-id="${s.id}" title="Remove from selection">Remove</button>`
+          : "";
+        return `<tr>
+          <td>${escapeHtml(s.pole || "—")}</td>
+          <td>${escapeHtml(s.identifier || "—")}</td>
+          <td class="dst-serials">${escapeHtml(s.serials || "—")}</td>
+          <td>${badge}</td>
+          <td>${escapeHtml(s.state || "—")}</td>
+          <td>${escapeHtml(s.agency || "—")}</td>
+          <td class="dst-selected-actions">${removeBtn}</td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  function syncSelectionUi() {
+    const checks = siteChecks();
+    const n = selectedMap.size;
+    const visibleSelected = checks.filter((el) => el.checked).length;
+    const hiddenSelected = Math.max(0, n - visibleSelected);
+    if (selectedCountEl) selectedCountEl.textContent = String(n);
+    if (checkAll) {
+      checkAll.checked = checks.length > 0 && visibleSelected === checks.length;
+      checkAll.indeterminate = visibleSelected > 0 && visibleSelected < checks.length;
+    }
+    if (selectHintEl) {
+      if (n === 0) {
+        selectHintEl.textContent = "Check listed sites to include, then start.";
+      } else if (hiddenSelected > 0) {
+        selectHintEl.textContent =
+          `${n} selected total — ${hiddenSelected} from other search(es) still kept.`;
+      } else {
+        selectHintEl.textContent = `${n} selected — kept across searches until Clear.`;
+      }
+    }
+    if (startBtn && canAudit && !jobId) {
+      startBtn.disabled = n === 0;
+      startBtn.textContent = n === 0 ? "Start DST Audit (0)" : `Start DST Audit (${n})`;
+    }
+    renderSelectedCart();
+  }
+
+  function setVisibleChecks(predicate) {
+    siteChecks().forEach((el) => {
+      el.checked = !!predicate(el);
+    });
+    syncSelectionFromChecks();
+  }
+
+  function clearAllSelection() {
+    selectedMap = new Map();
+    saveSelectionMap(selectedMap);
+    applySelectionToChecks();
+    syncSelectionUi();
+  }
+
+  if (checkAll) {
+    checkAll.addEventListener("change", () => {
+      const on = checkAll.checked;
+      setVisibleChecks(() => on);
+    });
+  }
+  document.getElementById("dst-select-all")?.addEventListener("click", () =>
+    setVisibleChecks(() => true)
+  );
+  document.getElementById("dst-select-none")?.addEventListener("click", () => clearAllSelection());
+  document.getElementById("dst-selected-clear")?.addEventListener("click", () => clearAllSelection());
+  document.getElementById("dst-select-lti")?.addEventListener("click", () =>
+    setVisibleChecks((el) => el.dataset.kind === "lti")
+  );
+  document.getElementById("dst-select-de")?.addEventListener("click", () =>
+    setVisibleChecks((el) => el.dataset.kind === "de")
+  );
+  document.getElementById("dst-eligible-table")?.addEventListener("change", (ev) => {
+    if (ev.target && ev.target.classList.contains("dst-site-check")) {
+      syncSelectionFromChecks();
+    }
+  });
+  // Click row (outside links) toggles checkbox.
+  document.getElementById("dst-eligible-table")?.addEventListener("click", (ev) => {
+    const row = ev.target.closest("tr");
+    if (!row || !row.querySelector(".dst-site-check")) return;
+    if (ev.target.closest("a, input, button, label")) return;
+    const cb = row.querySelector(".dst-site-check");
+    if (!cb || cb.disabled) return;
+    cb.checked = !cb.checked;
+    syncSelectionFromChecks();
+  });
+  document.getElementById("dst-selected-table")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".dst-selected-remove");
+    if (!btn) return;
+    const id = parseInt(btn.dataset.id, 10);
+    if (!Number.isNaN(id)) removeSelectedId(id);
+  });
+
+  // Restore prior picks onto whatever is listed now, and refresh cart labels from rows.
+  applySelectionToChecks();
+  syncSelectionFromChecks();
+
+  function fmtElapsed(s) {
+    if (s == null) return "";
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return m > 0 ? `${m}m ${r}s` : `${r}s`;
+  }
+
+  function phaseTitle(phase) {
+    const map = {
+      queued: "Queued",
+      power_on: "Phase 1 · Power on",
+      settle: "Phase 2 · Settle / boot wait",
+      capture: "Phase 3 · Capture",
+      done: "Finished",
+      failed: "Failed",
+      cancelled: "Cancelled",
+    };
+    return map[phase] || phase || "—";
+  }
+
+  function setProgress(percent, phase) {
+    const p = Math.max(0, Math.min(100, percent || 0));
+    fillEl.style.width = p + "%";
+    fillEl.parentElement.setAttribute("aria-valuenow", String(p));
+    percentLabel.textContent = p + "%";
+    phaseLabel.textContent = phaseTitle(phase);
+    pills.forEach((el) => {
+      const ph = el.getAttribute("data-phase");
+      el.classList.toggle("is-active", ph === phase);
+      el.classList.toggle(
+        "is-done",
+        (phase === "settle" && ph === "power_on") ||
+          (phase === "capture" && (ph === "power_on" || ph === "settle")) ||
+          phase === "done"
+      );
+    });
+  }
+
+  function renderSites(sites) {
+    if (!sites || !sites.length) {
+      sitesBody.innerHTML = '<tr><td colspan="6" class="muted">Waiting for site jobs…</td></tr>';
+      return;
+    }
+    sitesBody.innerHTML = sites
+      .map((s) => {
+        const err = s.error_message
+          ? `<div class="error small">${escapeHtml(s.error_message)}</div>`
+          : "";
+        return `<tr>
+          <td><a href="${escapeHtml(s.detail_url)}">${escapeHtml(s.pole || "—")}</a></td>
+          <td><span class="badge kind-${escapeHtml(s.kind || "")}">${escapeHtml((s.kind || "?").toUpperCase())}</span></td>
+          <td><span class="badge status-${escapeHtml(s.status)}">${escapeHtml(s.status)}</span></td>
+          <td>${s.shot_count || 0}</td>
+          <td>${escapeHtml(s.message || "")}${err}</td>
+          <td><a href="${escapeHtml(s.detail_url)}">Open</a></td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  function showLive(show) {
+    live.hidden = !show;
+  }
+
+  function wireRecentToggles(root) {
+    (root || document).querySelectorAll(".dst-recent-toggle").forEach((btn) => {
+      if (btn.dataset.wired === "1") return;
+      btn.dataset.wired = "1";
+      btn.addEventListener("click", () => {
+        const group = btn.closest(".dst-recent-group");
+        const kids = group?.querySelector(".dst-recent-children");
+        if (!kids) return;
+        const open = kids.hidden;
+        kids.hidden = !open;
+        btn.setAttribute("aria-expanded", open ? "true" : "false");
+        const chev = btn.querySelector(".dst-recent-chevron");
+        if (chev) chev.textContent = open ? "▾" : "▸";
+      });
+    });
+  }
+
+  function renderRecentJobs(jobs, { expandId } = {}) {
+    const list = document.getElementById("dst-recent-list");
+    const empty = document.getElementById("dst-recent-empty");
+    if (!list) return;
+    if (!jobs || !jobs.length) {
+      list.innerHTML = "";
+      if (empty) empty.hidden = false;
+      return;
+    }
+    if (empty) empty.hidden = true;
+    list.innerHTML = jobs
+      .map((j) => {
+        const open = expandId != null && Number(expandId) === Number(j.id);
+        const children = (j.children || [])
+          .map((c) => {
+            const kind = c.kind
+              ? `<span class="badge kind-${escapeHtml(c.kind)}">${escapeHtml(
+                  String(c.kind).toUpperCase()
+                )}</span>`
+              : "";
+            return `<li>
+              <a href="${escapeHtml(c.detail_url)}" class="dst-recent-child-link">
+                <span class="dst-recent-id">${escapeHtml(c.label)}</span>
+                <span class="dst-recent-site">${escapeHtml(c.site || "—")}</span>
+                ${kind}
+                <span class="badge status-${escapeHtml(c.status)}">${escapeHtml(
+                  c.status_display || c.status
+                )}</span>
+                <span class="muted">${c.shot_count || 0} shot${
+                  (c.shot_count || 0) === 1 ? "" : "s"
+                } · ${escapeHtml(c.message || "")}</span>
+              </a>
+            </li>`;
+          })
+          .join("");
+        const kidsHtml =
+          children || `<li class="muted">No site captures yet.</li>`;
+        return `<li class="dst-recent-group" data-job-id="${j.id}">
+          <button type="button" class="dst-recent-toggle" aria-expanded="${
+            open ? "true" : "false"
+          }" data-job-id="${j.id}">
+            <span class="dst-recent-chevron" aria-hidden="true">${
+              open ? "▾" : "▸"
+            }</span>
+            <span class="dst-recent-id">${escapeHtml(j.label)}</span>
+            <span class="dst-recent-site">${escapeHtml(j.sites_summary || "")}</span>
+            <span class="badge status-${escapeHtml(j.status)}">${escapeHtml(
+              j.status_display || j.status
+            )}</span>
+            <span class="muted">${j.site_count || 0} site${
+              (j.site_count || 0) === 1 ? "" : "s"
+            } · ${escapeHtml(j.when_display || "")} · ${escapeHtml(
+              j.message || ""
+            )}</span>
+          </button>
+          <ul class="dst-recent-children"${open ? "" : " hidden"}>${kidsHtml}</ul>
+        </li>`;
+      })
+      .join("");
+    wireRecentToggles(list);
+  }
+
+  async function refreshRecent(expandLatest) {
+    try {
+      const res = await fetch(RECENT_URL, { headers: { Accept: "application/json" } });
+      if (!res.ok) return;
+      const data = await res.json();
+      const jobs = data.jobs || [];
+      const expandId = expandLatest && jobs.length ? jobs[0].id : null;
+      renderRecentJobs(jobs, { expandId });
+    } catch (_err) {
+      /* keep existing list */
+    }
+  }
+
+  wireRecentToggles(document);
+  function clearJobFromUrl() {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has("job")) return;
+    url.searchParams.delete("job");
+    history.replaceState({}, "", url);
+  }
+
+  function finishLive(status) {
+    stopPoll();
+    jobId = null;
+    cancelling = false;
+    if (cancelBtn) {
+      cancelBtn.hidden = true;
+      cancelBtn.disabled = false;
+      cancelBtn.textContent = "Cancel audit";
+    }
+    // Hide live panel for any terminal status (success, fail, cancel).
+    if (status === "succeeded" || status === "failed" || status === "cancelled") {
+      showLive(false);
+      clearJobFromUrl();
+      if (detailLink) detailLink.hidden = true;
+      refreshRecent(true);
+    }
+    if (startBtn && canAudit) {
+      syncSelectionUi();
+    }
+  }
+
+  async function poll() {
+    if (!jobId) return;
+    try {
+      const res = await fetch(`/audits/${jobId}/status/`, {
+        headers: { Accept: "application/json" },
+      });
+      if (!res.ok) throw new Error("status " + res.status);
+      const data = await res.json();
+      if (
+        data.status === "succeeded" ||
+        data.status === "failed" ||
+        data.status === "cancelled"
+      ) {
+        // One last paint for non-success was previously skipped; hide immediately.
+        finishLive(data.status);
+        return;
+      }
+      applyStatus(data);
+    } catch (err) {
+      msgEl.textContent = "Status poll error: " + err.message;
+    }
+  }
+
+  function applyStatus(data) {
+    showLive(true);
+    badgeEl.textContent = data.status || "—";
+    badgeEl.className = "badge status-" + (data.status || "");
+    msgEl.textContent = data.message || data.progress || "—";
+    elapsedEl.textContent = data.elapsed_s != null ? "Elapsed " + fmtElapsed(data.elapsed_s) : "";
+    if (detailLink) {
+      detailLink.hidden = false;
+      detailLink.href = data.detail_url || `/audits/${data.id}/`;
+    }
+    if (cancelBtn && ["pending", "running"].includes(data.status)) {
+      cancelBtn.hidden = false;
+      if (!cancelling) cancelBtn.disabled = false;
+    }
+    const dst = data.dst || {};
+    setProgress(dst.percent || 0, dst.phase || "queued");
+    if (dst.total) {
+      phaseLabel.textContent =
+        phaseTitle(dst.phase) + ` · ${dst.current || 0}/${dst.total}`;
+    }
+    renderSites(dst.sites || []);
+  }
+
+  function startPoll() {
+    stopPoll();
+    poll();
+    pollTimer = setInterval(poll, 2000);
+  }
+
+  function stopPoll() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  if (startBtn && canAudit) {
+    startBtn.addEventListener("click", async () => {
+      if (startBtn.disabled) return;
+      const ids = selectedIds();
+      if (!ids.length) {
+        alert("Select at least one site to audit.");
+        return;
+      }
+      if (
+        !confirm(
+          `Start DST Audit for ${ids.length} selected site(s)?\n\n` +
+            `1) Power on those cameras\n` +
+            `2) Wait {{ settle_seconds }}s\n` +
+            `3) Capture CBW/VNC or TV/OvrC with timestamps\n\n` +
+            `You can cancel from this page.`
+        )
+      ) {
+        return;
+      }
+      startBtn.disabled = true;
+      startBtn.textContent = "Starting…";
+      try {
+        const res = await fetch(START_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": CSRF,
+            Accept: "application/json",
+          },
+          body: JSON.stringify({ ...FILTERS, installation_ids: ids }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "start failed");
+        // Selection was consumed by this run — clear so the next search starts clean.
+        selectedMap = new Map();
+        saveSelectionMap(selectedMap);
+        applySelectionToChecks();
+        syncSelectionUi();
+        jobId = data.job_id;
+        const url = new URL(window.location.href);
+        url.searchParams.set("job", String(jobId));
+        history.replaceState({}, "", url);
+        showLive(true);
+        if (cancelBtn) cancelBtn.hidden = false;
+        msgEl.textContent = `Queued — ${data.sites} site(s)`;
+        startBtn.textContent = "DST Audit running…";
+        startPoll();
+      } catch (err) {
+        alert(err.message);
+        syncSelectionUi();
+      }
+    });
+  }
+
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", async () => {
+      if (!jobId || cancelling) return;
+      if (!confirm("Cancel the DST Audit? In-progress captures will stop.")) return;
+      cancelling = true;
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = "Cancelling…";
+      try {
+        const res = await fetch(cancelUrl(jobId), {
+          method: "POST",
+          headers: {
+            "X-CSRFToken": CSRF,
+            Accept: "application/json",
+          },
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "cancel failed");
+        msgEl.textContent = data.message || "Cancel requested…";
+        startPoll();
+      } catch (err) {
+        alert(err.message);
+        cancelling = false;
+        cancelBtn.disabled = false;
+        cancelBtn.textContent = "Cancel audit";
+      }
+    });
+  }
+
+  if (jobId) {
+    // Only show the live panel immediately for a still-active job.
+    // A stale ?job= id (terminal status) is checked by poll and kept hidden.
+    if (activeJobId) {
+      showLive(true);
+      if (startBtn) {
+        startBtn.disabled = true;
+        startBtn.textContent = "DST Audit running…";
+      }
+      if (cancelBtn) cancelBtn.hidden = false;
+    }
+    startPoll();
+  }
+})();
+</script>
+{% endblock %}
