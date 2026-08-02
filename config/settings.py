@@ -155,6 +155,10 @@ VBE_DAILY_CHECKS_ROOT = os.getenv("VBE_DAILY_CHECKS_ROOT", "")
 AUDIT_MAX_CONCURRENT = int(os.getenv("AUDIT_MAX_CONCURRENT", "2"))
 # Parallel CBW + VNC lane captures within a single pole_bundle job.
 AUDIT_STEP_CONCURRENT = int(os.getenv("AUDIT_STEP_CONCURRENT", "3"))
+# Max seconds a queued job will wait for a free worker slot.
+AUDIT_SLOT_WAIT_SECONDS = int(os.getenv("AUDIT_SLOT_WAIT_SECONDS", "300"))
+# After DST Audit turns cameras on, wait before starting captures (boot settle).
+DST_POWER_SETTLE_SECONDS = int(os.getenv("DST_POWER_SETTLE_SECONDS", "90"))
 
 from config.logging import build_logging_config  # noqa: E402
 
