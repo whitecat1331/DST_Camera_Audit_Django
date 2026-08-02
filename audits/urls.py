@@ -4,6 +4,9 @@ from audits import views
 
 urlpatterns = [
     path("", views.audit_list, name="audit_list"),
+    path("dst/", views.dst_audit_page, name="dst_audit"),
+    path("dst/start/", views.start_dst_audit, name="dst_audit_start"),
+    path("dst/recent/", views.dst_recent_audits, name="dst_recent_audits"),
     path("start/", views.audit_start, name="audit_start"),
     path("capture-pole/", views.capture_pole, name="capture_pole"),
     path("vbe-daily-check/", views.start_vbe_daily_check, name="vbe_daily_check"),
