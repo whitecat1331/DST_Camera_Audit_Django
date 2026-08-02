@@ -17,11 +17,13 @@ class AuditJobAdmin(admin.ModelAdmin):
         "device_type",
         "status",
         "target_host",
+        "parent_job",
         "created_by",
         "created_at",
     )
     list_filter = ("device_type", "status")
     search_fields = ("pole_number", "target_host")
+    raw_id_fields = ("parent_job",)
     inlines = [AuditScreenshotInline]
 
 
