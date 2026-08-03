@@ -1,4 +1,4 @@
-﻿# DST Camera Audit
+# DST Camera Audit
 
 Django web app for **ASE installation camera audits** at Blue Line Solutions. Operators sign in through **IMS SSO**, sync installation inventory from IMS, view sites on a Folium map, and run automated capture jobs that store screenshots and metadata locally.
 
@@ -11,13 +11,14 @@ Django web app for **ASE installation camera audits** at Blue Line Solutions. Op
 
 ### DST Audit (fleet)
 
-`/audits/dst/` orchestrates a full DST timezone audit for **selected** sites (checkboxes on the eligible list; Select all / LTI only / DE only helpers):
+`/audits/dst/` orchestrates a full DST timezone audit for **selected** sites (checkboxes on the eligible list; Select all / LTI only / DE only helpers). Selection persists across searches.
 
-1. **Power on** selected sites (CBW relays for LTI; OvrC WattBox DCAM for DE/FX)
-2. **Settle** wait (`DST_POWER_SETTLE_SECONDS`, default 90s) for cameras to boot
-3. **Capture** each selected site — LTI: CBW + VNC; DE/FX: TeamViewer + OvrC — and record a **wall-clock timestamp** per screenshot (`capture_timestamps.txt` + UI)
+1. **Power on** — all selected sites first (LTI CBW relays in parallel; **one** OvrC login for every DE DCAM outlet)
+2. **Settle** — wait (`DST_POWER_SETTLE_SECONDS`, default 90s); skipped if everything was already on
+3. **Capture** — per site: LTI CBW + VNC, or DE TeamViewer lanes
+4. **OvrC times** — one OvrC pass for all FX local times (keeps the portal’s ADT/EDT zone label)
 
-Compare device clocks in the screenshots to the capture timestamps (LTI: CBW ≈ VNC ≈ wall time; DE/FX: TeamViewer ≈ OvrC ≈ wall time). Progress bars and cancel are on the DST Audit page; terminal logs use `[DST]` / `[AUDIT]`.
+Compare **OvrC device time** on each site job to **Finished** (EST). Progress bars (4 phases) and cancel are on the DST Audit page; terminal logs use `[DST]` / `[AUDIT]`.
 
 Chrome is required for CBW and OvrC captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
 
@@ -84,7 +85,7 @@ Open http://127.0.0.1:8000/ and **Sign in with IMS**.
 | `/cameras/<id>/` | Detail, audit controls |
 | `/map/` | Folium map |
 | `/audits/`, `/audits/<id>/` | Job list and status + screenshots |
-| `/audits/dst/` | DST Audit orchestration (power-on → capture + timestamps) |
+| `/audits/dst/` | DST Audit orchestration (power-all → settle → capture → OvrC times) |
 | `/sync/` | POST re-sync from IMS |
 | `/accounts/ims/start/`, `/accounts/ims/callback/` | IMS SSO |
 

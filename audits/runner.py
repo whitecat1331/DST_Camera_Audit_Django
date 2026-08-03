@@ -808,7 +808,7 @@ def _dst_fleet_ovrc_times(
     )
     _set_progress(
         parent_job_id,
-        f"Phase 3/3: OvrC local time for {len(unique_fx)} FX…",
+        f"Phase 4/4: OvrC local time for {len(unique_fx)} FX…",
     )
     AuditJob.objects.filter(pk=parent_job_id).update(
         target_host=f"ovrc 0/{len(unique_fx)}"
@@ -824,7 +824,7 @@ def _dst_fleet_ovrc_times(
             output_dir=fleet_dir,
             base_url=getattr(settings, "OVRC_BASE_URL", "") or "https://app.ovrc.com",
             headless=True,
-            on_progress=lambda msg: _set_progress(parent_job_id, f"Phase 3/3: {msg}"),
+            on_progress=lambda msg: _set_progress(parent_job_id, f"Phase 4/4: {msg}"),
         )
     except CaptureCancelled:
         raise
@@ -1317,7 +1317,7 @@ def _power_on_all_de_sites(
     )
     _set_progress(
         job_id,
-        f"Phase 1/3: DE power-on {len(unique_fx)} FX across {len(de_sites)} site(s)…",
+        f"Phase 1/4: DE power-on {len(unique_fx)} FX across {len(de_sites)} site(s)…",
     )
 
     if not unique_fx:
@@ -1331,7 +1331,7 @@ def _power_on_all_de_sites(
             password=ovrc_pass,
             base_url=getattr(settings, "OVRC_BASE_URL", "") or "https://app.ovrc.com",
             headless=True,
-            on_progress=lambda msg: _set_progress(job_id, f"Phase 1/3: {msg}"),
+            on_progress=lambda msg: _set_progress(job_id, f"Phase 1/4: {msg}"),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -1558,7 +1558,7 @@ def _run_dst_audit(
 
     # ── Phase 1a: CBW relays (parallel) ──────────────────────────────────
     if lti_sites:
-        _set_progress(job_id, f"Phase 1/3: powering on {len(lti_sites)} LTI site(s)…")
+        _set_progress(job_id, f"Phase 1/4: powering on {len(lti_sites)} LTI site(s)…")
         AuditJob.objects.filter(pk=job_id).update(
             target_host=f"power_on 0/{total}"
         )
@@ -1597,7 +1597,7 @@ def _run_dst_audit(
                     logger.info("[DST] Job %s power-on ok %s", job_id, summary)
                 _set_progress(
                     job_id,
-                    f"Phase 1/3: LTI power-on {done}/{len(lti_sites)} "
+                    f"Phase 1/4: LTI power-on {done}/{len(lti_sites)} "
                     f"(fleet {power_ok}/{total})…",
                 )
                 AuditJob.objects.filter(pk=job_id).update(
@@ -1643,7 +1643,7 @@ def _run_dst_audit(
                 break
             _set_progress(
                 job_id,
-                f"Phase 2/3: waiting {remaining}s for cameras to boot…",
+                f"Phase 2/4: waiting {remaining}s for cameras to boot…",
             )
             AuditJob.objects.filter(pk=job_id).update(
                 target_host=f"settle {remaining}s"
@@ -1654,14 +1654,14 @@ def _run_dst_audit(
             "[DST] Job %s phase2 settle skipped — all sites already on",
             job_id,
         )
-        _set_progress(job_id, "Phase 2/3: settle skipped (already on)")
+        _set_progress(job_id, "Phase 2/4: settle skipped (already on)")
         AuditJob.objects.filter(pk=job_id).update(target_host="settle skipped")
 
     # ── Phase 3: capture each site (TV/CBW/VNC), then one fleet OvrC pass ─
     sites_ok = 0
     de_ovrc_assignments: list[tuple[int, str, list[str], Path]] = []
     _dst_log(job_id, "phase3 begin total=%s", total)
-    _set_progress(job_id, f"Phase 3/3: capturing 0/{total} sites…")
+    _set_progress(job_id, f"Phase 3/4: capturing 0/{total} sites…")
     AuditJob.objects.filter(pk=job_id).update(target_host=f"capture 0/{total}")
 
     for index, inst in enumerate(sites, start=1):
@@ -1684,7 +1684,7 @@ def _run_dst_audit(
             kind,
             time.perf_counter() - t_key,
         )
-        _set_progress(job_id, f"Phase 3/3: {index}/{total} capturing {key} ({kind})…")
+        _set_progress(job_id, f"Phase 3/4: {index}/{total} capturing {key} ({kind})…")
         _dst_log(job_id, "phase3 creating child AuditJob…")
         t_child = time.perf_counter()
         child = AuditJob.objects.create(
@@ -1825,7 +1825,7 @@ def _run_dst_audit(
         )
         _set_progress(
             job_id,
-            f"Phase 3/3: {index}/{total} done — {sites_ok} ok, "
+            f"Phase 3/4: {index}/{total} done — {sites_ok} ok, "
             f"{len(all_errors)} warning(s)…",
         )
 

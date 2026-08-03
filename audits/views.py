@@ -93,7 +93,10 @@ def _shot_payload(shot) -> dict:
 
 
 def _parse_dst_progress(target_host: str, progress_message: str) -> dict:
-    """Derive phase / percent from dst_audit target_host + progress text."""
+    """Derive phase / percent from dst_audit target_host + progress text.
+
+    Phases: queued → power_on → settle → capture → ovrc → done
+    """
     import re
 
     host = (target_host or "").strip().lower()
@@ -122,48 +125,61 @@ def _parse_dst_progress(target_host: str, progress_message: str) -> dict:
         if frac:
             current, total = frac
         percent = 100
+    elif host.startswith("ovrc "):
+        phase = "ovrc"
+        frac = _frac("ovrc ")
+        if frac:
+            current, total = frac
+            percent = int(round(88 + (12 * current / total))) if total else 90
+        else:
+            percent = 90
     elif host.startswith("capture "):
         phase = "capture"
         frac = _frac("capture ")
         if frac:
             current, total = frac
-            percent = int(round(60 + (40 * current / total))) if total else 60
+            percent = int(round(55 + (33 * current / total))) if total else 55
     elif host.startswith("settle"):
         phase = "settle"
-        percent = 55 if "skip" not in host else 58
+        percent = 48 if "skip" not in host else 52
     elif "settle skipped" in msg_l or "already on" in msg_l:
         phase = "settle"
-        percent = 58
+        percent = 52
     elif host.startswith("power_on "):
         phase = "power_on"
         frac = _frac("power_on ")
         if frac:
             current, total = frac
-            percent = int(round(50 * current / total)) if total else 5
+            percent = int(round(40 * current / total)) if total else 5
     elif "waiting for audit worker" in msg_l or "worker slot" in msg_l:
         phase = "queued"
         percent = 2
-    elif "phase 1" in msg_l or "power" in msg_l:
+    elif "phase 1" in msg_l or ("power" in msg_l and "ovrc local" not in msg_l):
         phase = "power_on"
         percent = 10
     elif "phase 2" in msg_l or "waiting" in msg_l:
         phase = "settle"
-        percent = 55
+        percent = 48
+    elif "ovrc local time" in msg_l or "fleet ovrc" in msg_l:
+        phase = "ovrc"
+        percent = 90
     elif "phase 3" in msg_l or "captur" in msg_l:
         phase = "capture"
-        percent = 65
+        percent = 60
 
     # Prefer the last N/M in the message (skip "Phase 3/3" → use "4/100").
     matches = re.findall(r"(\d+)\s*/\s*(\d+)", msg)
-    if matches and phase in {"power_on", "capture"} and total == 0:
+    if matches and phase in {"power_on", "capture", "ovrc"} and total == 0:
         try:
             msg_cur, msg_tot = int(matches[-1][0]), int(matches[-1][1])
             if msg_tot > 0:
                 current, total = msg_cur, msg_tot
                 if phase == "capture":
-                    percent = int(round(60 + (40 * current / total)))
+                    percent = int(round(55 + (33 * current / total)))
+                elif phase == "ovrc":
+                    percent = int(round(88 + (12 * current / total)))
                 else:
-                    percent = int(round(50 * current / total))
+                    percent = int(round(40 * current / total))
         except ValueError:
             pass
 
@@ -900,7 +916,7 @@ def dst_recent_audits(request):
 @login_required
 @require_POST
 def start_dst_audit(request):
-    """Start a fleet DST audit (power-on → settle → capture with timestamps)."""
+    """Start a fleet DST audit (power-all → settle → capture → OvrC times)."""
     if not role_at_least(request.user, "technician"):
         return JsonResponse({"error": "forbidden"}, status=403)
 

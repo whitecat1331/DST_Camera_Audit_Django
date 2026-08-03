@@ -6,9 +6,9 @@
   <div>
     <h1>DST Audit</h1>
     <p class="lede">
-      Fleet timezone audit — select the sites to include, turn those cameras on,
-      wait for boot, then capture LTI (CBW + VNC) and DE/FX (TeamViewer + OvrC)
-      with wall-clock timestamps so device clocks can be compared to capture time.
+      Fleet timezone audit — select sites, power them all on first, wait for boot,
+      capture each site (LTI: CBW + VNC · DE: TeamViewer), then one OvrC pass for
+      device local times. Compare OvrC device time to when the audit finished (EST).
     </p>
   </div>
   <div class="browse-head-actions">
@@ -80,9 +80,10 @@
   </div>
 
   <ol class="dst-phases-legend">
-    <li><strong>Phase 1</strong> — Power on all selected: CBW relays (LTI) + one OvrC pass for every FX DCAM</li>
-    <li><strong>Phase 2</strong> — Wait {{ settle_seconds }}s for cameras to boot (skipped if already on)</li>
-    <li><strong>Phase 3</strong> — Capture each site (TV / CBW+VNC), then one OvrC pass for all local times</li>
+    <li><strong>1 · Power on</strong> — All selected sites first (LTI CBW relays in parallel; one OvrC login for every DE DCAM)</li>
+    <li><strong>2 · Settle</strong> — Wait {{ settle_seconds }}s for cameras to boot (skipped if everything was already on)</li>
+    <li><strong>3 · Capture</strong> — Per site: LTI CBW + VNC, or DE TeamViewer lanes</li>
+    <li><strong>4 · OvrC times</strong> — One OvrC pass for all FX local times (keeps ADT/EDT from the portal)</li>
   </ol>
 
   {% if can_audit %}
@@ -120,6 +121,7 @@
     <span class="dst-pill" data-phase="power_on">1 · Power on</span>
     <span class="dst-pill" data-phase="settle">2 · Settle</span>
     <span class="dst-pill" data-phase="capture">3 · Capture</span>
+    <span class="dst-pill" data-phase="ovrc">4 · OvrC times</span>
   </div>
 
   <h3>Per-site status</h3>
@@ -594,9 +596,10 @@
   function phaseTitle(phase) {
     const map = {
       queued: "Queued",
-      power_on: "Phase 1 · Power on",
-      settle: "Phase 2 · Settle / boot wait",
-      capture: "Phase 3 · Capture",
+      power_on: "1 · Power on (all sites)",
+      settle: "2 · Settle / boot wait",
+      capture: "3 · Capture (TV / CBW+VNC)",
+      ovrc: "4 · OvrC device times",
       done: "Finished",
       failed: "Failed",
       cancelled: "Cancelled",
@@ -610,14 +613,15 @@
     fillEl.parentElement.setAttribute("aria-valuenow", String(p));
     percentLabel.textContent = p + "%";
     phaseLabel.textContent = phaseTitle(phase);
+    const order = ["power_on", "settle", "capture", "ovrc"];
+    const idx = order.indexOf(phase);
     pills.forEach((el) => {
       const ph = el.getAttribute("data-phase");
+      const phIdx = order.indexOf(ph);
       el.classList.toggle("is-active", ph === phase);
       el.classList.toggle(
         "is-done",
-        (phase === "settle" && ph === "power_on") ||
-          (phase === "capture" && (ph === "power_on" || ph === "settle")) ||
-          phase === "done"
+        phase === "done" || (idx >= 0 && phIdx >= 0 && phIdx < idx)
       );
     });
   }
@@ -839,9 +843,10 @@
       if (
         !confirm(
           `Start DST Audit for ${ids.length} selected site(s)?\n\n` +
-            `1) Power on those cameras\n` +
-            `2) Wait {{ settle_seconds }}s\n` +
-            `3) Capture CBW/VNC or TV/OvrC with timestamps\n\n` +
+            `1) Power on ALL selected (LTI relays + one OvrC DCAM pass)\n` +
+            `2) Wait {{ settle_seconds }}s to boot (skipped if already on)\n` +
+            `3) Capture each site (CBW+VNC or TeamViewer)\n` +
+            `4) One OvrC pass for all device local times\n\n` +
             `You can cancel from this page.`
         )
       ) {
