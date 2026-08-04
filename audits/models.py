@@ -15,6 +15,8 @@ class AuditJob(models.Model):
         VBE_DAILY_ALL = "vbe_daily_all", "VBE Daily Checks (all sites)"
         DST_AUDIT = "dst_audit", "DST Audit (all sites)"
         DST_SITE = "dst_site", "DST Audit (one site)"
+        CONFIRM_BATCH = "confirm_batch", "Confirm Captures (batch)"
+        CONFIRM_SITE = "confirm_site", "Confirm Capture (one site)"
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
