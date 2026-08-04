@@ -1,0 +1,525 @@
+{% extends "base.html" %}
+{% block title %}Confirm Captures — DST Camera Audit{% endblock %}
+{% block container_class %}wide{% endblock %}
+{% block content %}
+<div class="browse-head">
+  <div>
+    <h1>Confirm Captures</h1>
+    <p class="lede">
+      Verify live video with the same quality-gated TeamViewer path used by VBE Daily
+      Checks (reconnect rejection, multi-attempt login, confirmed desktop — not a
+      first-frame screenshot). LTI sites use CBW + VNC. Target one camera or upload an
+      IMS installations export for a batch.
+    </p>
+  </div>
+  <div class="browse-head-actions">
+    <a class="btn-secondary" href="{% url 'dst_audit' %}">DST Audit</a>
+    <a class="btn-secondary" href="{% url 'audit_list' %}">All audit jobs</a>
+  </div>
+</div>
+
+<section class="panel dst-panel">
+  <h2>IMS list upload</h2>
+  <p class="muted confirm-hint">
+    Upload the Installations .xlsx from IMS (Installations sheet, or Devices sheet with
+    Installation ID). Rows are matched by Installation ID, Identifier, Pole, then Serial.
+  </p>
+  {% if can_audit %}
+  <div class="confirm-upload" id="confirm-upload">
+    <label class="confirm-file-label">
+      <input type="file" id="confirm-file" accept=".xlsx,.xlsm,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+      <span>Choose IMS .xlsx…</span>
+    </label>
+    <button type="button" class="btn-secondary" id="confirm-preview-btn" disabled>Match list</button>
+    <span class="muted" id="confirm-file-name"></span>
+  </div>
+  <div class="confirm-match-summary" id="confirm-match-summary" hidden>
+    <div class="dst-stats">
+      <div class="dst-stat">
+        <span class="dst-stat-n" id="confirm-matched-n">0</span>
+        <span class="dst-stat-l">matched</span>
+      </div>
+      <div class="dst-stat">
+        <span class="dst-stat-n" id="confirm-unmatched-n">0</span>
+        <span class="dst-stat-l">unmatched</span>
+      </div>
+      <div class="dst-stat">
+        <span class="dst-stat-n" id="confirm-ineligible-n">0</span>
+        <span class="dst-stat-l">ineligible</span>
+      </div>
+    </div>
+    <div class="table-scroll confirm-match-scroll">
+      <table class="data-table" id="confirm-match-table">
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Identifier</th>
+            <th>Pole</th>
+            <th>Kind</th>
+            <th>Match</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="confirm-match-body"></tbody>
+      </table>
+    </div>
+  </div>
+  {% else %}
+  <p class="lede">Technician role required to upload and confirm.</p>
+  {% endif %}
+</section>
+
+<section class="panel dst-panel">
+  <h2>Run configuration</h2>
+  <form method="get" class="filters dst-filters" id="confirm-filters">
+    {% if request.GET.job %}<input type="hidden" name="job" value="{{ request.GET.job }}">{% endif %}
+    <label class="dst-filter-search">Search
+      <input type="search" name="q" value="{{ q }}"
+        placeholder="Pole, identifier, serial, FX, agency…"
+        autofocus>
+    </label>
+    <label>Scope
+      <select name="scope" onchange="this.form.submit()">
+        <option value="all" {% if scope == "all" %}selected{% endif %}>All eligible (LTI + DE/FX)</option>
+        <option value="lti" {% if scope == "lti" %}selected{% endif %}>LTI / DS only</option>
+        <option value="de" {% if scope == "de" %}selected{% endif %}>DE / FX / VBE only</option>
+      </select>
+    </label>
+    <div class="dst-filter-actions">
+      <button type="submit">Filter</button>
+      {% if has_filters %}
+      <a class="btn-secondary" href="{% url 'confirm_captures' %}{% if request.GET.job %}?job={{ request.GET.job }}{% endif %}">Clear</a>
+      {% endif %}
+    </div>
+  </form>
+
+  <div class="dst-stats">
+    <div class="dst-stat">
+      <span class="dst-stat-n" id="confirm-selected-count">0</span>
+      <span class="dst-stat-l">selected</span>
+    </div>
+    <div class="dst-stat">
+      <span class="dst-stat-n">{{ site_count }}</span>
+      <span class="dst-stat-l">listed</span>
+    </div>
+    <div class="dst-stat">
+      <span class="dst-stat-n">{{ lti_count }}</span>
+      <span class="dst-stat-l">LTI (CBW+VNC)</span>
+    </div>
+    <div class="dst-stat">
+      <span class="dst-stat-n">{{ de_count }}</span>
+      <span class="dst-stat-l">DE/VBE (TV confirm)</span>
+    </div>
+  </div>
+
+  {% if can_audit %}
+  <div class="dst-actions">
+    <button type="button" class="btn-fire" id="confirm-start-btn" disabled>
+      {% if active_job %}Confirm running…{% else %}Confirm Captures (0){% endif %}
+    </button>
+    <button type="button" class="btn-danger" id="confirm-cancel-btn" hidden>Cancel</button>
+    <a class="btn-secondary" id="confirm-detail-link" href="#" hidden>Open job detail</a>
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel dst-panel" id="confirm-live" {% if not active_job %}hidden{% endif %}>
+  <div class="dst-live-head">
+    <h2>Live progress</h2>
+    <span class="badge" id="confirm-status-badge">—</span>
+    <span class="muted" id="confirm-elapsed"></span>
+  </div>
+  <p class="dst-message" id="confirm-message">Starting…</p>
+  <div class="dst-progress-wrap">
+    <div class="dst-progress-meta">
+      <span id="confirm-phase-label">Queued</span>
+      <span id="confirm-percent-label">0%</span>
+    </div>
+    <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="progress-bar-fill" id="confirm-progress-fill"></div>
+    </div>
+  </div>
+  <h3>Per-site status</h3>
+  <div class="table-scroll">
+    <table class="data-table" id="confirm-sites-table">
+      <thead>
+        <tr>
+          <th>Site</th>
+          <th>Kind</th>
+          <th>Status</th>
+          <th>Shots</th>
+          <th>Message</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="confirm-sites-body">
+        <tr><td colspan="6" class="muted">Waiting for site jobs…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel dst-panel">
+  <div class="dst-sites-head">
+    <h2>Eligible sites ({{ site_count }})</h2>
+    {% if can_audit and site_count %}
+    <div class="dst-select-actions">
+      <button type="button" class="btn-secondary" id="confirm-select-all">Select all listed</button>
+      <button type="button" class="btn-secondary" id="confirm-select-none">Clear selection</button>
+      <button type="button" class="btn-secondary" id="confirm-select-de">DE/VBE only</button>
+      <button type="button" class="btn-secondary" id="confirm-select-lti">LTI only</button>
+      <span class="muted">Or check one row to confirm a single camera.</span>
+    </div>
+    {% endif %}
+  </div>
+  <div class="table-scroll dst-eligible-scroll">
+    <table class="data-table" id="confirm-eligible-table">
+      <thead>
+        <tr>
+          <th class="col-check">
+            {% if can_audit and site_count %}
+            <input type="checkbox" id="confirm-check-all" title="Select all listed" aria-label="Select all">
+            {% endif %}
+          </th>
+          <th>Pole</th>
+          <th>Identifier</th>
+          <th>Serials</th>
+          <th>Platform</th>
+          <th>Kind</th>
+          <th>State</th>
+          <th>Agency</th>
+          <th>FX</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in sites %}
+        <tr data-kind="{{ s.kind }}" data-id="{{ s.id }}">
+          <td class="col-check">
+            {% if can_audit %}
+            <input type="checkbox" class="confirm-site-check" value="{{ s.id }}" data-kind="{{ s.kind }}"
+              aria-label="Select {{ s.identifier|default:s.pole }}">
+            {% endif %}
+          </td>
+          <td>{{ s.pole|default:"—" }}</td>
+          <td><a href="{% url 'camera_detail' s.id %}">{{ s.identifier|default:"—" }}</a></td>
+          <td class="dst-serials">{% if s.serials %}{{ s.serials }}{% else %}—{% endif %}</td>
+          <td>{{ s.platform|default:"—" }}</td>
+          <td><span class="badge">{{ s.kind }}</span></td>
+          <td>{{ s.state|default:"—" }}</td>
+          <td>{{ s.agency|default:"—" }}</td>
+          <td>{{ s.fx|default:"—" }}</td>
+          <td>
+            {% if can_audit %}
+            <button type="button" class="btn-secondary confirm-one-btn" data-id="{{ s.id }}">Confirm</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% empty %}
+        <tr><td colspan="10" class="muted">No eligible sites for this filter.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% if recent_jobs %}
+<section class="panel dst-panel">
+  <h2>Recent confirm jobs</h2>
+  <ul class="dst-recent">
+    {% for j in recent_jobs %}
+    <li>
+      <a class="dst-recent-link" href="{{ j.detail_url }}">{{ j.label }}</a>
+      <span class="badge">{{ j.status_display }}</span>
+      <span class="muted">{{ j.when_display }} · {{ j.sites_summary }} · {{ j.message }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  const canAudit = {{ can_audit|yesno:"true,false" }};
+  const csrf = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  const selected = new Set();
+  let matchedFromUpload = [];
+  let pollTimer = null;
+  let activeJobId = {% if active_job %}{{ active_job.pk }}{% else %}null{% endif %};
+
+  const startBtn = document.getElementById("confirm-start-btn");
+  const cancelBtn = document.getElementById("confirm-cancel-btn");
+  const detailLink = document.getElementById("confirm-detail-link");
+  const selectedCount = document.getElementById("confirm-selected-count");
+  const live = document.getElementById("confirm-live");
+  const statusBadge = document.getElementById("confirm-status-badge");
+  const messageEl = document.getElementById("confirm-message");
+  const elapsedEl = document.getElementById("confirm-elapsed");
+  const phaseLabel = document.getElementById("confirm-phase-label");
+  const percentLabel = document.getElementById("confirm-percent-label");
+  const progressFill = document.getElementById("confirm-progress-fill");
+  const sitesBody = document.getElementById("confirm-sites-body");
+
+  function syncStart() {
+    if (!startBtn || !canAudit) return;
+    const n = selected.size;
+    selectedCount.textContent = String(n);
+    const busy = !!activeJobId && startBtn.dataset.busy === "1";
+    startBtn.disabled = n === 0 || busy;
+    startBtn.textContent = busy
+      ? "Confirm running…"
+      : (n === 1 ? "Confirm Capture (1)" : `Confirm Captures (${n})`);
+  }
+
+  function setBusy(on) {
+    if (!startBtn) return;
+    startBtn.dataset.busy = on ? "1" : "0";
+    syncStart();
+    if (cancelBtn) cancelBtn.hidden = !on;
+  }
+
+  document.querySelectorAll(".confirm-site-check").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      const id = parseInt(cb.value, 10);
+      if (cb.checked) selected.add(id);
+      else selected.delete(id);
+      syncStart();
+    });
+  });
+
+  document.getElementById("confirm-check-all")?.addEventListener("change", (e) => {
+    const on = e.target.checked;
+    document.querySelectorAll(".confirm-site-check").forEach((cb) => {
+      cb.checked = on;
+      const id = parseInt(cb.value, 10);
+      if (on) selected.add(id);
+      else selected.delete(id);
+    });
+    syncStart();
+  });
+
+  document.getElementById("confirm-select-all")?.addEventListener("click", () => {
+    document.querySelectorAll(".confirm-site-check").forEach((cb) => {
+      cb.checked = true;
+      selected.add(parseInt(cb.value, 10));
+    });
+    syncStart();
+  });
+  document.getElementById("confirm-select-none")?.addEventListener("click", () => {
+    selected.clear();
+    document.querySelectorAll(".confirm-site-check").forEach((cb) => { cb.checked = false; });
+    syncStart();
+  });
+  document.getElementById("confirm-select-de")?.addEventListener("click", () => {
+    selected.clear();
+    document.querySelectorAll(".confirm-site-check").forEach((cb) => {
+      const on = cb.dataset.kind === "de";
+      cb.checked = on;
+      if (on) selected.add(parseInt(cb.value, 10));
+    });
+    syncStart();
+  });
+  document.getElementById("confirm-select-lti")?.addEventListener("click", () => {
+    selected.clear();
+    document.querySelectorAll(".confirm-site-check").forEach((cb) => {
+      const on = cb.dataset.kind === "lti";
+      cb.checked = on;
+      if (on) selected.add(parseInt(cb.value, 10));
+    });
+    syncStart();
+  });
+
+  document.querySelectorAll(".confirm-one-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = parseInt(btn.dataset.id, 10);
+      startConfirm([id]);
+    });
+  });
+
+  const fileInput = document.getElementById("confirm-file");
+  const previewBtn = document.getElementById("confirm-preview-btn");
+  const fileNameEl = document.getElementById("confirm-file-name");
+  fileInput?.addEventListener("change", () => {
+    const f = fileInput.files?.[0];
+    fileNameEl.textContent = f ? f.name : "";
+    if (previewBtn) previewBtn.disabled = !f;
+  });
+  previewBtn?.addEventListener("click", async () => {
+    const f = fileInput?.files?.[0];
+    if (!f) return;
+    previewBtn.disabled = true;
+    previewBtn.textContent = "Matching…";
+    try {
+      const fd = new FormData();
+      fd.append("file", f);
+      const res = await fetch("{% url 'confirm_captures_preview' %}", {
+        method: "POST",
+        headers: { "X-CSRFToken": csrf },
+        body: fd,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      matchedFromUpload = data.matched_ids || [];
+      selected.clear();
+      matchedFromUpload.forEach((id) => selected.add(id));
+      document.querySelectorAll(".confirm-site-check").forEach((cb) => {
+        const id = parseInt(cb.value, 10);
+        cb.checked = selected.has(id);
+      });
+      document.getElementById("confirm-matched-n").textContent = String(data.matched_count || 0);
+      document.getElementById("confirm-unmatched-n").textContent = String(data.unmatched_count || 0);
+      document.getElementById("confirm-ineligible-n").textContent = String(data.ineligible_count || 0);
+      const body = document.getElementById("confirm-match-body");
+      body.innerHTML = (data.rows || []).map((r) => {
+        const status = r.status || "unmatched";
+        return `<tr class="confirm-row-${status}">
+          <td><span class="badge">${status}</span></td>
+          <td>${esc(r.identifier || r.row_identifier || "—")}</td>
+          <td>${esc(r.pole || "—")}</td>
+          <td>${esc(r.kind || "—")}</td>
+          <td>${esc(r.match_by || "—")}</td>
+          <td>${esc(r.reason || "")}</td>
+        </tr>`;
+      }).join("") || `<tr><td colspan="6" class="muted">No rows found</td></tr>`;
+      document.getElementById("confirm-match-summary").hidden = false;
+      syncStart();
+    } catch (err) {
+      alert(err.message || String(err));
+    } finally {
+      previewBtn.disabled = !fileInput?.files?.length;
+      previewBtn.textContent = "Match list";
+    }
+  });
+
+  function esc(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  async function startConfirm(ids) {
+    if (!canAudit || !ids.length) return;
+    setBusy(true);
+    try {
+      const res = await fetch("{% url 'confirm_captures_start' %}", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": csrf,
+        },
+        body: JSON.stringify({ installation_ids: ids }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      activeJobId = data.job_id;
+      if (detailLink) {
+        detailLink.href = data.detail_url;
+        detailLink.hidden = false;
+      }
+      if (live) live.hidden = false;
+      pollStatus();
+    } catch (err) {
+      setBusy(false);
+      alert(err.message || String(err));
+    }
+  }
+
+  startBtn?.addEventListener("click", () => startConfirm([...selected]));
+
+  cancelBtn?.addEventListener("click", async () => {
+    if (!activeJobId) return;
+    try {
+      await fetch(`/audits/${activeJobId}/cancel/`, {
+        method: "POST",
+        headers: { "X-CSRFToken": csrf },
+      });
+    } catch (_) { /* ignore */ }
+  });
+
+  function fmtElapsed(s) {
+    if (s == null) return "";
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return m ? `${m}m ${r}s` : `${r}s`;
+  }
+
+  function renderSites(sites) {
+    if (!sitesBody) return;
+    if (!sites || !sites.length) {
+      sitesBody.innerHTML = `<tr><td colspan="6" class="muted">Waiting for site jobs…</td></tr>`;
+      return;
+    }
+    sitesBody.innerHTML = sites.map((s) => `
+      <tr>
+        <td>${esc(s.pole)}</td>
+        <td>${esc(s.kind)}</td>
+        <td><span class="badge">${esc(s.status)}</span></td>
+        <td>${s.shot_count ?? 0}</td>
+        <td>${esc(s.message || "")}</td>
+        <td>${s.detail_url ? `<a href="${esc(s.detail_url)}">Open</a>` : ""}</td>
+      </tr>
+    `).join("");
+  }
+
+  async function pollStatus() {
+    if (!activeJobId) return;
+    try {
+      const res = await fetch(`/audits/${activeJobId}/status/`);
+      const data = await res.json();
+      statusBadge.textContent = data.status || "—";
+      messageEl.textContent = data.message || data.progress || "…";
+      elapsedEl.textContent = data.elapsed_s != null ? fmtElapsed(data.elapsed_s) : "";
+      const conf = data.confirm;
+      if (conf) {
+        const pct = conf.percent || 0;
+        phaseLabel.textContent = `${conf.current || 0}/${conf.total || 0} sites`;
+        percentLabel.textContent = `${pct}%`;
+        progressFill.style.width = `${pct}%`;
+        renderSites(conf.sites || []);
+      } else if (data.device_type === "confirm_site") {
+        const done = ["succeeded", "failed", "cancelled"].includes(data.status);
+        const pct = done ? 100 : (data.status === "running" ? 40 : 5);
+        phaseLabel.textContent = data.pole_number || "Site";
+        percentLabel.textContent = `${pct}%`;
+        progressFill.style.width = `${pct}%`;
+        renderSites([{
+          pole: data.pole_number,
+          kind: data.target_host || "—",
+          status: data.status,
+          message: data.message,
+          shot_count: (data.screenshots || []).length,
+          detail_url: `/audits/${data.id}/`,
+        }]);
+      }
+      const terminal = ["succeeded", "failed", "cancelled"].includes(data.status);
+      if (terminal) {
+        setBusy(false);
+        if (pollTimer) clearTimeout(pollTimer);
+        pollTimer = null;
+        return;
+      }
+      setBusy(true);
+    } catch (_) { /* keep polling */ }
+    pollTimer = setTimeout(pollStatus, 2000);
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  const jobParam = params.get("job");
+  if (jobParam) {
+    activeJobId = parseInt(jobParam, 10);
+    if (live) live.hidden = false;
+    if (detailLink) {
+      detailLink.href = `/audits/${activeJobId}/`;
+      detailLink.hidden = false;
+    }
+  }
+  if (activeJobId) {
+    setBusy(true);
+    pollStatus();
+  }
+  syncStart();
+})();
+</script>
+{% endblock %}

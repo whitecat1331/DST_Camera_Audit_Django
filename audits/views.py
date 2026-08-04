@@ -265,6 +265,60 @@ def audit_job_status(request, pk):
             "sites_failed": sum(1 for s in site_rows if s["status"] == "failed"),
         }
 
+    if job.device_type == AuditJob.DeviceType.CONFIRM_BATCH:
+        children = list(
+            job.child_jobs.order_by("created_at").prefetch_related("screenshots")[:500]
+        )
+        site_rows = []
+        for child in children:
+            child_shots = [_shot_payload(s) for s in child.screenshots.all() if s.image]
+            kind = (child.target_host or "").strip().lower()
+            if kind not in {"lti", "de"}:
+                kind = "—"
+            site_rows.append(
+                {
+                    "id": child.pk,
+                    "pole": child.pole_number,
+                    "kind": kind,
+                    "status": child.status,
+                    "message": child.progress_message or child.get_status_display(),
+                    "error_message": child.error_message,
+                    "detail_url": f"/audits/{child.pk}/",
+                    "screenshots": child_shots,
+                    "shot_count": len(child_shots),
+                }
+            )
+        host = (job.target_host or "").strip()
+        current = 0
+        total = len(site_rows)
+        if "/" in host:
+            a, _, b = host.partition("/")
+            try:
+                current, total = int(a), int(b)
+            except ValueError:
+                pass
+        if job.status == AuditJob.Status.SUCCEEDED:
+            percent = 100
+        elif job.status in (AuditJob.Status.FAILED, AuditJob.Status.CANCELLED):
+            percent = 100 if total and current >= total else (
+                int(round(100 * current / total)) if total else 0
+            )
+        else:
+            percent = int(round(100 * current / total)) if total else 5
+        payload["confirm"] = {
+            "current": current,
+            "total": total or len(site_rows),
+            "percent": max(0, min(100, percent)),
+            "sites": site_rows,
+            "sites_done": sum(
+                1
+                for s in site_rows
+                if s["status"] in ("succeeded", "failed", "cancelled")
+            ),
+            "sites_ok": sum(1 for s in site_rows if s["status"] == "succeeded"),
+            "sites_failed": sum(1 for s in site_rows if s["status"] == "failed"),
+        }
+
     return JsonResponse(payload)
 
 
@@ -1204,3 +1258,325 @@ def turn_ovrc_dcam(request):
             "results": payload,
         }
     )
+
+
+def _confirm_recent_rows(limit: int = 12) -> list[dict]:
+    from audits.runner import _eastern_display
+
+    recent = (
+        AuditJob.objects.filter(
+            device_type__in=[
+                AuditJob.DeviceType.CONFIRM_BATCH,
+                AuditJob.DeviceType.CONFIRM_SITE,
+            ],
+            parent_job__isnull=True,
+        )
+        .prefetch_related("child_jobs")
+        .order_by("-created_at")[:limit]
+    )
+    rows: list[dict] = []
+    for job in recent:
+        when = job.finished_at or job.created_at
+        children = list(job.child_jobs.all()) if job.device_type == AuditJob.DeviceType.CONFIRM_BATCH else []
+        if children:
+            poles = [c.pole_number for c in children if c.pole_number]
+            if len(poles) <= 3:
+                sites_summary = ", ".join(poles) if poles else "no sites yet"
+            else:
+                sites_summary = f"{', '.join(poles[:2])} +{len(poles) - 2} more"
+            site_count = len(children)
+        else:
+            sites_summary = job.pole_number or "—"
+            site_count = 1
+        rows.append(
+            {
+                "id": job.pk,
+                "label": f"#{job.pk}",
+                "status": job.status,
+                "status_display": job.get_status_display(),
+                "when": when.isoformat() if when else "",
+                "when_display": _eastern_display(when),
+                "message": job.progress_message or job.get_status_display(),
+                "site_count": site_count,
+                "sites_summary": sites_summary,
+                "detail_url": f"/audits/{job.pk}/",
+                "device_type": job.device_type,
+            }
+        )
+    return rows
+
+
+@login_required
+def confirm_captures_page(request):
+    """Confirm camera captures — single site or IMS installation-list batch."""
+    from audits.runner import _active_dst_installations, _dst_site_kind
+
+    can_audit = role_at_least(request.user, "technician")
+    q = (request.GET.get("q") or "").strip()
+    scope = (request.GET.get("scope") or "all").strip().lower()
+    if scope not in {"all", "lti", "de"}:
+        scope = "all"
+
+    sites = _active_dst_installations(scope=scope)
+    preview = []
+    lti_count = 0
+    de_count = 0
+    q_lower = q.lower()
+    for inst in sites:
+        kind = _dst_site_kind(inst) or "?"
+        serials = _dst_serials_for_inst(inst)
+        serials_text = " · ".join(serials) if serials else ""
+        if q_lower:
+            hay = " ".join(
+                [
+                    (inst.pole_number or ""),
+                    (inst.identifier or ""),
+                    (inst.primary_platform or ""),
+                    (inst.state or ""),
+                    (inst.agency or ""),
+                    (inst.location or ""),
+                    (inst.serial_number or ""),
+                    serials_text,
+                    kind,
+                    " ".join(inst.fx_numbers or []),
+                ]
+            ).lower()
+            if q_lower not in hay:
+                continue
+        if kind == "lti":
+            lti_count += 1
+        elif kind == "de":
+            de_count += 1
+        preview.append(
+            {
+                "id": inst.pk,
+                "pole": (inst.pole_number or "").strip(),
+                "identifier": (inst.identifier or "").strip(),
+                "platform": (inst.primary_platform or "").strip(),
+                "state": (inst.state or "").strip(),
+                "agency": (inst.agency or "").strip(),
+                "kind": kind,
+                "fx": ", ".join(inst.fx_numbers or []),
+                "serials": serials_text,
+            }
+        )
+
+    active_job = (
+        AuditJob.objects.filter(
+            device_type__in=[
+                AuditJob.DeviceType.CONFIRM_BATCH,
+                AuditJob.DeviceType.CONFIRM_SITE,
+            ],
+            parent_job__isnull=True,
+            status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
+        )
+        .order_by("-created_at")
+        .first()
+    )
+
+    return render(
+        request,
+        "audits/confirm_captures.html",
+        {
+            "can_audit": can_audit,
+            "q": q,
+            "scope": scope,
+            "sites": preview,
+            "site_count": len(preview),
+            "lti_count": lti_count,
+            "de_count": de_count,
+            "active_job": active_job,
+            "recent_jobs": _confirm_recent_rows(12),
+            "has_filters": bool(q or (scope and scope != "all")),
+        },
+    )
+
+
+@login_required
+@require_POST
+def preview_confirm_ims_list(request):
+    """Parse an IMS installations Excel export and return match preview JSON."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    upload = request.FILES.get("file") or request.FILES.get("ims_list")
+    if upload is None:
+        return JsonResponse({"error": "Upload an IMS installations .xlsx file"}, status=400)
+    name = (getattr(upload, "name", "") or "").lower()
+    if not name.endswith((".xlsx", ".xlsm")):
+        return JsonResponse({"error": "File must be an Excel .xlsx export"}, status=400)
+
+    from services.ims_export_match import match_ims_export_to_installations
+
+    try:
+        report = match_ims_export_to_installations(upload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[CONFIRM] IMS list parse failed")
+        return JsonResponse({"error": f"Could not read Excel: {exc}"}, status=400)
+
+    rows = []
+    for item in report.rows:
+        rows.append(
+            {
+                "excel_row": item.row.excel_row,
+                "sheet": item.row.source_sheet,
+                "ims_id": item.row.ims_id or item.ims_id,
+                "identifier": item.identifier or item.row.identifier,
+                "pole": item.pole or item.row.pole,
+                "serial": item.row.serial,
+                "agency": item.row.agency,
+                "state": item.row.state,
+                "installation_id": item.installation_id,
+                "kind": item.kind,
+                "match_by": item.match_by,
+                "status": item.status,
+                "reason": item.reason,
+            }
+        )
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "sheets": report.sheet_names,
+            "matched_ids": report.matched_installation_ids,
+            "matched_count": report.matched_count,
+            "unmatched_count": report.unmatched_count,
+            "ineligible_count": report.ineligible_count,
+            "row_count": len(rows),
+            "rows": rows,
+        }
+    )
+
+
+@login_required
+@require_POST
+def start_confirm_captures(request):
+    """Start confirm capture for one site or a batch of installation IDs."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    if request.content_type and "application/json" in request.content_type:
+        try:
+            body = json.loads(request.body.decode() or "{}")
+        except json.JSONDecodeError:
+            body = {}
+        raw_ids = body.get("installation_ids") or body.get("ids") or []
+        installation_id = body.get("installation_id")
+    else:
+        raw_ids = request.POST.getlist("installation_ids")
+        installation_id = request.POST.get("installation_id")
+
+    installation_ids: list[int] = []
+    if installation_id not in (None, ""):
+        try:
+            installation_ids.append(int(installation_id))
+        except (TypeError, ValueError):
+            return JsonResponse({"error": f"invalid installation_id: {installation_id!r}"}, status=400)
+
+    if isinstance(raw_ids, str):
+        raw_ids = [p for p in raw_ids.replace(";", ",").split(",") if p.strip()]
+    if not isinstance(raw_ids, (list, tuple)):
+        return JsonResponse({"error": "installation_ids must be a list"}, status=400)
+    for x in raw_ids:
+        try:
+            installation_ids.append(int(x))
+        except (TypeError, ValueError):
+            return JsonResponse({"error": f"invalid installation id: {x!r}"}, status=400)
+
+    seen: set[int] = set()
+    installation_ids = [i for i in installation_ids if not (i in seen or seen.add(i))]
+    if not installation_ids:
+        return JsonResponse({"error": "Select at least one camera to confirm"}, status=400)
+
+    running = AuditJob.objects.filter(
+        device_type__in=[
+            AuditJob.DeviceType.CONFIRM_BATCH,
+            AuditJob.DeviceType.CONFIRM_SITE,
+            AuditJob.DeviceType.VBE_DAILY_ALL,
+            AuditJob.DeviceType.DST_AUDIT,
+        ],
+        parent_job__isnull=True,
+        status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
+    ).exists()
+    if running:
+        return JsonResponse(
+            {"error": "Another fleet capture is already running (Confirm / VBE / DST)"},
+            status=409,
+        )
+
+    from audits.runner import (
+        _active_dst_installations,
+        _dst_site_key,
+        write_confirm_selection,
+    )
+
+    sites = _active_dst_installations(installation_ids=installation_ids)
+    if not sites:
+        return JsonResponse(
+            {"error": "None of the selected sites are eligible for confirm capture"},
+            status=400,
+        )
+
+    resolved_ids = [inst.pk for inst in sites]
+
+    if len(sites) == 1:
+        inst = sites[0]
+        key = _dst_site_key(inst)
+        job = AuditJob.objects.create(
+            pole_number=key,
+            target_host=_dst_site_kind_safe(inst),
+            device_type=AuditJob.DeviceType.CONFIRM_SITE,
+            created_by=request.user,
+            progress_message=f"Queued — confirm {key}",
+        )
+        enqueue_audit_job(job.pk)
+        logger.info(
+            "[CONFIRM] start single job=%s site=%s user=%s",
+            job.pk,
+            key,
+            request.user.get_username(),
+        )
+        return JsonResponse(
+            {
+                "ok": True,
+                "job_id": job.pk,
+                "sites": 1,
+                "status_url": f"/audits/{job.pk}/status/",
+                "detail_url": f"/audits/{job.pk}/",
+                "page_url": f"/audits/confirm-captures/?job={job.pk}",
+                "mode": "confirm_site",
+            }
+        )
+
+    job = AuditJob.objects.create(
+        pole_number="CONFIRM",
+        target_host=f"0/{len(sites)}",
+        device_type=AuditJob.DeviceType.CONFIRM_BATCH,
+        created_by=request.user,
+        progress_message=f"Queued — {len(sites)} site(s)",
+    )
+    write_confirm_selection(job.pk, resolved_ids)
+    enqueue_audit_job(job.pk)
+    logger.info(
+        "[CONFIRM] start batch job=%s sites=%s user=%s",
+        job.pk,
+        len(sites),
+        request.user.get_username(),
+    )
+    return JsonResponse(
+        {
+            "ok": True,
+            "job_id": job.pk,
+            "sites": len(sites),
+            "status_url": f"/audits/{job.pk}/status/",
+            "detail_url": f"/audits/{job.pk}/",
+            "page_url": f"/audits/confirm-captures/?job={job.pk}",
+            "mode": "confirm_batch",
+        }
+    )
+
+
+def _dst_site_kind_safe(inst) -> str:
+    from audits.runner import _dst_site_kind
+
+    return _dst_site_kind(inst) or ""

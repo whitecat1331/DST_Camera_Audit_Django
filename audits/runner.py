@@ -1085,6 +1085,239 @@ def _run_vbe_daily_all(job_id: int, output_dir: Path) -> tuple[list[str], int]:
     return all_errors, sites_ok
 
 
+def _confirm_selection_path(job_id: int) -> Path:
+    return Path(settings.MEDIA_ROOT) / "audits" / f"confirm_selection_{job_id}.json"
+
+
+def write_confirm_selection(job_id: int, installation_ids: list[int]) -> Path:
+    """Persist selected installation PKs for a Confirm Captures parent job."""
+    path = _confirm_selection_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import json
+
+    path.write_text(
+        json.dumps({"installation_ids": [int(x) for x in installation_ids]}),
+        encoding="utf-8",
+    )
+    logger.info(
+        "[CONFIRM] Job %s selection written count=%s path=%s",
+        job_id,
+        len(installation_ids),
+        path,
+    )
+    return path
+
+
+def read_confirm_selection(job_id: int) -> list[int] | None:
+    """Return selected installation PKs, or None when no selection file exists."""
+    import json
+
+    path = _confirm_selection_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.exception("[CONFIRM] Job %s failed to read selection file", job_id)
+        return None
+    raw = data.get("installation_ids") or []
+    out: list[int] = []
+    for x in raw:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _confirm_daily_export_for(inst) -> bool:
+    """True when this DE/VBE site should also write into VBE Daily Checks folders."""
+    if not getattr(inst, "is_vbe", False):
+        return False
+    try:
+        from services.vbe_daily_checks import (
+            daily_checks_root,
+            is_canonical_vbe_identifier,
+            resolve_vbe_export_key,
+        )
+
+        if not is_canonical_vbe_identifier(getattr(inst, "identifier", None)):
+            return False
+        daily_checks_root()
+        resolve_vbe_export_key(inst)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _run_confirm_site_capture(job_id: int, inst, output_dir: Path) -> list[str]:
+    """Confirm one site: DE/VBE uses TeamViewer quality gates; LTI uses CBW+VNC."""
+    close_old_connections()
+    from audits.models import AuditJob
+    from cameras.models import Installation
+
+    inst_pk = getattr(inst, "pk", None)
+    if inst_pk:
+        fresh = Installation.objects.filter(pk=inst_pk, is_active=True).first()
+        if fresh is not None:
+            inst = fresh
+
+    kind = _dst_site_kind(inst)
+    key = _dst_site_key(inst)
+    if kind is None:
+        return [f"{key}: not eligible for confirm capture"]
+
+    AuditJob.objects.filter(pk=job_id).update(target_host=kind)
+    _set_progress(job_id, f"Confirming {key} ({kind})…")
+
+    if kind == "de":
+        daily = _confirm_daily_export_for(inst)
+        _dst_log(
+            job_id,
+            "confirm DE bundle daily_export=%s key=%s",
+            daily,
+            key,
+        )
+        errors = _run_de_bundle(job_id, key, output_dir, daily_export=daily)
+        AuditJob.objects.filter(pk=job_id).update(target_host=kind)
+        return errors
+
+    _dst_log(job_id, "confirm LTI pole bundle key=%s", key)
+    errors = _run_pole_bundle_parallel(job_id, key, output_dir)
+    AuditJob.objects.filter(pk=job_id).update(target_host=kind)
+    return errors
+
+
+def _run_confirm_batch(job_id: int, output_dir: Path) -> tuple[list[str], int]:
+    """Confirm captures for selected installations (IMS list or manual picks).
+
+    DE/VBE sites use the same TeamViewer quality-gated path as VBE Daily Checks.
+    LTI sites use CBW + VNC. Creates a child AuditJob per site.
+    """
+    from audits.models import AuditJob
+    from services.teamviewer_capture import CaptureCancelled
+
+    close_old_connections()
+    _raise_if_cancelled(job_id)
+    bulk = AuditJob.objects.get(pk=job_id)
+
+    selected = read_confirm_selection(job_id)
+    sites = _active_dst_installations(
+        installation_ids=selected if selected is not None else []
+    )
+    if not sites:
+        return ["No eligible installations selected for confirm capture"], 0
+
+    total = len(sites)
+    all_errors: list[str] = []
+    sites_ok = 0
+    _set_progress(job_id, f"Confirm Captures: 0/{total} sites…")
+    AuditJob.objects.filter(pk=job_id).update(target_host=f"0/{total}")
+
+    for index, inst in enumerate(sites, start=1):
+        _raise_if_cancelled(job_id)
+        key = _dst_site_key(inst)
+        kind = _dst_site_kind(inst) or "?"
+        _set_progress(job_id, f"Confirm Captures {index}/{total}: {key}")
+        AuditJob.objects.filter(pk=job_id).update(
+            target_host=f"{index - 1}/{total}",
+            progress_message=f"Confirm Captures {index}/{total}: {key}",
+        )
+        child = AuditJob.objects.create(
+            pole_number=key,
+            target_host=kind,
+            device_type=AuditJob.DeviceType.CONFIRM_SITE,
+            status=AuditJob.Status.RUNNING,
+            created_by=bulk.created_by,
+            parent_job=bulk,
+            started_at=timezone.now(),
+            progress_message=f"Batch job {job_id} ({index}/{total})",
+        )
+        with _cancel_lock:
+            child_ev = threading.Event()
+            _cancel_flags[child.pk] = child_ev
+            _job_children.setdefault(job_id, set()).add(child.pk)
+            pev = _cancel_flags.get(job_id)
+            if pev is not None and pev.is_set():
+                child_ev.set()
+        child_dir = output_dir / key.replace("/", "_").replace("\\", "_")
+        child_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            errors = _run_confirm_site_capture(child.pk, inst, child_dir)
+            child.refresh_from_db()
+            if child.status == AuditJob.Status.CANCELLED or is_job_cancelled(child.pk):
+                raise CaptureCancelled("Audit cancelled by user")
+            has_shots = child.screenshots.exists()
+            if has_shots:
+                sites_ok += 1
+                child.status = AuditJob.Status.SUCCEEDED
+                child.progress_message = (
+                    f"Done with warnings ({len(errors)})" if errors else "Done"
+                )
+            else:
+                child.status = AuditJob.Status.FAILED
+                child.progress_message = "Failed"
+            if errors:
+                child.error_message = "; ".join(errors)[:2000]
+                for err in errors:
+                    all_errors.append(f"{key}: {err}")
+            elif not has_shots:
+                all_errors.append(f"{key}: no screenshots")
+                child.error_message = "No screenshots captured"
+            child.finished_at = timezone.now()
+            child.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                    "progress_message",
+                    "finished_at",
+                    "target_host",
+                ]
+            )
+        except CaptureCancelled:
+            child.refresh_from_db()
+            if child.status != AuditJob.Status.CANCELLED:
+                child.status = AuditJob.Status.CANCELLED
+                child.error_message = "Cancelled by user"
+                child.progress_message = "Cancelled"
+                child.finished_at = timezone.now()
+                child.save(
+                    update_fields=[
+                        "status",
+                        "error_message",
+                        "progress_message",
+                        "finished_at",
+                    ]
+                )
+            _clear_cancel_flag(child.pk)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[CONFIRM] Job %s child failed site=%s", job_id, key
+            )
+            child.status = AuditJob.Status.FAILED
+            child.error_message = str(exc)[:2000]
+            child.progress_message = "Failed"
+            child.finished_at = timezone.now()
+            child.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                    "progress_message",
+                    "finished_at",
+                ]
+            )
+            all_errors.append(f"{key}: {exc}")
+        finally:
+            _clear_cancel_flag(child.pk)
+
+    _set_progress(job_id, f"Confirm Captures finished {sites_ok}/{total} site(s)")
+    AuditJob.objects.filter(pk=job_id).update(target_host=f"{sites_ok}/{total}")
+    if sites_ok == 0 and not all_errors:
+        all_errors.append("No sites confirmed")
+    return all_errors, sites_ok
+
+
 def _dst_site_kind(inst) -> str | None:
     """Return 'lti' or 'de' when the installation is eligible for DST audit."""
     if inst.is_dragoneye:
@@ -2183,6 +2416,87 @@ def _run_job(job_id: int) -> None:
                     "[DST] Job %s fleet audit finished sites_ok=%s errors=%s elapsed=%.1fs",
                     job_id,
                     sites_ok,
+                    len(errors),
+                    time.perf_counter() - t0,
+                )
+                return
+
+            if job.device_type == AuditJob.DeviceType.CONFIRM_BATCH:
+                errors, sites_ok = _run_confirm_batch(job_id, output_dir)
+                job.refresh_from_db()
+                if job.status == AuditJob.Status.CANCELLED or is_job_cancelled(job_id):
+                    _finalize_cancelled()
+                    return
+                if sites_ok == 0:
+                    raise RuntimeError("; ".join(errors) or "Confirm Captures failed")
+                job.status = AuditJob.Status.SUCCEEDED
+                if errors:
+                    job.error_message = "; ".join(errors)[:2000]
+                job.progress_message = (
+                    f"Done with warnings ({len(errors)})" if errors else "Done"
+                )
+                job.finished_at = timezone.now()
+                job.save(
+                    update_fields=[
+                        "status",
+                        "error_message",
+                        "progress_message",
+                        "finished_at",
+                        "target_host",
+                    ]
+                )
+                logger.info(
+                    "[CONFIRM] Job %s finished sites_ok=%s errors=%s elapsed=%.1fs",
+                    job_id,
+                    sites_ok,
+                    len(errors),
+                    time.perf_counter() - t0,
+                )
+                return
+
+            if job.device_type == AuditJob.DeviceType.CONFIRM_SITE:
+                from cameras.models import Installation
+
+                key = job.pole_number
+                inst = (
+                    Installation.objects.filter(pole_number=key, is_active=True)
+                    .order_by("-last_synced_at")
+                    .first()
+                )
+                if inst is None:
+                    inst = (
+                        Installation.objects.filter(identifier=key, is_active=True)
+                        .order_by("-last_synced_at")
+                        .first()
+                    )
+                if inst is None:
+                    raise RuntimeError(f"No installation for {key}")
+                errors = _run_confirm_site_capture(job_id, inst, output_dir)
+                job.refresh_from_db()
+                if job.status == AuditJob.Status.CANCELLED or is_job_cancelled(job_id):
+                    _finalize_cancelled()
+                    return
+                if not job.screenshots.exists():
+                    raise RuntimeError("; ".join(errors) or "No confirm screenshots")
+                job.status = AuditJob.Status.SUCCEEDED
+                if errors:
+                    job.error_message = "; ".join(errors)[:2000]
+                job.progress_message = (
+                    f"Done with warnings ({len(errors)})" if errors else "Done"
+                )
+                job.finished_at = timezone.now()
+                job.save(
+                    update_fields=[
+                        "status",
+                        "error_message",
+                        "progress_message",
+                        "finished_at",
+                    ]
+                )
+                logger.info(
+                    "[CONFIRM] Job %s site finished shots=%s errors=%s elapsed=%.1fs",
+                    job_id,
+                    job.screenshots.count(),
                     len(errors),
                     time.perf_counter() - t0,
                 )

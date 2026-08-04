@@ -7,6 +7,17 @@ urlpatterns = [
     path("dst/", views.dst_audit_page, name="dst_audit"),
     path("dst/start/", views.start_dst_audit, name="dst_audit_start"),
     path("dst/recent/", views.dst_recent_audits, name="dst_recent_audits"),
+    path("confirm-captures/", views.confirm_captures_page, name="confirm_captures"),
+    path(
+        "confirm-captures/preview/",
+        views.preview_confirm_ims_list,
+        name="confirm_captures_preview",
+    ),
+    path(
+        "confirm-captures/start/",
+        views.start_confirm_captures,
+        name="confirm_captures_start",
+    ),
     path("start/", views.audit_start, name="audit_start"),
     path("capture-pole/", views.capture_pole, name="capture_pole"),
     path("vbe-daily-check/", views.start_vbe_daily_check, name="vbe_daily_check"),
