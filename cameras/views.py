@@ -2,11 +2,11 @@ from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.paginator import Paginator
 from django.db.models import Q
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.contrib import messages
 from django.views.decorators.csrf import ensure_csrf_cookie
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_GET, require_POST
 from django.utils.safestring import mark_safe
 import json
 import logging
@@ -17,6 +17,7 @@ from folium.plugins import MarkerCluster
 from audits.models import AuditJob
 from cameras.models import DragonEyeTeamViewerId, Installation, SyncState
 from cameras.roles import require_ims_role, role_at_least
+from services.de_pi_export import build_de_pi_pack_zip, export_filename
 from services.dragoneye_ids import (
     ensure_default_csv_loaded,
     replace_mappings_from_csv,
@@ -333,6 +334,61 @@ def camera_detail(request, pk):
             "nav_total": len(ordered),
         },
     )
+
+
+@login_required
+@require_GET
+def site_photos_status(request, pk):
+    """Async Site Photos presence check (keeps detail page render fast)."""
+    installation = get_object_or_404(Installation, pk=pk, is_active=True)
+    if not installation.is_dragoneye:
+        return JsonResponse({"ok": False, "message": "not a DragonEye site"}, status=400)
+    from services.de_pi_export import site_documents_status
+
+    status = site_documents_status(
+        installation.pole_number or "",
+        installation.identifier or "",
+        installation.fx_number or "",
+    )
+    return JsonResponse(status)
+
+
+@login_required
+@require_GET
+def export_de_pi_tv(request, pk):
+    """Download Post-Install image pack (Site Documents + TeamViewer lanes)."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    installation = get_object_or_404(Installation, pk=pk, is_active=True)
+    if not installation.is_dragoneye:
+        return JsonResponse({"error": "export requires a DragonEye / FX site"}, status=400)
+
+    try:
+        data, names, counts = build_de_pi_pack_zip(
+            pole_number=installation.pole_number or "",
+            identifier=installation.identifier or "",
+            fx_number=installation.fx_number or "",
+        )
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=404)
+
+    filename = export_filename(
+        installation.pole_number or "",
+        installation.identifier or "",
+        installation.fx_number or "",
+    )
+    logger.info(
+        "[DE] post-install images export pk=%s user=%s tv=%s site_photos=%s files=%s",
+        pk,
+        request.user.get_username(),
+        counts.get("tv", 0),
+        counts.get("site_photos", 0),
+        ",".join(names),
+    )
+    resp = HttpResponse(data, content_type="application/zip")
+    resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
 
 
 @login_required
