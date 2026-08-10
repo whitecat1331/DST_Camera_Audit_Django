@@ -74,6 +74,12 @@
       <button type="button" class="btn-fire" id="detail-tv"
         data-pole="{% firstof installation.pole_number installation.identifier %}"
         data-installation-id="{{ installation.pk }}">TV Capture</button>
+      <a class="btn-secondary" id="detail-export-de-pi-tv"
+        href="{% url 'export_de_pi_tv' installation.pk %}"
+        title="Zip Site Photos + TeamViewer captures for IMS DE Post-Install">Export Post Install Images</a>
+      <p class="site-docs-check cell-muted" id="detail-site-photos-status"
+         data-url="{% url 'site_photos_status' installation.pk %}">Site Photos: checking…</p>
+      <p class="cell-muted">After TV Capture, export the zip (Site Photos + TV) and upload it in IMS → DE Post-Install.</p>
       <button type="button" class="btn-secondary" id="detail-ovrc"
         data-pole="{% firstof installation.pole_number installation.identifier %}"
         data-installation-id="{{ installation.pk }}"
@@ -276,6 +282,30 @@
   if (cbw) cbw.addEventListener('click', () => startMode(cbw, 'cbw'));
   const vnc = document.getElementById('detail-vnc');
   if (vnc) vnc.addEventListener('click', () => startMode(vnc, 'vnc'));
+
+  const sitePhotosStatus = document.getElementById('detail-site-photos-status');
+  if (sitePhotosStatus?.dataset.url) {
+    fetch(sitePhotosStatus.dataset.url, { headers: { Accept: 'application/json' } })
+      .then((res) => res.json().then((data) => ({ ok: res.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) {
+          sitePhotosStatus.textContent = 'Site Photos: check failed';
+          sitePhotosStatus.classList.add('site-docs-missing');
+          return;
+        }
+        const found = !!data.ok;
+        sitePhotosStatus.textContent =
+          (found ? 'Site Photos: found' : 'Site Photos: missing') +
+          (data.message ? ' — ' + data.message : '');
+        sitePhotosStatus.title = data.path || '';
+        sitePhotosStatus.classList.remove('cell-muted', 'site-docs-ok', 'site-docs-missing');
+        sitePhotosStatus.classList.add(found ? 'site-docs-ok' : 'site-docs-missing');
+      })
+      .catch(() => {
+        sitePhotosStatus.textContent = 'Site Photos: check failed';
+        sitePhotosStatus.classList.add('site-docs-missing');
+      });
+  }
 
   const dcam = document.getElementById('detail-ovrc-dcam');
   if (dcam) {

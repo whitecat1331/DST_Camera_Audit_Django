@@ -159,6 +159,10 @@
           data-action="capture" data-capture-mode="tv"
           data-pole="{% firstof installation.pole_number installation.identifier %}"
           data-installation-id="{{ installation.pk }}">TV</button>
+        <a class="icon-btn btn-ovrc"
+          href="{% url 'export_de_pi_tv' installation.pk %}"
+          title="Zip Site Photos + TeamViewer captures for IMS DE Post-Install"
+          onclick="event.stopPropagation()">Export Post Install Images</a>
         <button type="button" class="icon-btn btn-ovrc"
           title="Capture OvrC local date/time for FX camera(s)"
           data-action="capture" data-capture-mode="ovrc"
