@@ -13,9 +13,13 @@ from django.db import transaction
 
 logger = logging.getLogger(__name__)
 
-# FX1051 Apollo… | FX1070 L1 Sheridan… | FX1074L1
+# FX1051 Apollo… | FX1070 L1 Sheridan… | FX1074L1 | FX1403L EB…
 _FX_LANE_RE = re.compile(
     r"^(FX\d+)\s*(L\d+)?\s*(.*)$",
+    re.IGNORECASE,
+)
+_FX_DIR_RE = re.compile(
+    r"^(FX\d+)([LR])\b\s*(.*)$",
     re.IGNORECASE,
 )
 
@@ -29,10 +33,20 @@ class ParsedTvRow:
 
 
 def parse_fx_label(raw: str) -> tuple[str, str, str] | None:
-    """Return (FX####, lane, remainder) or None."""
+    """Return (FX####, lane, remainder) or None.
+
+    Lane may be ``L1``/``L2`` or directional ``L``/``R`` on the FX token
+    (``FX1403L`` → L1, ``FX1403R`` → L2).
+    """
     text = (raw or "").strip()
     if not text:
         return None
+    m = _FX_DIR_RE.match(text)
+    if m:
+        fx = m.group(1).upper()
+        lane = "L1" if m.group(2).upper() == "L" else "L2"
+        rest = (m.group(3) or "").strip()
+        return fx, lane, rest
     m = _FX_LANE_RE.match(text)
     if not m:
         return None

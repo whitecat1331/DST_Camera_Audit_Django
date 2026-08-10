@@ -469,6 +469,24 @@ def _run_de_bundle(
         )
         for m in mapped:
             all_mappings.append((fx, m))
+    # Prefer lane-normalized targets (unlaned CSV → L1) so thumbs match the UI.
+    from services.device_layers import resolve_de_tv_capture_targets
+
+    targets = resolve_de_tv_capture_targets(inst)
+    if targets:
+        class _Target:
+            def __init__(self, row: dict[str, str]):
+                self.teamviewer_id = row["teamviewer_id"]
+                self.lane = row["lane"]
+                self.label = row["label"]
+                self._thumb = row["thumb_key"]
+
+            @property
+            def thumb_key(self) -> str:
+                return self._thumb
+
+        all_mappings = [(t["fx"], _Target(t)) for t in targets]
+
     if not all_mappings:
         joined = ", ".join(fx_list)
         msg = (

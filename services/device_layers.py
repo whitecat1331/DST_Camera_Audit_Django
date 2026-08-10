@@ -113,11 +113,25 @@ def _display_name(ds_number: str | None, device: InstallationDevice | None) -> s
 
 
 def _lane_token(raw: str | None) -> str | None:
+    """Return L1/L2/… lane token from device text.
+
+    Accepts explicit ``L1``/``L2`` (including glued ``FX1074L1``) and DragonEye
+    directional CPU names ``FX1403L`` / ``FX1403R`` (mapped to L1 / L2).
+    """
     text = (raw or "").strip().upper()
     if not text:
         return None
     m = re.search(r"\b(L\d+)\b", text)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    m = re.search(r"FX\d+(L\d+)\b", text)
+    if m:
+        return m.group(1)
+    # FX####L / FX####R glued or spaced (E/W CPUs in PRTG).
+    m = re.search(r"\bFX\d+\s*([LR])\b", text)
+    if m:
+        return "L1" if m.group(1) == "L" else "L2"
+    return None
 
 
 def _lanes_from_devices(devices: list[InstallationDevice], fx: str | None = None) -> list[str]:
@@ -129,7 +143,7 @@ def _lanes_from_devices(devices: list[InstallationDevice], fx: str | None = None
         blob = f"{d.name or ''} {d.unit_serial or ''} {d.lane_code or ''}"
         if fx_u and fx_u not in blob.upper():
             continue
-        for src in (d.name, d.lane_code):
+        for src in (d.name, d.lane_code, d.unit_serial):
             lane = _lane_token(src)
             if lane and lane not in seen:
                 seen.add(lane)
@@ -179,6 +193,60 @@ def _device_for_fx_lane(
         if any_match is None:
             any_match = d
     return cpu_match or any_match
+
+
+def resolve_de_tv_capture_targets(installation: Installation) -> list[dict[str, str]]:
+    """Return ordered TeamViewer capture targets for a DE installation.
+
+    Each item: fx, lane, teamviewer_id, thumb_key, label.
+
+    Legacy unlaned CSV rows (lane="") are bound to the first device lane
+    (usually L1 from FX####L) so screenshots save as ``de_l1`` and match the UI.
+    """
+    from services.dragoneye_ids import mappings_for_fx
+
+    devices = list(installation.devices.all())
+    out: list[dict[str, str]] = []
+    for fx in installation.fx_numbers:
+        mappings = mappings_for_fx(fx)
+        by_lane = {(m.lane or "").strip().upper(): m for m in mappings}
+        device_lanes = _lanes_from_devices(devices, fx) or _lanes_from_devices(devices)
+
+        if device_lanes:
+            lanes = list(device_lanes)
+        elif by_lane:
+            numbered = sorted([k for k in by_lane if k], key=lambda x: (len(x), x))
+            lanes = numbered if numbered else [""]
+        else:
+            lanes = [""]
+
+        for extra in by_lane:
+            if extra and extra not in lanes:
+                lanes.append(extra)
+
+        unlaned = by_lane.get("")
+        unlaned_consumed = False
+        for lane in lanes:
+            m = by_lane.get(lane)
+            if m is None and unlaned is not None and not unlaned_consumed:
+                m = unlaned
+                unlaned_consumed = True
+            if m is None or not (m.teamviewer_id or "").strip():
+                continue
+            if lane:
+                thumb = f"de_{lane.lower()}"
+            else:
+                thumb = m.thumb_key
+            out.append(
+                {
+                    "fx": fx,
+                    "lane": lane,
+                    "teamviewer_id": m.teamviewer_id,
+                    "thumb_key": thumb,
+                    "label": (m.label or f"{fx} {lane}".strip()).strip(),
+                }
+            )
+    return out
 
 
 def build_device_layers(installation: Installation) -> list[DeviceLayer]:
@@ -231,45 +299,62 @@ def _build_dragoneye_layers(installation: Installation) -> list[DeviceLayer]:
     if fx_list:
         for fx in fx_list:
             mappings = mappings_for_fx(fx)
-            if mappings:
-                for m in mappings:
-                    lane = (m.lane or "").strip().upper()
-                    lane_bit = f" {lane}" if lane else ""
-                    lane_key = (lane or "tv").lower()
-                    matched_dev = _device_for_fx_lane(devices, fx, lane or None)
-                    add_layer(
-                        key=f"de_{fx.lower()}_{lane_key}",
-                        label=f"TeamViewer{lane_bit}",
-                        ip=m.teamviewer_id,
-                        thumb_key=m.thumb_key,
-                        device=matched_dev,
-                        ds_number=fx,
-                        display_name=m.label or (f"{fx} {lane}".strip() if lane else fx),
-                        fx_number=fx,
-                        tv_lane=lane or None,
-                        editable_tv=True,
-                    )
+            by_lane = {(m.lane or "").strip().upper(): m for m in mappings}
+            device_lanes = _lanes_from_devices(devices, fx)
+            if not device_lanes:
+                device_lanes = _lanes_from_devices(devices)
+
+            # Prefer one editable TV slot per CPU lane (L1/L2 from FX####L/R).
+            # Fall back to mapping lanes / a single unlaned slot.
+            if device_lanes:
+                lanes = list(device_lanes)
+            elif by_lane:
+                numbered = sorted(
+                    [k for k in by_lane if k],
+                    key=lambda x: (len(x), x),
+                )
+                lanes = numbered if numbered else [""]
             else:
-                # No CSV row yet — still show one TeamViewer slot per L1/L2 CPU lane.
-                lanes = _lanes_from_devices(devices, fx)
-                if not lanes:
-                    lanes = _lanes_from_devices(devices) or [""]
-                for lane in lanes:
-                    lane_bit = f" {lane}" if lane else ""
-                    lane_key = (lane or "tv").lower()
-                    matched_dev = _device_for_fx_lane(devices, fx, lane or None)
-                    add_layer(
-                        key=f"de_{fx.lower()}_{lane_key}",
-                        label=f"TeamViewer{lane_bit}",
-                        ip=None,
-                        thumb_key="de_tv" if not lane else f"de_{lane.lower()}",
-                        device=matched_dev,
-                        ds_number=fx,
-                        display_name=f"{fx} {lane}".strip() if lane else fx,
-                        fx_number=fx,
-                        tv_lane=lane or None,
-                        editable_tv=True,
-                    )
+                lanes = [""]
+
+            for extra in by_lane:
+                if extra and extra not in lanes:
+                    lanes.append(extra)
+
+            unlaned = by_lane.get("")
+            unlaned_consumed = False
+            for lane in lanes:
+                m = by_lane.get(lane)
+                if m is None and unlaned is not None and not unlaned_consumed:
+                    # Legacy CSV row with no lane: attach once to the first slot.
+                    m = unlaned
+                    unlaned_consumed = True
+                lane_bit = f" {lane}" if lane else ""
+                lane_key = (lane or "tv").lower()
+                matched_dev = _device_for_fx_lane(devices, fx, lane or None)
+                if m is not None:
+                    thumb = m.thumb_key
+                    # Prefer explicit lane thumb when we assigned an unlaned row.
+                    if lane and (m.lane or "").strip() == "":
+                        thumb = f"de_{lane.lower()}"
+                    display = m.label or (f"{fx} {lane}".strip() if lane else fx)
+                    tv_id = m.teamviewer_id
+                else:
+                    thumb = "de_tv" if not lane else f"de_{lane.lower()}"
+                    display = f"{fx} {lane}".strip() if lane else fx
+                    tv_id = None
+                add_layer(
+                    key=f"de_{fx.lower()}_{lane_key}",
+                    label=f"TeamViewer{lane_bit}",
+                    ip=tv_id,
+                    thumb_key=thumb,
+                    device=matched_dev,
+                    ds_number=fx,
+                    display_name=display,
+                    fx_number=fx,
+                    tv_lane=lane or None,
+                    editable_tv=True,
+                )
             # One OvrC local-time slot per FX (filled by the OvrC capture button).
             add_layer(
                 key=f"ovrc_{fx.lower()}",
