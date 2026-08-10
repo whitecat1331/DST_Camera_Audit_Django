@@ -22,6 +22,17 @@ Compare **OvrC device time** on each site job to **Finished** (EST). Progress ba
 
 Chrome is required for CBW and OvrC captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
 
+### Export Post Install Images (for IMS)
+
+After a successful **TV Capture** on a DragonEye site detail page, use
+**Export Post Install Images** to download a zip that includes:
+
+- TeamViewer lane captures (`tv/de_l1.png`, `tv/de_l2.png`, …)
+- Site photos from `{Site Documents}\{pole}\Site Photos\`
+
+Upload that zip in IMS under **Installation Registry → DE Post-Install Pack**.
+IMS does not need SharePoint access — everything comes from this zip.
+
 ## Setup
 
 ```powershell
@@ -82,7 +93,8 @@ Open http://127.0.0.1:8000/ and **Sign in with IMS**.
 |------|---------|
 | `/` | Dashboard + sync from IMS (admin+) |
 | `/cameras/` | Installation cards with device/sensor layers and capture thumbnails |
-| `/cameras/<id>/` | Detail, audit controls |
+| `/cameras/<id>/` | Detail, audit controls, **Export Post Install Images** (DE zip for IMS) |
+| `/cameras/<id>/export-de-pi-tv/` | Download Site Documents + TV captures as `*_post_install_images.zip` |
 | `/map/` | Folium map |
 | `/audits/`, `/audits/<id>/` | Job list and status + screenshots |
 | `/audits/dst/` | DST Audit orchestration (power-all → settle → capture → OvrC times) |

@@ -500,11 +500,17 @@ code {
   color: var(--ice-frost);
   cursor: pointer;
   border-radius: 4px;
+  text-decoration: none;
+  display: inline-block;
+}
+a.icon-btn {
+  line-height: inherit;
 }
 .icon-btn:hover:not(:disabled) {
   background: rgba(255, 90, 31, 0.16);
   border-color: var(--fire-hot);
   color: var(--fire-core);
+  text-decoration: none;
 }
 .icon-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-capture {
@@ -540,6 +546,13 @@ code {
   gap: 0.5rem;
   align-items: center;
 }
+.site-docs-check {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: 0.92rem;
+}
+.site-docs-ok { color: var(--ok); }
+.site-docs-missing { color: var(--danger); }
 .detail-advanced-audit {
   margin-top: 1rem;
 }

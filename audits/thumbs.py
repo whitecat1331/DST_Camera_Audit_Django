@@ -50,6 +50,10 @@ def latest_thumbs_for_poles(poles: list[str]) -> dict[str, dict[str, AuditScreen
         key = normalize_thumb_label(shot)
         if key and key not in out[pole]:
             out[pole][key] = shot
+    # Legacy unlaned DE captures use de_tv; L1 UI slots expect de_l1.
+    for pole, by_key in out.items():
+        if "de_l1" not in by_key and "de_tv" in by_key:
+            by_key["de_l1"] = by_key["de_tv"]
     return out
 
 

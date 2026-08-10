@@ -104,6 +104,8 @@ IMS_SSO_REDIRECT_URI = os.getenv("IMS_SSO_REDIRECT_URI", "")
 IMS_API_TOKEN = os.getenv("IMS_API_TOKEN", "")
 IMS_TLS_VERIFY = os.getenv("IMS_TLS_VERIFY", "true").lower() in ("1", "true", "yes")
 DST_LOCAL_ADMIN = os.getenv("DST_LOCAL_ADMIN", "false").lower() in ("1", "true", "yes")
+# Optional override for Post-Install Site Documents root (default: auto-detect X:\Site Documents).
+DE_PI_SITE_DOCUMENTS_ROOT = os.getenv("DE_PI_SITE_DOCUMENTS_ROOT", "").strip()
 
 TF_VNC_PASSWORD = os.getenv("TF_VNC_PASSWORD", "")
 CBW_USERNAME = os.getenv("CBW_USERNAME", "")
