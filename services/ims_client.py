@@ -34,11 +34,43 @@ def exchange_sso_code(code: str) -> dict[str, str]:
         raise IMSClientError("IMS SSO client credentials are not configured")
     logger.info("[IMS] SSO token exchange request")
     with httpx.Client(timeout=30.0, verify=settings.IMS_TLS_VERIFY) as client:
-        resp = client.post(url, json=payload)
+        try:
+            resp = client.post(url, json=payload)
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "[IMS] SSO token exchange connection error url=%s exc=%s",
+                url,
+                type(exc).__name__,
+            )
+            raise IMSClientError(
+                f"Could not reach IMS at {settings.IMS_BASE_URL} "
+                f"({type(exc).__name__}). If IMS runs with --https, use the "
+                "https:// scheme (e.g. https://127.0.0.1), not http://."
+            )
+    if 300 <= resp.status_code < 400:
+        loc = resp.headers.get("location", "")
+        logger.warning(
+            "[IMS] SSO token exchange redirected status=%s location=%s",
+            resp.status_code,
+            loc,
+        )
+        raise IMSClientError(
+            f"IMS redirected the token request (HTTP {resp.status_code}"
+            f"{' to ' + loc if loc else ''}). Point --ims at the HTTPS app URL, "
+            "not the HTTP redirect port."
+        )
     if resp.status_code >= 400:
         logger.warning("[IMS] SSO token exchange failed status=%s", resp.status_code)
         raise IMSClientError(f"SSO token exchange failed ({resp.status_code})")
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(
+            "[IMS] SSO token response not JSON status=%s body=%r",
+            resp.status_code,
+            resp.text[:200],
+        )
+        raise IMSClientError("SSO token exchange returned a non-JSON response")
     if "username" not in data or "role" not in data:
         logger.warning("[IMS] SSO token response missing username/role")
         raise IMSClientError("SSO token response missing username/role")

@@ -79,7 +79,40 @@ python manage.py sync_installations
 python manage.py runserver
 ```
 
+Or via the included PowerShell wrapper (activates `.venv` for you):
+
+```powershell
+.\start_dst_camera_audit.ps1
+```
+
 Open http://127.0.0.1:8000/ and **Sign in with IMS**.
+
+### Choosing the port and pointing at IMS
+
+`runserver` accepts extra flags (see `python manage.py runserver --help`):
+
+| Flag | Effect |
+|------|--------|
+| `--http P` | Serve plain HTTP on port `P` |
+| `--https P` | Serve HTTPS on port `P` using a self-signed dev cert (auto-generated under `certs/`) |
+| `--ims URL` | Point at IMS: sets `IMS_BASE_URL` and derives `IMS_SSO_REDIRECT_URI` from the chosen scheme/port |
+
+`--http` and `--https` are mutually exclusive. When `--ims` is given, the SSO
+callback is auto-derived as `{scheme}://127.0.0.1:{port}/accounts/ims/callback/`,
+so you do not need `IMS_SSO_REDIRECT_URI` in `.env` for local dev.
+
+Local dev pairing with IMS:
+
+```powershell
+# IMS (Access Replacement repo):
+.\start_access_replacement.ps1 --http 8051 --dst http://127.0.0.1:8050
+
+# DST Camera Audit (this repo):
+.\start_dst_camera_audit.ps1 --http 8050 --ims http://127.0.0.1:8051
+```
+
+Point `--ims` at IMS's base URL (scheme + host + port). If you run IMS over
+HTTPS with a self-signed cert instead, set `IMS_TLS_VERIFY=false` in `.env`.
 
 | IMS role | Access |
 |----------|--------|
