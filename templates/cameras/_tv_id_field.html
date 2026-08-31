@@ -1,0 +1,13 @@
+{% if can_audit and layer.editable_tv and layer.fx_number %}
+<input type="text" class="tv-id-input" inputmode="numeric" pattern="[0-9]*"
+  value="{{ layer.ip|default:'' }}"
+  placeholder="TV ID"
+  title="Edit TeamViewer ID for {{ layer.fx_number }}{% if layer.tv_lane %} {{ layer.tv_lane }}{% endif %} — Enter to save, empty to clear"
+  data-fx="{{ layer.fx_number }}"
+  data-lane="{{ layer.tv_lane|default:'' }}"
+  data-original="{{ layer.ip|default:'' }}"
+  onclick="event.stopPropagation()"
+  autocomplete="off">
+{% else %}
+<code>{{ layer.ip|default:"—" }}</code>
+{% endif %}

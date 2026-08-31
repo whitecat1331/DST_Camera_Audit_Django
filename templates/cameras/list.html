@@ -1,0 +1,767 @@
+{% extends "base.html" %}
+{% block title %}Installations — DST Camera Audit{% endblock %}
+{% block container_class %}wide{% endblock %}
+{% block content %}
+<div class="browse-head">
+  <div>
+    <h1>Installations</h1>
+    <p class="lede">
+      {{ total }} ASE site{{ total|pluralize }} from IMS
+      {% if has_filters %}(filtered){% endif %}
+      · Each card layers audit IPs with IMS device + sensor data; captures sit beside the matching IP
+      {% if last_sync %}
+      · Last sync {{ last_sync }}{% if sync_counts %} ({{ sync_counts }}){% endif %}
+      {% endif %}
+    </p>
+  </div>
+  <div class="browse-head-actions">
+    {% if can_audit %}
+    <button type="button" class="btn-daily btn-fire" id="vbe-checks-btn"
+      title="Capture all VBE TeamViewer lanes and save to the shared VBE Daily Checks folder">
+      VBE Checks
+    </button>
+    {% endif %}
+    {% if can_sync %}
+    <form method="post" action="{% url 'sync_installations' %}">
+      {% csrf_token %}
+      <button type="submit">Sync from IMS</button>
+    </form>
+    {% endif %}
+    <a class="btn-secondary" href="{% url 'map' %}">Open map</a>
+  </div>
+</div>
+
+<form method="get" class="browse-filters" id="install-filters">
+  <div class="filters-primary">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search pole, identifier, serial, IP, location…" autofocus>
+    <button type="submit">Search</button>
+    {% if has_filters %}
+    <a class="btn-secondary" href="{% url 'camera_list' %}">Clear</a>
+    {% endif %}
+  </div>
+  <div class="filters-secondary">
+    <label>Platform
+      <select name="platform" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for p in platforms %}
+        <option value="{{ p }}" {% if platform == p %}selected{% endif %}>{{ p }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>State
+      <select name="state" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for s in states %}
+        <option value="{{ s }}" {% if state == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Agency
+      <select name="agency" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for a in agencies %}
+        <option value="{{ a }}" {% if agency == a %}selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Status
+      <select name="status" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for st in statuses %}
+        <option value="{{ st }}" {% if status == st %}selected{% endif %}>{{ st }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Sort
+      <select name="sort" onchange="this.form.submit()">
+        <option value="pole" {% if sort == "pole" %}selected{% endif %}>Pole</option>
+        <option value="identifier" {% if sort == "identifier" %}selected{% endif %}>Identifier</option>
+        <option value="platform" {% if sort == "platform" %}selected{% endif %}>Platform</option>
+        <option value="agency" {% if sort == "agency" %}selected{% endif %}>Agency</option>
+        <option value="state" {% if sort == "state" %}selected{% endif %}>State</option>
+        <option value="status" {% if sort == "status" %}selected{% endif %}>Status</option>
+      </select>
+    </label>
+    <label>Per page
+      <select name="page_size" onchange="this.form.submit()">
+        <option value="25" {% if page_size == 25 %}selected{% endif %}>25</option>
+        <option value="50" {% if page_size == 50 %}selected{% endif %}>50</option>
+        <option value="100" {% if page_size == 100 %}selected{% endif %}>100</option>
+      </select>
+    </label>
+  </div>
+</form>
+
+{% if page.paginator.num_pages > 1 %}
+<nav class="pager pager-top">
+  {% if page.has_previous %}
+  <a href="?page={{ page.previous_page_number }}&{{ querystring }}">Previous</a>
+  {% else %}
+  <span class="pager-disabled">Previous</span>
+  {% endif %}
+  <span>Page {{ page.number }} of {{ page.paginator.num_pages }} · showing {{ page.start_index }}–{{ page.end_index }}</span>
+  {% if page.has_next %}
+  <a href="?page={{ page.next_page_number }}&{{ querystring }}">Next</a>
+  {% else %}
+  <span class="pager-disabled">Next</span>
+  {% endif %}
+</nav>
+{% endif %}
+
+<div class="install-cards">
+  {% for installation in page %}
+  <article class="install-card" data-detail="{% url 'camera_detail' installation.pk %}"
+    data-pole="{% firstof installation.pole_number installation.identifier %}"
+    data-identifier="{{ installation.identifier }}">
+    <header class="install-card-head">
+      <div class="install-card-title">
+        <a href="{% url 'camera_detail' installation.pk %}">
+          {{ installation.identifier|default:installation.serial_number|default:"—" }}
+        </a>
+        <code class="pole-tag">{{ installation.pole_number|default:"—" }}</code>
+        {% if installation.primary_platform %}
+        <span class="badge">{{ installation.primary_platform }}</span>
+        {% endif %}
+        {% if installation.status %}
+        <span class="badge">{{ installation.status }}</span>
+        {% endif %}
+      </div>
+      <div class="install-card-meta">
+        <span>{{ installation.agency|default:"—" }}</span>
+        {% if installation.location %}<span>· {{ installation.location }}</span>{% endif %}
+        {% if installation.state %}<span>· {{ installation.state }}</span>{% endif %}
+      </div>
+      <div class="install-card-facts">
+        {% if installation.serial_number %}<span>Serial <code>{{ installation.serial_number }}</code></span>{% endif %}
+        {% if installation.vendor or installation.model %}
+        <span>{{ installation.vendor }} {{ installation.model }}</span>
+        {% endif %}
+        {% with comps=installation.components.all %}
+        {% if comps %}
+        <span>{{ comps|length }} component{{ comps|length|pluralize }}</span>
+        {% endif %}
+        {% endwith %}
+        {% if installation.is_vbe %}
+        <span class="vbe-last-check" data-vbe-last-check>
+          {% if installation.last_vbe_check_at %}
+          Last VBE check <time datetime="{{ installation.last_vbe_check_at|date:'c' }}">{{ installation.last_vbe_check_at|date:"M j, Y g:i A" }}</time>
+          {% else %}
+          Last VBE check <em>never</em>
+          {% endif %}
+        </span>
+        {% endif %}
+      </div>
+      {% if can_audit %}
+      <div class="install-card-actions" onclick="event.stopPropagation()">
+        {% if installation.is_dragoneye %}
+        <button type="button" class="icon-btn btn-capture"
+          title="Capture DragonEye via TeamViewer"
+          data-action="capture" data-capture-mode="tv"
+          data-pole="{% firstof installation.pole_number installation.identifier %}"
+          data-installation-id="{{ installation.pk }}">TV</button>
+        <a class="icon-btn btn-ovrc"
+          href="{% url 'export_de_pi_tv' installation.pk %}"
+          title="Zip Site Photos + TeamViewer captures for IMS DE Post-Install"
+          onclick="event.stopPropagation()">Export Post Install Images</a>
+        <button type="button" class="icon-btn btn-ovrc"
+          title="Capture OvrC local date/time for FX camera(s)"
+          data-action="capture" data-capture-mode="ovrc"
+          data-pole="{% firstof installation.pole_number installation.identifier %}"
+          data-installation-id="{{ installation.pk }}"
+          {% if not installation.fx_number %}disabled{% endif %}>OvrC</button>
+        {% if installation.is_vbe %}
+        <button type="button" class="icon-btn btn-daily"
+          title="Run VBE Daily Check for this site (TeamViewer lanes → shared folder)"
+          data-action="vbe-check"
+          data-pole="{% firstof installation.identifier installation.pole_number %}"
+          data-installation-id="{{ installation.pk }}">VBE</button>
+        {% endif %}
+        <button type="button" class="icon-btn btn-relays"
+          title="Turn OvrC WattBox DCAM System ON (only if currently OFF)"
+          data-action="ovrc-dcam"
+          data-pole="{% firstof installation.pole_number installation.identifier %}"
+          data-installation-id="{{ installation.pk }}"
+          {% if not installation.fx_number %}disabled{% endif %}>Turn On</button>
+        {% else %}
+        <button type="button" class="icon-btn btn-capture"
+          title="Capture CBW Date/Time"
+          data-action="capture" data-capture-mode="cbw"
+          data-pole="{{ installation.pole_number }}"
+          data-installation-id="{{ installation.pk }}"
+          {% if not installation.pole_number %}disabled{% endif %}>CBW</button>
+        <button type="button" class="icon-btn btn-capture"
+          title="Capture VNC L1/L2"
+          data-action="capture" data-capture-mode="vnc"
+          data-pole="{{ installation.pole_number }}"
+          data-installation-id="{{ installation.pk }}"
+          {% if not installation.pole_number %}disabled{% endif %}>VNC</button>
+        <button type="button" class="icon-btn btn-relays" title="Turn CBW relays ON"
+          data-action="relays" data-pole="{{ installation.pole_number }}"
+          {% if not installation.pole_number %}disabled{% endif %}>Turn On</button>
+        {% endif %}
+      </div>
+      {% endif %}
+    </header>
+
+    <div class="device-layers">
+      {% for layer in installation.device_layers %}
+      <section class="device-layer {% if layer.matched %}matched{% endif %}" data-layer="{{ layer.key }}">
+        <div class="layer-body">
+          <div class="layer-label">{{ layer.label }}</div>
+          <div class="layer-ip">{% include "cameras/_tv_id_field.html" %}</div>
+          {% if layer.ds_number or layer.device %}
+          <div class="layer-device"{% if layer.device %} title="{{ layer.device.enclosure_label }}"{% endif %}>
+            <strong>{% firstof layer.display_name layer.ds_number "Device" %}</strong>
+            {% if layer.device and layer.device.name and layer.ds_number and layer.ds_number != layer.device.name %}
+            <span class="cell-muted">· {{ layer.device.name }}</span>
+            {% endif %}
+            {% if layer.device and layer.device.lane_code %}<span class="cell-muted">· {{ layer.device.lane_code }}</span>{% endif %}
+          </div>
+          {% else %}
+          <div class="layer-device cell-muted">No IMS device match</div>
+          {% endif %}
+          {% if layer.sensors %}
+          <ul class="sensor-chips">
+            {% for s in layer.sensors %}
+            <li><span class="sensor-name">{{ s.name }}</span> <span class="sensor-val">{{ s.last_value }}</span></li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </div>
+        {% if layer.thumb_key %}
+        <div class="layer-thumb" data-thumb-key="{{ layer.thumb_key }}" onclick="event.stopPropagation()">
+          {% if layer.thumb %}
+          <button type="button" class="thumb-btn" data-full="{{ layer.thumb.image.url }}"
+            title="{{ layer.label }} · {{ layer.thumb.created_at }}">
+            <img src="{{ layer.thumb.image.url }}" alt="{{ layer.label }} capture" loading="lazy">
+          </button>
+          {% else %}
+          <span class="thumb-empty">Not run</span>
+          {% endif %}
+        </div>
+        {% endif %}
+      </section>
+      {% empty %}
+      <p class="cell-muted">No device layers — sync IMS (include devices) or upload DragonEye TeamViewer CSV.</p>
+      {% endfor %}
+    </div>
+  </article>
+  {% empty %}
+  <p class="panel">No installations match these filters.</p>
+  {% endfor %}
+</div>
+
+{% if page.paginator.num_pages > 1 %}
+<nav class="pager">
+  {% if page.has_previous %}
+  <a href="?page={{ page.previous_page_number }}&{{ querystring }}">Previous</a>
+  {% endif %}
+  <span>Page {{ page.number }} of {{ page.paginator.num_pages }}</span>
+  {% if page.has_next %}
+  <a href="?page={{ page.next_page_number }}&{{ querystring }}">Next</a>
+  {% endif %}
+</nav>
+{% endif %}
+
+<dialog id="thumb-modal" class="thumb-modal">
+  <form method="dialog"><button class="modal-close" value="close" aria-label="Close">×</button></form>
+  <img id="thumb-modal-img" alt="Capture preview">
+</dialog>
+
+<button type="button" class="fab-top" id="scroll-to-top" aria-label="Scroll to top" title="Scroll to top">↑</button>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+  const CAPTURE_URL = "{% url 'capture_pole' %}";
+  const VBE_CHECK_URL = "{% url 'vbe_daily_check' %}";
+  const VBE_CHECKS_URL = "{% url 'vbe_daily_checks' %}";
+  const RELAYS_URL = "{% url 'turn_relays' %}";
+  const OVRC_DCAM_URL = "{% url 'turn_ovrc_dcam' %}";
+  const CANCEL_URL_TMPL = "{% url 'audit_cancel' pk=0 %}".replace('/0/', '/{id}/');
+
+  function cancelUrl(jobId) {
+    return CANCEL_URL_TMPL.replace('{id}', String(jobId));
+  }
+
+  function resetActionBtn(btn, idleLabel) {
+    btn.disabled = false;
+    btn.textContent = idleLabel;
+    btn.title = btn.dataset.idleTitle || idleLabel;
+    btn.classList.remove('btn-cancel', 'is-cancelling');
+    delete btn.dataset.mode;
+    delete btn.dataset.jobId;
+    delete btn.dataset.cancelling;
+  }
+
+  function showCancelBtn(btn, jobId, progressTitle) {
+    btn.dataset.mode = 'cancel';
+    btn.dataset.jobId = String(jobId);
+    btn.disabled = false;
+    btn.textContent = 'Cancel';
+    btn.classList.add('btn-cancel');
+    btn.classList.remove('is-cancelling');
+    btn.title = progressTitle || 'Cancel and close TeamViewer sessions';
+  }
+
+  document.querySelectorAll('.install-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('a, button, input, .install-card-actions, .layer-thumb, .layer-ip')) return;
+      const url = card.dataset.detail;
+      if (url) window.location = url;
+    });
+  });
+
+  const modal = document.getElementById('thumb-modal');
+  const modalImg = document.getElementById('thumb-modal-img');
+
+  function wireThumbBtn(btn) {
+    if (btn.dataset.wired === '1') return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', () => {
+      modalImg.src = btn.dataset.full;
+      modal.showModal();
+    });
+  }
+  document.querySelectorAll('.thumb-btn').forEach(wireThumbBtn);
+
+  function findInstallCard(pole) {
+    if (!pole) return null;
+    const escaped = CSS.escape(pole);
+    return document.querySelector(`.install-card[data-pole="${escaped}"]`)
+      || document.querySelector(`.install-card[data-identifier="${escaped}"]`);
+  }
+
+  function applyScreenshots(pole, screenshots) {
+    if (!pole || !Array.isArray(screenshots) || !screenshots.length) return;
+    const card = findInstallCard(pole);
+    if (!card) return;
+    for (const shot of screenshots) {
+      const key = String(shot.label || '').trim().toLowerCase();
+      if (!key || !shot.url) continue;
+      const box = card.querySelector(`.layer-thumb[data-thumb-key="${CSS.escape(key)}"]`);
+      if (!box) continue;
+      let btn = box.querySelector('.thumb-btn');
+      if (!btn) {
+        box.innerHTML = '';
+        btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'thumb-btn';
+        const img = document.createElement('img');
+        img.alt = key + ' capture';
+        img.loading = 'lazy';
+        btn.appendChild(img);
+        box.appendChild(btn);
+        wireThumbBtn(btn);
+      }
+      if (btn.dataset.full === shot.url) continue;
+      btn.dataset.full = shot.url;
+      btn.title = key;
+      const img = btn.querySelector('img');
+      if (img) img.src = shot.url;
+    }
+  }
+
+  const fab = document.getElementById('scroll-to-top');
+  window.addEventListener('scroll', () => {
+    fab.classList.toggle('visible', window.scrollY > 400);
+  });
+  fab.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+
+  function formatVbeCheckStamp(when) {
+    const d = when instanceof Date ? when : new Date(when);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  }
+
+  function updateVbeLastCheck(pole, when) {
+    if (!pole) return;
+    const card = findInstallCard(pole);
+    if (!card) return;
+    const el = card.querySelector('[data-vbe-last-check]');
+    if (!el) return;
+    const stamp = formatVbeCheckStamp(when || new Date());
+    if (!stamp) return;
+    const iso = (when instanceof Date ? when : new Date(when || Date.now())).toISOString();
+    el.innerHTML = `Last VBE check <time datetime="${iso}">${stamp}</time>`;
+  }
+
+  async function pollJob(statusUrl, btn, pole, idleLabel, opts) {
+    const options = opts || {};
+    const doneLabel = idleLabel || btn.dataset.idleLabel || 'Capture';
+    const cancelable = !!options.cancelable;
+    for (let i = 0; i < 180; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      const res = await fetch(statusUrl, { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      applyScreenshots(pole, data.screenshots);
+      const label = data.progress || data.message || data.status || 'Running';
+      const elapsed = (data.elapsed_s != null) ? ` (${data.elapsed_s}s)` : '';
+      if (cancelable && btn.dataset.mode === 'cancel' && btn.dataset.cancelling !== '1') {
+        btn.textContent = 'Cancel';
+        btn.disabled = false;
+        btn.title = `${label}${elapsed}`;
+      } else if (btn.dataset.cancelling === '1') {
+        btn.textContent = 'Cancelling…';
+        btn.disabled = true;
+        btn.title = `${label}${elapsed}`;
+      } else {
+        const short = label.length > 28 ? label.slice(0, 26) + '…' : label;
+        btn.textContent = short;
+        btn.title = `${label}${elapsed}`;
+      }
+      if (data.status === 'succeeded') {
+        resetActionBtn(btn, doneLabel);
+        const summary = data.progress || data.message || doneLabel;
+        btn.title = data.error_message
+          ? `Done with warnings: ${data.error_message}`
+          : summary;
+        if (options.updateVbeCheck) {
+          updateVbeLastCheck(pole, new Date());
+        }
+        return;
+      }
+      if (data.status === 'cancelled') {
+        resetActionBtn(btn, doneLabel);
+        btn.title = 'Cancelled';
+        return;
+      }
+      if (data.status === 'failed') {
+        resetActionBtn(btn, doneLabel);
+        alert(data.error_message || data.message || doneLabel + ' failed');
+        return;
+      }
+    }
+    resetActionBtn(btn, doneLabel);
+    alert(doneLabel + ' timed out waiting for status — check logs/dst.log for [AUDIT] lines');
+  }
+
+  async function cancelJob(btn, idleLabel) {
+    const jobId = btn.dataset.jobId;
+    if (!jobId) return;
+    btn.dataset.cancelling = '1';
+    btn.classList.add('is-cancelling');
+    btn.disabled = true;
+    btn.textContent = 'Cancelling…';
+    btn.title = 'Closing TeamViewer sessions…';
+    try {
+      const res = await fetch(cancelUrl(jobId), {
+        method: 'POST',
+        headers: {
+          'X-CSRFToken': csrf,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(data.error || 'Cancel failed');
+        showCancelBtn(btn, jobId, 'Cancel failed — try again');
+        delete btn.dataset.cancelling;
+        btn.classList.remove('is-cancelling');
+      }
+    } catch (err) {
+      alert(String(err));
+      showCancelBtn(btn, jobId, 'Cancel failed — try again');
+      delete btn.dataset.cancelling;
+      btn.classList.remove('is-cancelling');
+    }
+  }
+
+  async function startCapture(btn, mode) {
+    const pole = btn.dataset.pole || '';
+    const installationId = btn.dataset.installationId || '';
+    const idleLabel = btn.dataset.idleLabel || btn.textContent.trim() || 'Capture';
+    if (!pole && !installationId) return;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      const payload = {};
+      if (pole) payload.pole_number = pole;
+      if (installationId) payload.installation_id = installationId;
+      if (mode) payload.mode = mode;
+      const res = await fetch(CAPTURE_URL, {
+        method: 'POST',
+        headers: {
+          'X-CSRFToken': csrf,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'Capture failed to start');
+        resetActionBtn(btn, idleLabel);
+        return;
+      }
+      const cancelable = mode === 'tv' || mode === 'ovrc';
+      if (cancelable) {
+        showCancelBtn(btn, data.job_id, 'Starting…');
+        pollJob(data.status_url, btn, data.pole || pole, idleLabel, { cancelable: true });
+      } else {
+        btn.textContent = 'Starting…';
+        pollJob(data.status_url, btn, data.pole || pole, idleLabel);
+      }
+    } catch (err) {
+      alert(String(err));
+      resetActionBtn(btn, idleLabel);
+    }
+  }
+
+  document.querySelectorAll('[data-action="capture"]').forEach(btn => {
+    const captureMode = (btn.dataset.captureMode || '').trim();
+    const idle = btn.textContent.trim() || 'Capture';
+    btn.dataset.idleLabel = idle;
+    btn.dataset.idleTitle = btn.title || idle;
+    btn.addEventListener('click', () => {
+      if (btn.dataset.mode === 'cancel') {
+        cancelJob(btn, idle);
+        return;
+      }
+      startCapture(btn, captureMode);
+    });
+  });
+
+  async function startVbeCheck(btn) {
+    const installationId = btn.dataset.installationId || '';
+    const pole = btn.dataset.pole || '';
+    const idleLabel = btn.dataset.idleLabel || 'VBE';
+    if (!installationId) return;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      const res = await fetch(VBE_CHECK_URL, {
+        method: 'POST',
+        headers: {
+          'X-CSRFToken': csrf,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ installation_id: installationId }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'VBE Check failed to start');
+        resetActionBtn(btn, idleLabel);
+        return;
+      }
+      showCancelBtn(btn, data.job_id, 'Starting…');
+      pollJob(data.status_url, btn, data.pole || pole, idleLabel, {
+        cancelable: true,
+        updateVbeCheck: true,
+      });
+    } catch (err) {
+      alert(String(err));
+      resetActionBtn(btn, idleLabel);
+    }
+  }
+
+  document.querySelectorAll('[data-action="vbe-check"]').forEach(btn => {
+    btn.dataset.idleLabel = btn.textContent.trim() || 'VBE';
+    btn.dataset.idleTitle = btn.title || 'Run VBE Daily Check for this site';
+    btn.addEventListener('click', () => {
+      if (btn.dataset.mode === 'cancel') {
+        cancelJob(btn, btn.dataset.idleLabel || 'VBE');
+        return;
+      }
+      startVbeCheck(btn);
+    });
+  });
+
+  const vbeChecksBtn = document.getElementById('vbe-checks-btn');
+  if (vbeChecksBtn) {
+    vbeChecksBtn.dataset.idleLabel = 'VBE Checks';
+    vbeChecksBtn.dataset.idleTitle = vbeChecksBtn.title || 'VBE Checks';
+    vbeChecksBtn.addEventListener('click', async () => {
+      const idleLabel = 'VBE Checks';
+      if (vbeChecksBtn.dataset.mode === 'cancel') {
+        cancelJob(vbeChecksBtn, idleLabel);
+        return;
+      }
+      if (!confirm('Run VBE Daily Checks for all VBE sites? This captures every TeamViewer lane and saves PNGs to the shared folder.')) {
+        return;
+      }
+      vbeChecksBtn.disabled = true;
+      vbeChecksBtn.textContent = '…';
+      try {
+        const res = await fetch(VBE_CHECKS_URL, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': csrf,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || 'VBE Checks failed to start');
+          resetActionBtn(vbeChecksBtn, idleLabel);
+          return;
+        }
+        showCancelBtn(vbeChecksBtn, data.job_id, `Starting ${data.sites || ''}…`);
+        // Bulk job: keep Cancel visible; reload when done so all card thumbs refresh.
+        for (let i = 0; i < 900; i++) {
+          await new Promise(r => setTimeout(r, 2000));
+          const st = await fetch(data.status_url, { headers: { 'Accept': 'application/json' } });
+          if (!st.ok) continue;
+          const status = await st.json();
+          const label = status.progress || status.message || status.status || 'Running';
+          if (vbeChecksBtn.dataset.cancelling === '1') {
+            vbeChecksBtn.textContent = 'Cancelling…';
+            vbeChecksBtn.disabled = true;
+            vbeChecksBtn.title = label;
+          } else if (vbeChecksBtn.dataset.mode === 'cancel') {
+            vbeChecksBtn.textContent = 'Cancel';
+            vbeChecksBtn.disabled = false;
+            vbeChecksBtn.title = label;
+          } else {
+            const short = label.length > 36 ? label.slice(0, 34) + '…' : label;
+            vbeChecksBtn.textContent = short;
+            vbeChecksBtn.title = label;
+          }
+          if (status.status === 'succeeded') {
+            window.location.reload();
+            return;
+          }
+          if (status.status === 'cancelled') {
+            resetActionBtn(vbeChecksBtn, idleLabel);
+            return;
+          }
+          if (status.status === 'failed') {
+            resetActionBtn(vbeChecksBtn, idleLabel);
+            alert(status.error_message || status.message || 'VBE Checks failed');
+            return;
+          }
+        }
+        resetActionBtn(vbeChecksBtn, idleLabel);
+        alert('VBE Checks timed out — check Audits / logs/dst.log');
+      } catch (err) {
+        alert(String(err));
+        resetActionBtn(vbeChecksBtn, idleLabel);
+      }
+    });
+  }
+
+  function formatOvrcDcamMessage(data) {
+    const results = data.results || [];
+    if (!results.length) return 'Turn On completed.';
+    const parts = results.map(r => {
+      if (r.action === 'already_on') return `${r.fx}: already on`;
+      if (r.action === 'turned_on') return `${r.fx}: successfully turned on`;
+      return `${r.fx}: ${r.action || 'ok'}`;
+    });
+    const allAlready = results.every(r => r.action === 'already_on');
+    const allTurned = results.every(r => r.action === 'turned_on');
+    if (allAlready) return `Already on.\n\n${parts.join('\n')}`;
+    if (allTurned) return `Successfully turned on.\n\n${parts.join('\n')}`;
+    return `Turn On finished.\n\n${parts.join('\n')}`;
+  }
+
+  function formatRelaysMessage(data, pole) {
+    const names = (data.relays || []).join(', ') || 'relays';
+    if (data.action === 'already_on') {
+      return `Pole ${pole}: already on.\n\n${names}`;
+    }
+    if (data.action === 'turned_on') {
+      return `Pole ${pole}: successfully turned on.\n\n${names}`;
+    }
+    return `Pole ${pole}: relays ON.\n\n${names}`;
+  }
+
+  document.querySelectorAll('[data-action="relays"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const pole = btn.dataset.pole;
+      if (!pole) return;
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = '…';
+      try {
+        const res = await fetch(RELAYS_URL, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': csrf,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ pole_number: pole }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(data.error || 'Relay request failed');
+        } else {
+          const names = (data.relays || []).join(', ') || 'ok';
+          btn.title = 'Relays ON: ' + names;
+          btn.textContent = 'On';
+          alert(formatRelaysMessage(data, pole));
+          setTimeout(() => { btn.textContent = prev; }, 2000);
+        }
+      } catch (err) {
+        alert(String(err));
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '…') btn.textContent = prev;
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-action="ovrc-dcam"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const pole = btn.dataset.pole || '';
+      const installationId = btn.dataset.installationId || '';
+      if (!pole && !installationId) return;
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = '…';
+      try {
+        const payload = {};
+        if (pole) payload.pole_number = pole;
+        if (installationId) payload.installation_id = installationId;
+        const res = await fetch(OVRC_DCAM_URL, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': csrf,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert(data.error || 'OvrC Turn On failed');
+          btn.textContent = prev;
+          return;
+        }
+        const parts = (data.results || []).map(r => {
+          if (r.action === 'already_on') return `${r.fx}: already on`;
+          if (r.action === 'turned_on') return `${r.fx}: turned on`;
+          return `${r.fx}: ${r.action || 'ok'}`;
+        });
+        btn.title = parts.join('; ') || 'DCAM System OK';
+        btn.textContent = 'On';
+        alert(formatOvrcDcamMessage(data));
+        setTimeout(() => { btn.textContent = prev; }, 2500);
+      } catch (err) {
+        alert(String(err));
+        btn.textContent = prev;
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === '…') btn.textContent = prev;
+      }
+    });
+  });
+})();
+</script>
+{% include "cameras/_tv_id_edit_js.html" %}
+{% endblock %}

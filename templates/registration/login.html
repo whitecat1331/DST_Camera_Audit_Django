@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Login — DST Camera Audit{% endblock %}
+{% block content %}
+<section class="auth-panel">
+  <h1>DST Camera Audit</h1>
+  <p class="lede">Sign in with your IMS account. MFA is enforced by IMS.</p>
+  {% if error %}
+  <p class="error">{{ error }}</p>
+  {% endif %}
+  {% if ims_configured %}
+  <p><a class="btn-primary" href="{{ ims_start_url }}">Sign in with IMS</a></p>
+  {% else %}
+  <p class="error">IMS SSO is not configured. Set IMS_BASE_URL, IMS_SSO_CLIENT_ID, and IMS_SSO_CLIENT_SECRET.</p>
+  {% endif %}
+  {% if local_admin_enabled %}
+  <p class="lede"><a href="{% url 'login' %}?local=1">Local admin login</a></p>
+  {% endif %}
+</section>
+{% endblock %}

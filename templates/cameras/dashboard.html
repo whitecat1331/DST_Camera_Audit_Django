@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — DST Camera Audit{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+<div class="stat-row">
+  <a class="stat stat-link" href="{% url 'camera_list' %}">
+    <span class="stat-n">{{ installation_count }}</span><span class="stat-l">Installations</span>
+  </a>
+  <a class="stat stat-link" href="{% url 'map' %}">
+    <span class="stat-n">{{ mapped_count }}</span><span class="stat-l">Mapped</span>
+  </a>
+  <a class="stat stat-link" href="{% url 'audit_list' %}">
+    <span class="stat-n">{{ job_count }}</span><span class="stat-l">Audit jobs</span>
+  </a>
+  <div class="stat"><span class="stat-n">{{ running_count }}</span><span class="stat-l">Active</span></div>
+  <div class="stat ims-{{ ims_status.status }}">
+    <span class="stat-n ims-status">
+      {% if ims_status.status == "connected" %}Online
+      {% elif ims_status.status == "auth_error" %}Auth error
+      {% elif ims_status.status == "not_configured" %}Not set
+      {% else %}Offline
+      {% endif %}
+    </span>
+    <span class="stat-l">IMS link</span>
+  </div>
+</div>
+
+<p class="lede">
+  <a href="{% url 'camera_list' %}">Browse installations →</a>
+  · <a href="{% url 'capture_explorer' %}">Open captures explorer →</a>
+</p>
+
+{% if can_audit %}
+<section class="panel">
+  <h2>DragonEye TeamViewer IDs</h2>
+  <p class="lede">
+    Upload <code>DragonEye Teamviewer IDs.csv</code> to map each FX serial to its TeamViewer ID
+    (and L1/L2 lanes), or edit IDs directly on installation TeamViewer layers.
+    FX cards expose <strong>TV</strong>, <strong>OvrC</strong>, and (for VBE sites) <strong>VBE</strong> capture buttons.
+    TV uses <code>TV_USERNAME</code> / <code>TV_PASSWORD</code>; OvrC uses <code>OVRC_USERNAME</code> / <code>OVRC_PASSWORD</code>.
+  </p>
+  <form method="post" action="{% url 'upload_dragoneye_tv_csv' %}" enctype="multipart/form-data" class="filters">
+    {% csrf_token %}
+    <input type="file" name="csv_file" accept=".csv,text/csv" required>
+    <button type="submit">Upload CSV</button>
+    <span class="lede">
+      {% if dragoneye_tv_count %}
+      Loaded {{ dragoneye_tv_count }} ID{{ dragoneye_tv_count|pluralize }}{% if dragoneye_tv_source %} from {{ dragoneye_tv_source }}{% endif %}
+      {% else %}
+      No IDs loaded yet
+      {% endif %}
+    </span>
+  </form>
+</section>
+{% endif %}
+
+<section>
+  <div class="section-head">
+    <h2>Recent audits</h2>
+    <a href="{% url 'audit_list' %}">View all</a>
+  </div>
+  {% include "audits/_job_table.html" with jobs=recent_jobs %}
+</section>
+{% endblock %}

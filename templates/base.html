@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>{% block title %}DST Camera Audit{% endblock %}</title>
+  {% load static %}
+  <link rel="stylesheet" href="{% static 'app.css' %}?v=21">
+  {% block extra_head %}{% endblock %}
+</head>
+<body>
+  {% if user.is_authenticated %}
+  <header class="topbar">
+    <a class="brand" href="{% url 'dashboard' %}">DST Camera Audit</a>
+    <nav>
+      <a href="{% url 'camera_list' %}">Installations</a>
+      <a href="{% url 'map' %}">Map</a>
+      <a href="{% url 'audit_list' %}">Audits</a>
+      <a href="{% url 'dst_audit' %}">DST Audit</a>
+      <a href="{% url 'confirm_captures' %}">Confirm Captures</a>
+      <a href="{% url 'capture_explorer' %}">Captures</a>
+      <form class="inline" method="post" action="{% url 'logout' %}">
+        {% csrf_token %}
+        <button type="submit" class="linkish">Logout ({{ user.username }})</button>
+      </form>
+    </nav>
+  </header>
+  {% endif %}
+
+  <main class="container {% block container_class %}{% endblock %}">
+    {% if messages %}
+    <ul class="messages">
+      {% for message in messages %}
+      <li class="{{ message.tags }}">{{ message }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  {% block extra_js %}{% endblock %}
+</body>
+</html>

@@ -1,4 +1,4 @@
-﻿# DST Camera Audit
+# DST Camera Audit
 
 Django web app for **ASE installation camera audits** at Blue Line Solutions. Operators sign in through **IMS SSO**, sync installation inventory from IMS, view sites on a Folium map, and run automated capture jobs that store screenshots and metadata locally.
 
@@ -7,9 +7,31 @@ Django web app for **ASE installation camera audits** at Blue Line Solutions. Op
 | Site type | Stack | Env / inputs |
 |-----------|--------|----------------|
 | **LTI / pole (CBW + VNC)** | Chrome (Selenium) for CBW date/time relay UI; VNC for camera layers | `CBW_USERNAME`, `CBW_PASSWORDS`, `TF_VNC_PASSWORD` |
-| **DragonEye** | TeamViewer to DragonCam; FX serial → TeamViewer ID map | `TV_USERNAME`, `TV_PASSWORD` (or `TEAMVIEWER_PASSWORDS`), CSV upload on dashboard or `DragonEye Teamviewer IDs.csv` in project root (gitignored) |
+| **DragonEye** | TeamViewer to DragonCam; FX serial → TeamViewer ID map; **OvrC** local date/time + WattBox **DCAM System** Turn On (only if OFF) | `TV_USERNAME`, `TV_PASSWORD` (comma list: try each for TV connect; **last** entry is the in-session camera login), optional `TEAMVIEWER_PASSWORDS`, CSV upload on dashboard or `DragonEye Teamviewer IDs.csv` in project root (gitignored); `OVRC_USERNAME`, `OVRC_PASSWORD` |
 
-Chrome is required for CBW captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
+### DST Audit (fleet)
+
+`/audits/dst/` orchestrates a full DST timezone audit for **selected** sites (checkboxes on the eligible list; Select all / LTI only / DE only helpers). Selection persists across searches.
+
+1. **Power on** — all selected sites first (LTI CBW relays in parallel; **one** OvrC login for every DE DCAM outlet)
+2. **Settle** — wait (`DST_POWER_SETTLE_SECONDS`, default 90s); skipped if everything was already on
+3. **Capture** — per site: LTI CBW + VNC, or DE TeamViewer lanes
+4. **OvrC times** — one OvrC pass for all FX local times (keeps the portal’s ADT/EDT zone label)
+
+Compare **OvrC device time** on each site job to **Finished** (EST). Progress bars (4 phases) and cancel are on the DST Audit page; terminal logs use `[DST]` / `[AUDIT]`.
+
+Chrome is required for CBW and OvrC captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
+
+### Export Post Install Images (for IMS)
+
+After a successful **TV Capture** on a DragonEye site detail page, use
+**Export Post Install Images** to download a zip that includes:
+
+- TeamViewer lane captures (`tv/de_l1.png`, `tv/de_l2.png`, …)
+- Site photos from `{Site Documents}\{pole}\Site Photos\`
+
+Upload that zip in IMS under **Installation Registry → DE Post-Install Pack**.
+IMS does not need SharePoint access — everything comes from this zip.
 
 ## Setup
 
@@ -40,13 +62,14 @@ See `.env.example` for the full list. Required for production use:
 - **Django:** `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`
 - **IMS:** `IMS_BASE_URL`, `IMS_SSO_CLIENT_ID`, `IMS_SSO_CLIENT_SECRET`, `IMS_API_TOKEN`
 - **LTI captures:** `CBW_USERNAME`, `CBW_PASSWORDS`, `TF_VNC_PASSWORD`
-- **DragonEye:** `TV_USERNAME`, `TV_PASSWORD`
+- **DragonEye:** `TV_USERNAME`, `TV_PASSWORD` (connect tries each comma-separated value; camera login uses the last)
+- **OvrC (FX local time):** `OVRC_USERNAME`, `OVRC_PASSWORD` (optional `OVRC_BASE_URL`)
 
-Optional: `IMS_SSO_REDIRECT_URI`, `IMS_TLS_VERIFY=false` (dev only), `DST_LOCAL_ADMIN=1` (break-glass Django admin), `AUDIT_MAX_CONCURRENT`, `AUDIT_STEP_CONCURRENT`, `LOG_LEVEL`, `LOG_FILE`, `LOG_TO_FILE`, `TEAMVIEWER_PATH`.
+Optional: `IMS_SSO_REDIRECT_URI`, `IMS_TLS_VERIFY=false` (dev only), `DST_LOCAL_ADMIN=1` (break-glass Django admin), `AUDIT_MAX_CONCURRENT`, `AUDIT_STEP_CONCURRENT`, `DST_POWER_SETTLE_SECONDS`, `LOG_LEVEL`, `LOG_FILE`, `LOG_TO_FILE`, `TEAMVIEWER_PATH`.
 
 ### Logging
 
-Bracket prefixes match sibling apps (`[INIT]`, `[HTTP]`, `[AUTH]`, `[IMS]`, `[SYNC]`, `[AUDIT]`, `[CBW]`, `[VNC]`, `[TV]`, `[DE]`). Default log file: `logs/dst.log` (rotating; directory is gitignored).
+Bracket prefixes match sibling apps (`[INIT]`, `[HTTP]`, `[AUTH]`, `[IMS]`, `[SYNC]`, `[AUDIT]`, `[DST]`, `[CBW]`, `[VNC]`, `[TV]`, `[DE]`, `[OVRC]`). Default log file: `logs/dst.log` (rotating; directory is gitignored).
 
 ## Run
 
@@ -56,7 +79,40 @@ python manage.py sync_installations
 python manage.py runserver
 ```
 
+Or via the included PowerShell wrapper (activates `.venv` for you):
+
+```powershell
+.\start_dst_camera_audit.ps1
+```
+
 Open http://127.0.0.1:8000/ and **Sign in with IMS**.
+
+### Choosing the port and pointing at IMS
+
+`runserver` accepts extra flags (see `python manage.py runserver --help`):
+
+| Flag | Effect |
+|------|--------|
+| `--http P` | Serve plain HTTP on port `P` |
+| `--https P` | Serve HTTPS on port `P` using a self-signed dev cert (auto-generated under `certs/`) |
+| `--ims URL` | Point at IMS: sets `IMS_BASE_URL` and derives `IMS_SSO_REDIRECT_URI` from the chosen scheme/port |
+
+`--http` and `--https` are mutually exclusive. When `--ims` is given, the SSO
+callback is auto-derived as `{scheme}://127.0.0.1:{port}/accounts/ims/callback/`,
+so you do not need `IMS_SSO_REDIRECT_URI` in `.env` for local dev.
+
+Local dev pairing with IMS:
+
+```powershell
+# IMS (Access Replacement repo):
+.\start_access_replacement.ps1 --http 8051 --dst http://127.0.0.1:8050
+
+# DST Camera Audit (this repo):
+.\start_dst_camera_audit.ps1 --http 8050 --ims http://127.0.0.1:8051
+```
+
+Point `--ims` at IMS's base URL (scheme + host + port). If you run IMS over
+HTTPS with a self-signed cert instead, set `IMS_TLS_VERIFY=false` in `.env`.
 
 | IMS role | Access |
 |----------|--------|
@@ -70,9 +126,11 @@ Open http://127.0.0.1:8000/ and **Sign in with IMS**.
 |------|---------|
 | `/` | Dashboard + sync from IMS (admin+) |
 | `/cameras/` | Installation cards with device/sensor layers and capture thumbnails |
-| `/cameras/<id>/` | Detail, audit controls |
+| `/cameras/<id>/` | Detail, audit controls, **Export Post Install Images** (DE zip for IMS) |
+| `/cameras/<id>/export-de-pi-tv/` | Download Site Documents + TV captures as `*_post_install_images.zip` |
 | `/map/` | Folium map |
 | `/audits/`, `/audits/<id>/` | Job list and status + screenshots |
+| `/audits/dst/` | DST Audit orchestration (power-all → settle → capture → OvrC times) |
 | `/sync/` | POST re-sync from IMS |
 | `/accounts/ims/start/`, `/accounts/ims/callback/` | IMS SSO |
 
