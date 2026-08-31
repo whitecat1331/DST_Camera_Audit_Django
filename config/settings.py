@@ -157,7 +157,7 @@ OVRC_BASE_URL = (
 ).rstrip("/")
 
 # VBE Daily Checks export root (OneDrive / shared folder).
-# Example: C:\Users\<you>\Blue Line Solutions, LLC\VBE Daily Checks
+# Example: C:\Users\<you>\Blue Line Solutions, LLC\PSCU Production - Documents\VBE Daily Checks
 VBE_DAILY_CHECKS_ROOT = os.getenv("VBE_DAILY_CHECKS_ROOT", "")
 
 AUDIT_MAX_CONCURRENT = int(os.getenv("AUDIT_MAX_CONCURRENT", "2"))

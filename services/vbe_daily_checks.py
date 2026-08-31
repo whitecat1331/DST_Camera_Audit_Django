@@ -4,7 +4,7 @@ Layout:
   {root}/{YYYY}/{MM MonthName YYYY}/VBE {NNNN}/{M.D.YY} {AM|PM} Check Lane {n}.png
 
 Month folders historically mix "02February 2026" and "02 February 2026";
-lookup accepts both, new folders use the spaced form.
+lookup accepts both, new folders use the no-space form ("08August 2026").
 
 IMS often has two rows per truck:
   - canonical site id  I-VBE-0012  (folder → VBE 0012)
@@ -148,8 +148,8 @@ def capture_filename(when: datetime, lane: int) -> str:
 def _month_folder_candidates(year_dir: Path, when: datetime) -> list[Path]:
     name = _MONTH_NAMES[when.month - 1]
     return [
-        year_dir / f"{when.month:02d} {name} {when.year}",
         year_dir / f"{when.month:02d}{name} {when.year}",
+        year_dir / f"{when.month:02d} {name} {when.year}",
     ]
 
 
