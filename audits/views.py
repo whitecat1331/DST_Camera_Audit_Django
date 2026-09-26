@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Any
 
 from django.conf import settings
 from django.contrib import messages
@@ -9,6 +10,7 @@ from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_GET, require_POST
 from django.utils import timezone
+from django.http import FileResponse, Http404
 
 from audits.models import AuditJob
 from audits.runner import enqueue_audit_job, request_job_cancel
@@ -1573,6 +1575,235 @@ def start_confirm_captures(request):
             "page_url": f"/audits/confirm-captures/?job={job.pk}",
             "mode": "confirm_batch",
         }
+    )
+
+
+def _rejection_recent_rows(limit: int = 12) -> list[dict]:
+    from audits.runner import _eastern_display
+
+    recent = (
+        AuditJob.objects.filter(
+            device_type=AuditJob.DeviceType.REJECTION_REPORT,
+            parent_job__isnull=True,
+        )
+        .prefetch_related("child_jobs")
+        .order_by("-created_at")[:limit]
+    )
+    rows: list[dict] = []
+    for job in recent:
+        children = list(job.child_jobs.all())
+        when = job.finished_at or job.created_at
+        rows.append(
+            {
+                "id": job.pk,
+                "label": f"#{job.pk}",
+                "status": job.status,
+                "status_display": job.get_status_display(),
+                "when_display": _eastern_display(when),
+                "message": job.progress_message or job.get_status_display(),
+                "site_count": len(children),
+                "detail_url": f"/audits/{job.pk}/",
+                "download_url": f"/audits/rejection-report/{job.pk}/download/",
+            }
+        )
+    return rows
+
+
+@login_required
+def rejection_report_page(request):
+    """Rejection CSV report — upload, match, run, and download the result."""
+    can_audit = role_at_least(request.user, "technician")
+    active_job = (
+        AuditJob.objects.filter(
+            device_type=AuditJob.DeviceType.REJECTION_REPORT,
+            parent_job__isnull=True,
+            status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    return render(
+        request,
+        "audits/rejection_report.html",
+        {
+            "can_audit": can_audit,
+            "active_job": active_job,
+            "active_download_url": (
+                f"/audits/rejection-report/{active_job.pk}/download/"
+                if active_job
+                else ""
+            ),
+            "recent_jobs": _rejection_recent_rows(12),
+        },
+    )
+
+
+def _read_rejection_csv_upload(request) -> tuple[str, Any]:
+    upload = request.FILES.get("file") or request.FILES.get("rejection_csv")
+    if upload is None:
+        return "Upload a rejection .csv file", None
+    name = (getattr(upload, "name", "") or "").lower()
+    if not name.endswith(".csv"):
+        return "File must be a .csv", None
+    return "", upload
+
+
+def _serialize_rejection_rows(report) -> list[dict]:
+    out = []
+    for item in report.rows:
+        out.append(
+            {
+                "serial": item.row.serial,
+                "count": item.row.count,
+                "reason": item.row.reason,
+                "source_row": item.row.source_row,
+                "status": item.status,
+                "installation_id": item.installation_id,
+                "identifier": item.identifier,
+                "pole": item.pole,
+                "kind": item.kind,
+                "match_by": item.match_by,
+                "reason_note": item.reason,
+            }
+        )
+    return out
+
+
+@login_required
+@require_POST
+def preview_rejection_report(request):
+    """Parse + match a rejection CSV and return a preview JSON."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    err, upload = _read_rejection_csv_upload(request)
+    if err:
+        return JsonResponse({"error": err}, status=400)
+
+    from services.rejection_csv import parse_rejection_csv
+    from services.rejection_match import match_rejection_rows
+
+    try:
+        rows = parse_rejection_csv(upload.read())
+        report = match_rejection_rows(rows)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[REJECTION] preview parse failed")
+        return JsonResponse({"error": f"Could not read CSV: {exc}"}, status=400)
+
+    preview_rows = []
+    for item in report.rows:
+        preview_rows.append(
+            {
+                "serial": item.row.serial,
+                "count": item.row.count,
+                "reason": item.row.reason,
+                "status": item.status,
+                "kind": item.kind,
+                "identifier": item.identifier,
+                "pole": item.pole,
+                "match_by": item.match_by,
+                "reason_note": item.reason,
+            }
+        )
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "row_count": len(preview_rows),
+            "matched_count": report.matched_count,
+            "unmatched_count": report.unmatched_count,
+            "ineligible_count": report.ineligible_count,
+            "duplicate_count": report.duplicate_count,
+            "rows": preview_rows,
+        }
+    )
+
+
+@login_required
+@require_POST
+def start_rejection_report(request):
+    """Parse the CSV again, persist rows, and enqueue the report job."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    err, upload = _read_rejection_csv_upload(request)
+    if err:
+        return JsonResponse({"error": err}, status=400)
+
+    from services.rejection_csv import parse_rejection_csv
+    from services.rejection_match import match_rejection_rows
+
+    try:
+        rows = parse_rejection_csv(upload.read())
+        report = match_rejection_rows(rows)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[REJECTION] start parse failed")
+        return JsonResponse({"error": f"Could not read CSV: {exc}"}, status=400)
+
+    if not report.rows:
+        return JsonResponse({"error": "CSV contained no rows"}, status=400)
+
+    running = AuditJob.objects.filter(
+        device_type__in=[
+            AuditJob.DeviceType.REJECTION_REPORT,
+            AuditJob.DeviceType.CONFIRM_BATCH,
+            AuditJob.DeviceType.CONFIRM_SITE,
+            AuditJob.DeviceType.VBE_DAILY_ALL,
+            AuditJob.DeviceType.DST_AUDIT,
+        ],
+        parent_job__isnull=True,
+        status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
+    ).exists()
+    if running:
+        return JsonResponse(
+            {"error": "Another fleet capture is already running (Rejection / Confirm / VBE / DST)"},
+            status=409,
+        )
+
+    from audits.runner import write_rejection_selection
+
+    serialized = _serialize_rejection_rows(report)
+    job = AuditJob.objects.create(
+        pole_number="REJECTION",
+        target_host=f"0/{len(serialized)}",
+        device_type=AuditJob.DeviceType.REJECTION_REPORT,
+        created_by=request.user,
+        progress_message=f"Queued — {len(serialized)} row(s)",
+    )
+    write_rejection_selection(job.pk, serialized)
+    enqueue_audit_job(job.pk)
+    logger.info(
+        "[REJECTION] start job=%s rows=%s user=%s",
+        job.pk,
+        len(serialized),
+        request.user.get_username(),
+    )
+    return JsonResponse(
+        {
+            "ok": True,
+            "job_id": job.pk,
+            "rows": len(serialized),
+            "status_url": f"/audits/{job.pk}/status/",
+            "detail_url": f"/audits/{job.pk}/",
+            "download_url": f"/audits/rejection-report/{job.pk}/download/",
+        }
+    )
+
+
+@login_required
+@require_GET
+def download_rejection_report(request, pk):
+    """Serve the generated .xlsx report for a finished rejection job."""
+    job = get_object_or_404(AuditJob, pk=pk, device_type=AuditJob.DeviceType.REJECTION_REPORT)
+    from audits.runner import _rejection_report_xlsx_path
+
+    path = _rejection_report_xlsx_path(job.pk)
+    if not path.exists():
+        raise Http404("Report not ready")
+    return FileResponse(
+        path.open("rb"),
+        as_attachment=True,
+        filename=f"rejection_report_{job.pk}.xlsx",
     )
 
 

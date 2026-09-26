@@ -24,6 +24,26 @@ urlpatterns = [
     path("vbe-daily-checks/", views.start_vbe_daily_checks, name="vbe_daily_checks"),
     path("turn-relays/", views.turn_relays, name="turn_relays"),
     path("turn-ovrc-dcam/", views.turn_ovrc_dcam, name="turn_ovrc_dcam"),
+    path(
+        "rejection-report/",
+        views.rejection_report_page,
+        name="rejection_report",
+    ),
+    path(
+        "rejection-report/preview/",
+        views.preview_rejection_report,
+        name="rejection_report_preview",
+    ),
+    path(
+        "rejection-report/start/",
+        views.start_rejection_report,
+        name="rejection_report_start",
+    ),
+    path(
+        "rejection-report/<int:pk>/download/",
+        views.download_rejection_report,
+        name="rejection_report_download",
+    ),
     path("<int:pk>/", views.audit_detail, name="audit_detail"),
     path("<int:pk>/status/", views.audit_job_status, name="audit_job_status"),
     path("<int:pk>/cancel/", views.cancel_audit_job, name="audit_cancel"),

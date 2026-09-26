@@ -1336,6 +1336,406 @@ def _run_confirm_batch(job_id: int, output_dir: Path) -> tuple[list[str], int]:
     return all_errors, sites_ok
 
 
+def _rejection_selection_path(job_id: int) -> Path:
+    return Path(settings.MEDIA_ROOT) / "audits" / f"rejection_selection_{job_id}.json"
+
+
+def write_rejection_selection(job_id: int, rows: list[dict]) -> Path:
+    """Persist parsed + matched rejection CSV rows for the background worker."""
+    import json
+
+    path = _rejection_selection_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"rows": rows}), encoding="utf-8")
+    logger.info("[REJECTION] Job %s selection written count=%s", job_id, len(rows))
+    return path
+
+
+def read_rejection_selection(job_id: int) -> list[dict]:
+    """Return the persisted rejection rows, or [] when none exist."""
+    import json
+
+    path = _rejection_selection_path(job_id)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.exception("[REJECTION] Job %s failed to read selection", job_id)
+        return []
+    return data.get("rows") or []
+
+
+def _rejection_report_dir(job_id: int) -> Path:
+    return Path(settings.MEDIA_ROOT) / "rejection_report" / str(job_id)
+
+
+def _rejection_report_xlsx_path(job_id: int) -> Path:
+    return _rejection_report_dir(job_id) / "report.xlsx"
+
+
+def _rejection_tv_credentials() -> tuple[list[str], list[str], str, str]:
+    """Return (connect_passwords, login_passwords, camera_username, tv_path)."""
+    tv_passwords = list(getattr(settings, "TEAMVIEWER_PASSWORDS", []) or [])
+    cam_passwords = list(getattr(settings, "TV_CAMERA_PASSWORDS", []) or [])
+    if not cam_passwords:
+        legacy = list(getattr(settings, "TV_PASSWORDS", []) or [])
+        cam_passwords = [legacy[-1]] if legacy else list(tv_passwords[-1:] if tv_passwords else [])
+    cam_user = getattr(settings, "TV_USERNAME", "") or ""
+    tv_path = getattr(settings, "TEAMVIEWER_PATH", "") or ""
+    connect_passwords = tv_passwords or cam_passwords
+    login_passwords = cam_passwords
+    return connect_passwords, login_passwords, cam_user, tv_path
+
+
+def _rejection_fx_capture(
+    job_id: int,
+    inst,
+    fx: str,
+    output_dir: Path,
+    *,
+    connect_passwords: list[str],
+    login_passwords: list[str],
+    cam_user: str,
+    tv_path: str,
+) -> list[str]:
+    """Capture each TeamViewer lane for one FX serial."""
+    from services.rejection_match import resolve_fx_tv_targets
+    from services.teamviewer_capture import (
+        CaptureCancelled,
+        capture_dragoneye_via_teamviewer,
+    )
+
+    targets = resolve_fx_tv_targets(inst, fx)
+    if not targets:
+        return [f"No TeamViewer ID mapped for {fx}"]
+
+    errors: list[str] = []
+    used_filenames: set[str] = set()
+    for target in targets:
+        _raise_if_cancelled(job_id)
+        label = target.get("thumb_key") or "de_tv"
+        lane_bit = target.get("lane") or "TV"
+        filename = f"{label}.png"
+        if filename in used_filenames:
+            filename = f"{fx.lower()}_{label}.png"
+        used_filenames.add(filename)
+        try:
+            _set_progress(
+                job_id,
+                f"TeamViewer {fx} {lane_bit} ({target['teamviewer_id']})…",
+            )
+            path = capture_dragoneye_via_teamviewer(
+                teamviewer_id=target["teamviewer_id"],
+                teamviewer_passwords=connect_passwords,
+                camera_passwords=login_passwords,
+                output_dir=output_dir,
+                filename=filename,
+                camera_username=cam_user,
+                teamviewer_path=tv_path,
+                on_progress=lambda msg: _set_progress(job_id, msg),
+                should_cancel=lambda: is_job_cancelled(job_id),
+            )
+            _save_shot(job_id, path, label)
+        except CaptureCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{fx} {lane_bit}: {exc}")
+    return errors
+
+
+def _rejection_ds_capture(
+    job_id: int,
+    inst,
+    ds_serial: str,
+    output_dir: Path,
+) -> list[str]:
+    """Capture the VNC lane for one DS serial."""
+    from services.rejection_match import resolve_ds_vnc_target
+    from services.vnc_capture import capture_vnc
+
+    host, lane_key, thumb = resolve_ds_vnc_target(inst, ds_serial)
+    if not host:
+        return [f"Unable to locate VNC lane for {ds_serial}"]
+    try:
+        _set_progress(job_id, f"VNC {ds_serial} connect {host}…")
+        path = capture_vnc(
+            output_dir=output_dir,
+            host=host,
+            password=settings.TF_VNC_PASSWORD,
+            filename=f"{thumb or 'vnc'}.png",
+            on_progress=lambda msg: _set_progress(job_id, msg),
+        )
+        _save_shot(job_id, path, thumb or "vnc")
+        return []
+    except Exception as exc:  # noqa: BLE001
+        return [f"VNC {lane_key or ds_serial}: {exc}"]
+
+
+def _run_rejection_report(job_id: int, output_dir: Path) -> tuple[list[str], int]:
+    """Run the rejection CSV report: power on, capture, build .xlsx/.csv."""
+    from audits.models import AuditJob
+    from cameras.models import Installation
+    from services.ovrc_capture import ensure_dcam_on_for_fxes
+    from services.teamviewer_capture import CaptureCancelled
+
+    close_old_connections()
+    _raise_if_cancelled(job_id)
+    bulk = AuditJob.objects.get(pk=job_id)
+
+    rows = read_rejection_selection(job_id)
+    if not rows:
+        return ["No rejection CSV rows loaded"], 0
+
+    total = len(rows)
+    matched = [r for r in rows if r.get("status") == "matched"]
+    _set_progress(job_id, f"Rejection Report: 0/{total} rows…")
+    AuditJob.objects.filter(pk=job_id).update(target_host=f"0/{total}")
+
+    all_errors: list[str] = []
+    power_ok: dict[str, bool] = {}
+    power_text: dict[str, str] = {}
+    result_by_serial: dict[str, str] = {}
+    shot_by_serial: dict[str, str] = {}
+
+    fx_rows = [r for r in matched if r.get("kind") == "de"]
+    lti_rows = [r for r in matched if r.get("kind") == "lti"]
+
+    # ── Phase 1: power on ────────────────────────────────────────────────
+    if fx_rows:
+        fx_serials = list(dict.fromkeys((r["serial"] or "").strip().upper() for r in fx_rows))
+        fx_serials = [fx for fx in fx_serials if fx]
+        ovrc_user = (getattr(settings, "OVRC_USERNAME", "") or "").strip()
+        ovrc_pass = (getattr(settings, "OVRC_PASSWORD", "") or "").strip()
+        if not ovrc_user or not ovrc_pass:
+            for fx in fx_serials:
+                power_ok[fx] = False
+                power_text[fx] = "UNABLE TO TURN ON: OVRC_USERNAME / OVRC_PASSWORD not configured"
+        else:
+            _set_progress(job_id, f"Rejection power-on: {len(fx_serials)} FX…")
+            try:
+                results = ensure_dcam_on_for_fxes(
+                    fx_serials,
+                    username=ovrc_user,
+                    password=ovrc_pass,
+                    base_url=getattr(settings, "OVRC_BASE_URL", "") or "https://app.ovrc.com",
+                    headless=True,
+                    on_progress=lambda msg: _set_progress(job_id, msg),
+                )
+                by_fx = {(r.fx_number or "").strip().upper(): r for r in results}
+                for fx in fx_serials:
+                    res = by_fx.get(fx)
+                    if res is None:
+                        power_ok[fx] = False
+                        power_text[fx] = "UNABLE TO TURN ON: no DCAM result"
+                    else:
+                        power_ok[fx] = True
+                        power_text[fx] = f"DCAM {res.action}"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[REJECTION] Job %s FX power-on failed: %s",
+                    job_id,
+                    type(exc).__name__,
+                )
+                for fx in fx_serials:
+                    power_ok[fx] = False
+                    power_text[fx] = f"UNABLE TO TURN ON: {type(exc).__name__}"
+
+    if lti_rows:
+        from services.cbw_relays import turn_all_relays_on
+
+        by_pole: dict[str, list[str]] = {}
+        for r in lti_rows:
+            pole = (r.get("pole") or "").strip()
+            serial = (r["serial"] or "").strip().upper()
+            if pole:
+                by_pole.setdefault(pole, []).append(serial)
+        _set_progress(job_id, f"Rejection power-on: {len(by_pole)} LTI pole(s)…")
+        for pole, serials in by_pole.items():
+            try:
+                result = turn_all_relays_on(
+                    pole,
+                    settings.CBW_USERNAME,
+                    settings.CBW_PASSWORDS,
+                )
+                action = result.action
+                for serial in serials:
+                    power_ok[serial] = True
+                    power_text[serial] = f"relays {action}"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[REJECTION] Job %s LTI power-on failed pole=%s: %s",
+                    job_id,
+                    pole,
+                    type(exc).__name__,
+                )
+                for serial in serials:
+                    power_ok[serial] = False
+                    power_text[serial] = f"UNABLE TO TURN ON: {exc}"
+
+    # ── Phase 2: capture matched + powered-on rows ───────────────────────
+    connect_passwords, login_passwords, cam_user, tv_path = _rejection_tv_credentials()
+    captured = 0
+
+    for r in rows:
+        serial = (r["serial"] or "").strip().upper()
+        status = r.get("status")
+        if status != "matched":
+            note = r.get("reason_note") or r.get("reason") or status
+            result_by_serial[serial] = f"{(status or 'unmatched').upper()}: {note}"
+
+    for index, r in enumerate(matched, start=1):
+        _raise_if_cancelled(job_id)
+        serial = (r["serial"] or "").strip().upper()
+        kind = r.get("kind") or "?"
+        _set_progress(job_id, f"Rejection Report {index}/{len(matched)}: {serial} ({kind})")
+        AuditJob.objects.filter(pk=job_id).update(
+            target_host=f"{index - 1}/{total}",
+            progress_message=f"Rejection Report {index}/{len(matched)}: {serial} ({kind})",
+        )
+
+        if not power_ok.get(serial):
+            result_by_serial[serial] = power_text.get(serial, "UNABLE TO TURN ON")
+            all_errors.append(f"{serial}: {result_by_serial[serial]}")
+            continue
+
+        inst = Installation.objects.filter(
+            pk=r.get("installation_id"), is_active=True
+        ).first()
+        if inst is None:
+            result_by_serial[serial] = "UNABLE TO TURN ON: installation no longer active"
+            all_errors.append(f"{serial}: {result_by_serial[serial]}")
+            continue
+
+        child = AuditJob.objects.create(
+            pole_number=serial,
+            target_host=kind,
+            device_type=AuditJob.DeviceType.REJECTION_SITE,
+            status=AuditJob.Status.RUNNING,
+            created_by=bulk.created_by,
+            parent_job=bulk,
+            started_at=timezone.now(),
+            progress_message=f"Rejection report {job_id} ({index}/{len(matched)})",
+        )
+        with _cancel_lock:
+            child_ev = threading.Event()
+            _cancel_flags[child.pk] = child_ev
+            _job_children.setdefault(job_id, set()).add(child.pk)
+            pev = _cancel_flags.get(job_id)
+            if pev is not None and pev.is_set():
+                child_ev.set()
+        child_dir = output_dir / serial.replace("/", "_").replace("\\", "_")
+        child_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if kind == "de":
+                errors = _rejection_fx_capture(
+                    child.pk,
+                    inst,
+                    serial,
+                    child_dir,
+                    connect_passwords=connect_passwords,
+                    login_passwords=login_passwords,
+                    cam_user=cam_user,
+                    tv_path=tv_path,
+                )
+            else:
+                errors = _rejection_ds_capture(child.pk, inst, serial, child_dir)
+
+            child.refresh_from_db()
+            if child.status == AuditJob.Status.CANCELLED or is_job_cancelled(child.pk):
+                raise CaptureCancelled("Audit cancelled by user")
+            has_shots = child.screenshots.exists()
+            if has_shots:
+                captured += 1
+                child.status = AuditJob.Status.SUCCEEDED
+                child.progress_message = (
+                    f"Done with warnings ({len(errors)})" if errors else "Done"
+                )
+                shot = child.screenshots.first()
+                if shot is not None and shot.image:
+                    shot_by_serial[serial] = shot.image.path
+                result_by_serial[serial] = (
+                    f"OK (warnings: {len(errors)})" if errors else "OK"
+                )
+            else:
+                child.status = AuditJob.Status.FAILED
+                child.progress_message = "Failed"
+                detail = "; ".join(errors) if errors else "no screenshot"
+                result_by_serial[serial] = f"CAPTURE FAILED: {detail}"
+            if errors:
+                child.error_message = "; ".join(errors)[:2000]
+                for err in errors:
+                    all_errors.append(f"{serial}: {err}")
+            child.finished_at = timezone.now()
+            child.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                    "progress_message",
+                    "finished_at",
+                    "target_host",
+                ]
+            )
+        except CaptureCancelled:
+            child.refresh_from_db()
+            if child.status != AuditJob.Status.CANCELLED:
+                child.status = AuditJob.Status.CANCELLED
+                child.error_message = "Cancelled by user"
+                child.progress_message = "Cancelled"
+                child.finished_at = timezone.now()
+                child.save(
+                    update_fields=[
+                        "status",
+                        "error_message",
+                        "progress_message",
+                        "finished_at",
+                    ]
+                )
+            _clear_cancel_flag(child.pk)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[REJECTION] Job %s child failed serial=%s", job_id, serial)
+            child.status = AuditJob.Status.FAILED
+            child.error_message = str(exc)[:2000]
+            child.progress_message = "Failed"
+            child.finished_at = timezone.now()
+            child.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                    "progress_message",
+                    "finished_at",
+                ]
+            )
+            result_by_serial[serial] = f"CAPTURE FAILED: {exc}"
+            all_errors.append(f"{serial}: {exc}")
+        finally:
+            _clear_cancel_flag(child.pk)
+
+    # ── Phase 3: build report ────────────────────────────────────────────
+    from services.rejection_report import ReportRow, build_rejection_report
+
+    report_rows = []
+    for r in rows:
+        serial = (r["serial"] or "").strip().upper()
+        path = shot_by_serial.get(serial, "")
+        report_rows.append(
+            ReportRow(
+                serial=r["serial"],
+                count=r.get("count", ""),
+                reason=r.get("reason", ""),
+                result=result_by_serial.get(serial, ""),
+                screenshot_path=path,
+            )
+        )
+    xlsx_path = _rejection_report_xlsx_path(job_id)
+    build_rejection_report(report_rows, xlsx_path)
+
+    _set_progress(job_id, f"Rejection Report finished {captured}/{len(matched)} camera(s)")
+    AuditJob.objects.filter(pk=job_id).update(target_host=f"{captured}/{len(matched)}")
+    return all_errors, captured
+
+
 def _dst_site_kind(inst) -> str | None:
     """Return 'lti' or 'de' when the installation is eligible for DST audit."""
     if inst.is_dragoneye:
@@ -2515,6 +2915,40 @@ def _run_job(job_id: int) -> None:
                     "[CONFIRM] Job %s site finished shots=%s errors=%s elapsed=%.1fs",
                     job_id,
                     job.screenshots.count(),
+                    len(errors),
+                    time.perf_counter() - t0,
+                )
+                return
+
+            if job.device_type == AuditJob.DeviceType.REJECTION_REPORT:
+                errors, captured = _run_rejection_report(job_id, output_dir)
+                job.refresh_from_db()
+                if job.status == AuditJob.Status.CANCELLED or is_job_cancelled(job_id):
+                    _finalize_cancelled()
+                    return
+                report_path = _rejection_report_xlsx_path(job_id)
+                if not report_path.exists():
+                    raise RuntimeError("; ".join(errors) or "Rejection report was not produced")
+                job.status = AuditJob.Status.SUCCEEDED
+                if errors:
+                    job.error_message = "; ".join(errors)[:2000]
+                job.progress_message = (
+                    f"Done with warnings ({len(errors)})" if errors else "Done"
+                )
+                job.finished_at = timezone.now()
+                job.save(
+                    update_fields=[
+                        "status",
+                        "error_message",
+                        "progress_message",
+                        "finished_at",
+                        "target_host",
+                    ]
+                )
+                logger.info(
+                    "[REJECTION] Job %s finished captured=%s errors=%s elapsed=%.1fs",
+                    job_id,
+                    captured,
                     len(errors),
                     time.perf_counter() - t0,
                 )
