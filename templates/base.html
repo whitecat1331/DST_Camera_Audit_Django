@@ -19,6 +19,7 @@
       <a href="{% url 'audit_list' %}">Audits</a>
       <a href="{% url 'dst_audit' %}">DST Audit</a>
       <a href="{% url 'confirm_captures' %}">Confirm Captures</a>
+      <a href="{% url 'rejection_report' %}">Rejection Report</a>
       <a href="{% url 'capture_explorer' %}">Captures</a>
       <form class="inline" method="post" action="{% url 'logout' %}">
         {% csrf_token %}
