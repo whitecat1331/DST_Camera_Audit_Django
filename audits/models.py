@@ -17,6 +17,8 @@ class AuditJob(models.Model):
         DST_SITE = "dst_site", "DST Audit (one site)"
         CONFIRM_BATCH = "confirm_batch", "Confirm Captures (batch)"
         CONFIRM_SITE = "confirm_site", "Confirm Capture (one site)"
+        REJECTION_REPORT = "rejection_report", "Rejection CSV Report"
+        REJECTION_SITE = "rejection_site", "Rejection CSV (one camera)"
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
