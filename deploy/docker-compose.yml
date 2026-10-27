@@ -48,7 +48,8 @@ services:
         - CMD
         - python
         - -c
-        - "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/accounts/login/', context=ssl._create_unverified_context(), timeout=5)"
+        # Host header must be an ALLOWED_HOSTS value; 127.0.0.1 is deliberately not one.
+        - "import ssl,urllib.request as u; u.urlopen(u.Request('https://127.0.0.1:8443/accounts/login/', headers={'Host': '45.79.220.29'}), context=ssl._create_unverified_context(), timeout=5)"
       interval: 30s
       timeout: 10s
       retries: 3
