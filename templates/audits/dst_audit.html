@@ -277,6 +277,51 @@
     {% endfor %}
   </ul>
 </section>
+
+{% if can_publish %}
+<section class="panel dst-panel" id="dst-publish-panel">
+  <h2>Publish to shared DB</h2>
+  <p class="lede muted">
+    Sends finished runs (site jobs, screenshots, images, OvrC times) to the shared review
+    database. <strong>Turn the camera VPN off first</strong> — it blocks the database ports.
+    Publish the LTI run and the DE run into the same round. Re-publishing is safe.
+  </p>
+  {% if publish_runs %}
+  <div class="table-scroll">
+    <table class="data-table" id="dst-publish-table">
+      <thead>
+        <tr><th></th><th>Run</th><th>Sites</th><th>Status</th><th>Finished</th><th>Round</th></tr>
+      </thead>
+      <tbody>
+        {% for r in publish_runs %}
+        <tr>
+          <td><input type="checkbox" class="dst-publish-pick" value="{{ r.id }}" aria-label="Publish run {{ r.label }}"></td>
+          <td><a href="{{ r.detail_url }}">{{ r.label }}</a></td>
+          <td>{{ r.sites_summary }} <span class="muted">({{ r.site_count }})</span></td>
+          <td><span class="badge status-{{ r.status }}">{{ r.status_display }}</span></td>
+          <td class="muted">{{ r.when_display }}</td>
+          <td>{% if r.round %}<span class="badge status-succeeded">{{ r.round }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="dst-actions dst-publish-actions">
+    <input type="text" id="dst-publish-round" list="dst-publish-rounds" maxlength="128"
+      placeholder="Round, e.g. 2026-11-01 fall back" aria-label="Audit round name"
+      value="{{ rounds.0|default:'' }}">
+    <datalist id="dst-publish-rounds">
+      {% for name in rounds %}<option value="{{ name }}">{% endfor %}
+    </datalist>
+    <button type="button" class="btn-fire" id="dst-publish-btn" disabled>Publish (0)</button>
+    <a class="btn-secondary" id="dst-publish-job" href="#" hidden>Open publish job</a>
+  </div>
+  <p class="muted" id="dst-publish-status" role="status">{% if active_publish %}{{ active_publish.progress_message }}{% endif %}</p>
+  {% else %}
+  <p class="lede muted">No finished DST runs to publish yet.</p>
+  {% endif %}
+</section>
+{% endif %}
 {% endblock %}
 
 {% block extra_js %}
@@ -930,4 +975,76 @@
   }
 })();
 </script>
+{% if can_publish %}
+<script>
+(function () {
+  const URL_PUBLISH = "{% url 'dst_publish' %}";
+  const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  const btn = document.getElementById("dst-publish-btn");
+  const roundInput = document.getElementById("dst-publish-round");
+  const statusEl = document.getElementById("dst-publish-status");
+  const jobLink = document.getElementById("dst-publish-job");
+  if (!btn) return;
+  const picks = () => [...document.querySelectorAll(".dst-publish-pick:checked")].map((c) => Number(c.value));
+  let busy = false;
+
+  function refresh() {
+    const n = picks().length;
+    btn.textContent = busy ? "Publishing…" : `Publish (${n})`;
+    btn.disabled = busy || !n || !roundInput.value.trim();
+  }
+  document.querySelectorAll(".dst-publish-pick").forEach((c) => c.addEventListener("change", refresh));
+  roundInput.addEventListener("input", refresh);
+
+  function poll(jobId) {
+    busy = true;
+    refresh();
+    jobLink.href = `/audits/${jobId}/`;
+    jobLink.hidden = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(`/audits/${jobId}/status/`, { headers: { Accept: "application/json" } });
+        const data = await res.json();
+        if (data.status === "running" || data.status === "pending") {
+          statusEl.textContent = data.progress || "Publishing…";
+          setTimeout(tick, 1500);
+          return;
+        }
+        busy = false;
+        statusEl.textContent = data.status === "succeeded"
+          ? data.progress + (data.error_message ? ` — ${data.error_message}` : "")
+          : `Publish failed: ${data.error_message || data.message}`;
+        if (data.status === "succeeded") setTimeout(() => window.location.reload(), 2500);
+        refresh();
+      } catch (err) {
+        setTimeout(tick, 3000);
+      }
+    };
+    tick();
+  }
+
+  btn.addEventListener("click", async () => {
+    statusEl.textContent = "Starting publish…";
+    busy = true;
+    refresh();
+    try {
+      const res = await fetch(URL_PUBLISH, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": CSRF },
+        body: JSON.stringify({ run_ids: picks(), round: roundInput.value }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      poll(data.job_id);
+    } catch (err) {
+      busy = false;
+      statusEl.textContent = `Publish failed: ${err.message}`;
+      refresh();
+    }
+  });
+
+  {% if active_publish %}poll({{ active_publish.pk }});{% else %}refresh();{% endif %}
+})();
+</script>
+{% endif %}
 {% endblock %}

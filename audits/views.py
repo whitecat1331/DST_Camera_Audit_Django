@@ -12,7 +12,7 @@ from django.views.decorators.http import require_GET, require_POST
 from django.utils import timezone
 from django.http import FileResponse, Http404
 
-from audits.models import AuditJob
+from audits.models import AuditJob, AuditRound
 from audits.runner import enqueue_audit_job, request_job_cancel
 from cameras.models import Installation
 from cameras.roles import role_at_least
@@ -757,6 +757,7 @@ def _dst_recent_audit_rows(limit: int = 12) -> list[dict]:
 
     recent = (
         AuditJob.objects.filter(device_type=AuditJob.DeviceType.DST_AUDIT)
+        .select_related("round")
         .prefetch_related("child_jobs", "child_jobs__screenshots")
         .order_by("-created_at")[:limit]
     )
@@ -819,6 +820,9 @@ def _dst_recent_audit_rows(limit: int = 12) -> list[dict]:
                 ),
                 "site_count": len(children_payload),
                 "sites_summary": sites_summary,
+                "round": parent.round.name if parent.round_id else "",
+                "finished": parent.status
+                not in (AuditJob.Status.PENDING, AuditJob.Status.RUNNING),
                 "detail_url": f"/audits/{parent.pk}/",
                 "children": children_payload,
             }
@@ -915,6 +919,19 @@ def dst_audit_page(request):
 
     settle = int(getattr(settings, "DST_POWER_SETTLE_SECONDS", 90))
 
+    from audits.publish import shared_configured
+
+    can_publish = can_audit and settings.DST_ROLE == "capture" and shared_configured()
+    active_publish = (
+        AuditJob.objects.filter(
+            device_type=AuditJob.DeviceType.PUBLISH, status=AuditJob.Status.RUNNING
+        )
+        .order_by("-created_at")
+        .first()
+        if can_publish
+        else None
+    )
+
     return render(
         request,
         "audits/dst_audit.html",
@@ -933,6 +950,10 @@ def dst_audit_page(request):
             "active_job": active_job,
             "recent_jobs": recent_rows,
             "settle_seconds": settle,
+            "can_publish": can_publish,
+            "publish_runs": [r for r in recent_rows if r["finished"]],
+            "rounds": list(AuditRound.objects.values_list("name", flat=True)[:20]),
+            "active_publish": active_publish,
             "has_filters": bool(q or state or agency or (scope and scope != "all")),
         },
     )
@@ -961,6 +982,34 @@ def _dst_serials_for_inst(inst) -> list[str]:
     for fx in inst.fx_numbers or []:
         add(fx)
     return out
+
+
+@login_required
+@require_POST
+def publish_dst(request):
+    """Publish finished DST runs to the shared DB (background job; VPN must be off)."""
+    from audits.publish import PublishError, shared_configured, start_publish_job
+
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if settings.DST_ROLE != "capture" or not shared_configured():
+        return JsonResponse({"error": "Publishing is only available on the capture laptop with DB_HOST set."}, status=400)
+    try:
+        body = json.loads(request.body.decode() or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "invalid JSON"}, status=400)
+    try:
+        run_ids = [int(x) for x in body.get("run_ids") or []]
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "run_ids must be job ids"}, status=400)
+    if not run_ids:
+        return JsonResponse({"error": "Select at least one run."}, status=400)
+    try:
+        job = start_publish_job(run_ids, str(body.get("round") or ""), request.user)
+    except PublishError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    logger.info("[PUBLISH] user=%s started job=%s runs=%s", request.user.username, job.pk, run_ids)
+    return JsonResponse({"job_id": job.pk})
 
 
 @login_required
