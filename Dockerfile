@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DST_ROLE=review \
     DJANGO_DEBUG=false \
-    LOG_TO_FILE=false
+    LOG_TO_FILE=false \
+    DB_SSLROOTCERT=certs/supabase_ca.crt
 
 WORKDIR /app
 COPY requirements-review.txt .
