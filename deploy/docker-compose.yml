@@ -1,0 +1,66 @@
+# DST Camera Audit — review instance on the IMS Linode (45.79.220.29).
+# Lives in /opt/dst_camera_audit next to IMS (/opt/access_replacement), which
+# keeps ports 80/443 and is never modified by this project. See deploy/README.md.
+name: dst_camera_audit
+
+services:
+  dst:
+    build:
+      context: ./app
+    image: dst_camera_audit:review
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    # IMS shares this 2 GB box; DST can never starve it.
+    mem_limit: 512m
+    environment:
+      DST_ROLE: review
+      DJANGO_DEBUG: "false"
+      DJANGO_ALLOWED_HOSTS: 45.79.220.29
+      DJANGO_CSRF_TRUSTED_ORIGINS: https://45.79.220.29:8443
+      # Shared Supabase DB — transaction pooler (same shape as IMS).
+      DB_HOST: aws-1-ca-central-1.pooler.supabase.com
+      DB_PORT: "6543"
+      DB_NAME: postgres
+      DB_SSLMODE: verify-full
+      DB_SSLROOTCERT: certs/supabase_ca.crt
+      # IMS on the same host; its self-signed cert is pinned, not skipped.
+      IMS_BASE_URL: https://45.79.220.29
+      IMS_CA_FILE: /certs/cert.pem
+      IMS_SSO_CLIENT_ID: ${IMS_SSO_CLIENT_ID:?set IMS_SSO_CLIENT_ID in /opt/dst_camera_audit/.env}
+      IMS_SSO_REDIRECT_URI: https://45.79.220.29:8443/accounts/ims/callback/
+      LOG_TO_FILE: "false"
+    volumes:
+      # IMS's TLS cert/key: served by gunicorn and pinned for IMS API calls.
+      - /opt/access_replacement/certs/cert.pem:/certs/cert.pem:ro
+      - /opt/access_replacement/certs/key.pem:/certs/key.pem:ro
+    secrets:
+      - django_secret_key
+      - db_user
+      - db_password
+      - ims_api_token
+      - ims_sso_client_secret
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/accounts/login/', context=ssl._create_unverified_context(), timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+# File-based secrets (not swarm), same pattern as IMS. Read by
+# config/settings.py:_load_secret_file from /run/secrets/<name>.
+secrets:
+  django_secret_key:
+    file: ./secrets/django_secret_key
+  db_user:
+    file: ./secrets/db_user
+  db_password:
+    file: ./secrets/db_password
+  ims_api_token:
+    file: ./secrets/ims_api_token
+  ims_sso_client_secret:
+    file: ./secrets/ims_sso_client_secret
