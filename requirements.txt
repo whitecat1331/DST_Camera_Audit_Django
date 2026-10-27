@@ -1,4 +1,7 @@
 Django>=5.0,<6.1
+psycopg[binary]>=3.2
+whitenoise>=6.7
+gunicorn>=23; sys_platform != "win32"
 cryptography>=45.0.0,<46.0.0
 pandas>=2.0
 openpyxl>=3.1

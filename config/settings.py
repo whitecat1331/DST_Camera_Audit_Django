@@ -2,12 +2,39 @@
 
 from pathlib import Path
 import os
+import sys
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
+
+
+def _load_secret_file(env_key: str, secret_path: str) -> None:
+    """Inject a Docker secret file into the environment unless already set.
+
+    Mirrors IMS ``config.LoadSecretFile``: .env / process env wins, and outside
+    Docker the file is absent so this is a no-op.
+    """
+    if os.getenv(env_key, "").strip():
+        return
+    try:
+        value = Path(secret_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if value:
+        os.environ[env_key] = value
+
+
+for _key, _secret in (
+    ("DJANGO_SECRET_KEY", "django_secret_key"),
+    ("DB_USER", "db_user"),
+    ("DB_PASSWORD", "db_password"),
+    ("IMS_API_TOKEN", "ims_api_token"),
+    ("IMS_SSO_CLIENT_SECRET", "ims_sso_client_secret"),
+):
+    _load_secret_file(_key, f"/run/secrets/{_secret}")
 
 _secret_key = os.getenv("DJANGO_SECRET_KEY", "").strip()
 if not _secret_key:
@@ -37,10 +64,12 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "config.middleware.ReviewOnlyMiddleware",
     "config.middleware.RequestLoggingMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -65,12 +94,72 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
+# DST_ROLE=capture (laptop, default): captures always land in local SQLite —
+#   the camera VPN blocks Postgres egress — and DB_* (if set) is exposed as the
+#   "shared" alias used only to publish finished runs.
+# DST_ROLE=review (Linode): the shared Supabase DB from DB_* is the default.
+# DB_* follows IMS (db.go): Supabase transaction pooler on 6543 with verify-full
+# TLS. Run migrate / bulk loads over the session pooler (5432).
+DST_ROLE = os.getenv("DST_ROLE", "capture").strip().lower()
+if DST_ROLE not in ("capture", "review"):
+    raise ImproperlyConfigured("DST_ROLE must be 'capture' or 'review'.")
+
+_sqlite_db = {
+    "ENGINE": "django.db.backends.sqlite3",
+    "NAME": BASE_DIR / "db.sqlite3",
 }
+_shared_db = None
+_db_host = os.getenv("DB_HOST", "").strip()
+if _db_host:
+    _db_password = os.getenv("DB_PASSWORD", "")
+    if not _db_password:
+        raise ImproperlyConfigured("DB_PASSWORD is required when DB_HOST is set.")
+    _db_options = {
+        "sslmode": os.getenv("DB_SSLMODE", "verify-full").strip(),
+        # Transaction pooling cannot hold server-side prepared statements.
+        "prepare_threshold": None,
+        # Fail fast when Postgres egress is blocked (e.g. on the camera VPN).
+        "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+    }
+    _db_rootcert = os.getenv("DB_SSLROOTCERT", "").strip()
+    if _db_rootcert:
+        _rootcert_path = Path(_db_rootcert)
+        if not _rootcert_path.is_absolute():
+            _rootcert_path = BASE_DIR / _rootcert_path
+        _db_options["sslrootcert"] = str(_rootcert_path)
+    elif _db_options["sslmode"] in ("verify-ca", "verify-full"):
+        raise ImproperlyConfigured(
+            "DB_SSLROOTCERT is required when DB_SSLMODE is verify-ca or verify-full."
+        )
+    _shared_db = {
+        "ENGINE": "django.db.backends.postgresql",
+        "HOST": _db_host,
+        "PORT": os.getenv("DB_PORT", "6543").strip(),
+        "USER": os.getenv("DB_USER", "postgres").strip(),
+        "PASSWORD": _db_password,
+        "NAME": os.getenv("DB_NAME", "postgres").strip(),
+        "OPTIONS": _db_options,
+        # Pooler owns connection reuse; .iterator() cursors break under it.
+        "CONN_MAX_AGE": 0,
+        "CONN_HEALTH_CHECKS": True,
+        "DISABLE_SERVER_SIDE_CURSORS": True,
+    }
+
+if DST_ROLE == "review":
+    if _shared_db is None:
+        raise ImproperlyConfigured("DST_ROLE=review requires DB_HOST (shared DB).")
+    DATABASES = {"default": _shared_db}
+else:
+    DATABASES = {"default": _sqlite_db}
+    if _shared_db is not None:
+        DATABASES["shared"] = _shared_db
+
+# Tests never touch Supabase: publish is exercised against a second SQLite DB.
+if sys.argv[1:2] == ["test"]:
+    DATABASES = {
+        "default": _sqlite_db,
+        "shared": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "shared-test.sqlite3"},
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -91,6 +180,33 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
+# The review instance reads published image bytes from the shared DB; the laptop
+# keeps captures on disk. Static files are served by WhiteNoise (no proxy).
+STORAGES = {
+    "default": {
+        "BACKEND": "audits.storage.DatabaseStorage"
+        if DST_ROLE == "review"
+        else "django.core.files.storage.FileSystemStorage"
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        if DST_ROLE == "review"
+        else "django.contrib.staticfiles.storage.StaticFilesStorage"
+    },
+}
+
+# Production hardening (the review instance runs with DJANGO_DEBUG=false behind
+# gunicorn TLS on the IMS Linode, e.g. https://45.79.220.29:8443).
+CSRF_TRUSTED_ORIGINS = [
+    o.strip() for o in os.getenv("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o.strip()
+]
+if not DEBUG:
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = "same-origin"
+    # No HSTS: the host is a bare IP with a self-signed certificate (shared with IMS).
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 LOGIN_URL = "login"
@@ -103,6 +219,10 @@ IMS_SSO_CLIENT_SECRET = os.getenv("IMS_SSO_CLIENT_SECRET", "")
 IMS_SSO_REDIRECT_URI = os.getenv("IMS_SSO_REDIRECT_URI", "")
 IMS_API_TOKEN = os.getenv("IMS_API_TOKEN", "")
 IMS_TLS_VERIFY = os.getenv("IMS_TLS_VERIFY", "true").lower() in ("1", "true", "yes")
+# Pin IMS's self-signed certificate (PEM) instead of disabling verification.
+IMS_CA_FILE = os.getenv("IMS_CA_FILE", "").strip()
+if IMS_CA_FILE and not Path(IMS_CA_FILE).is_absolute():
+    IMS_CA_FILE = str(BASE_DIR / IMS_CA_FILE)
 DST_LOCAL_ADMIN = os.getenv("DST_LOCAL_ADMIN", "false").lower() in ("1", "true", "yes")
 # Optional override for Post-Install Site Documents root (default: auto-detect X:\Site Documents).
 DE_PI_SITE_DOCUMENTS_ROOT = os.getenv("DE_PI_SITE_DOCUMENTS_ROOT", "").strip()

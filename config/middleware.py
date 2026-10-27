@@ -17,6 +17,32 @@ _SKIP_PREFIXES = (
 _QUIET_SUFFIXES = ("/status/",)
 
 
+# Review instance (DST_ROLE=review): paths that read the capture laptop's disk or
+# start work never apply there, and only sign-in/out may change state. Phase 6
+# adds the review endpoints (Complete / Notes) to REVIEW_WRITE_PREFIXES.
+REVIEW_BLOCKED_PREFIXES = ("/explorer/", "/sync/", "/dragoneye/", "/admin/")
+REVIEW_WRITE_PREFIXES = ("/accounts/",)
+
+
+class ReviewOnlyMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        from django.conf import settings
+        from django.http import HttpResponseForbidden
+
+        if settings.DST_ROLE == "review":
+            path = request.path or ""
+            unsafe = request.method not in ("GET", "HEAD", "OPTIONS")
+            if any(path.startswith(p) for p in REVIEW_BLOCKED_PREFIXES) or (
+                unsafe and not any(path.startswith(p) for p in REVIEW_WRITE_PREFIXES)
+            ):
+                logger.warning("[HTTP] review-only blocked %s %s", request.method, path)
+                return HttpResponseForbidden("Review instance: captures run on the capture laptop.")
+        return self.get_response(request)
+
+
 class RequestLoggingMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response

@@ -19,6 +19,12 @@ class AuditsConfig(AppConfig):
             return
         if os.environ.get("RUN_MAIN") != "true":
             return
+        # The review instance never runs jobs; its DB holds published (finished)
+        # rows only, so there is nothing of its own to reap.
+        from django.conf import settings
+
+        if settings.DST_ROLE == "review":
+            return
 
         def _reap() -> None:
             try:
