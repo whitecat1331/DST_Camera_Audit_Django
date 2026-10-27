@@ -9,6 +9,9 @@ services:
       context: ./app
     image: dst_camera_audit:review
     restart: unless-stopped
+    # Run as the host's deploy user (owner of IMS's cert/key) so the mounted
+    # key stays readable once it is tightened to 0600 (it is 0666 today).
+    user: "1000:1000"
     ports:
       - "8443:8443"
     # IMS shares this 2 GB box; DST can never starve it.

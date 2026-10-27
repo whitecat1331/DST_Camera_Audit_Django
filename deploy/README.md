@@ -26,11 +26,13 @@ IMS keeps 80/443, and `/opt/access_replacement` is never edited.
    secret in `secrets/ims_sso_client_secret`.
 2. **Firewall:** allow TCP 8443 inbound (ufw on the host, and the Linode Cloud
    Firewall if one is attached).
-3. **Key readability:** gunicorn runs as uid 10001 and must be able to read the
-   mounted `/opt/access_replacement/certs/key.pem`. Check it with
-   `stat -c '%a %U' /opt/access_replacement/certs/key.pem`. If it is not
-   world-readable, grant read access with a group/ACL instead of loosening IMS's
-   files broadly.
+3. **Directory:** `/opt` is root-owned, so create the project dir once:
+   `sudo install -d -o deploy -g deploy -m 750 /opt/dst_camera_audit`.
+4. **Key readability:** the container runs as the host `deploy` user (uid 1000,
+   which owns `/opt/access_replacement/certs/`), so the mounted `key.pem` stays
+   readable at `0600`. As of 2026-10-27 the key is `0666` (world-writable);
+   tighten it with `chmod 600 /opt/access_replacement/certs/key.pem`. That is an
+   IMS change, so verify IMS afterwards.
 
 ## Deploy / update
 
