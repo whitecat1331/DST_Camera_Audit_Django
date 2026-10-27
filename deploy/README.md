@@ -6,7 +6,7 @@ in the image. It shares the IMS Linode (`deploy@45.79.220.29`) on **port 8443**;
 IMS keeps 80/443, and `/opt/access_replacement` is never edited.
 
 ```
-/opt/dst_camera_audit/
+/home/deploy/dst_camera_audit/      (~deploy; no sudo needed)
 ├── docker-compose.yml      ← deploy/docker-compose.yml
 ├── .env                    ← IMS_SSO_CLIENT_ID=… (compose variable, not secret)
 ├── app/                    ← source tree (git archive of the release commit)
@@ -22,13 +22,14 @@ IMS keeps 80/443, and `/opt/access_replacement` is never edited.
 
 1. **IMS SSO client:** in IMS, Admin → External Integrations, add the redirect URI
    `https://45.79.220.29:8443/accounts/ims/callback/` (to the existing DST client
-   or a new one). Put its client id in `/opt/dst_camera_audit/.env` and its
-   secret in `secrets/ims_sso_client_secret`.
+   or a new one). Put its client id in `~/dst_camera_audit/.env` and its
+   secret in `secrets/ims_sso_client_secret`. Credentials must come from
+   **production** IMS: the laptop's `.env` points at dev IMS (127.0.0.1:8051).
+   Don't run `IMS/cmd/mint-dst-integration` against production: its upsert
+   overwrites any existing `dst_camera_audit` client's secret and redirect URIs.
 2. **Firewall:** allow TCP 8443 inbound (ufw on the host, and the Linode Cloud
    Firewall if one is attached).
-3. **Directory:** `/opt` is root-owned, so create the project dir once:
-   `sudo install -d -o deploy -g deploy -m 750 /opt/dst_camera_audit`.
-4. **Key readability:** the container runs as the host `deploy` user (uid 1000,
+3. **Key readability:** the container runs as the host `deploy` user (uid 1000,
    which owns `/opt/access_replacement/certs/`), so the mounted `key.pem` stays
    readable at `0600`. As of 2026-10-27 the key is `0666` (world-writable);
    tighten it with `chmod 600 /opt/access_replacement/certs/key.pem`. That is an
@@ -39,14 +40,14 @@ IMS keeps 80/443, and `/opt/access_replacement` is never edited.
 From the laptop (capture role), at the release commit:
 
 ```powershell
-git archive --format=tar HEAD | ssh -i $env:USERPROFILE\.ssh\linode_access_replacement deploy@45.79.220.29 "rm -rf /opt/dst_camera_audit/app && mkdir -p /opt/dst_camera_audit/app && tar -x -C /opt/dst_camera_audit/app"
-scp -i $env:USERPROFILE\.ssh\linode_access_replacement deploy/docker-compose.yml deploy@45.79.220.29:/opt/dst_camera_audit/
+git archive --format=tar HEAD | ssh -i $env:USERPROFILE\.ssh\linode_access_replacement deploy@45.79.220.29 "rm -rf ~/dst_camera_audit/app && mkdir -p ~/dst_camera_audit/app && tar -x -C ~/dst_camera_audit/app"
+scp -i $env:USERPROFILE\.ssh\linode_access_replacement deploy/docker-compose.yml deploy@45.79.220.29:dst_camera_audit/
 ```
 
 On the Linode:
 
 ```bash
-cd /opt/dst_camera_audit
+cd ~/dst_camera_audit
 docker compose build && docker compose up -d
 docker compose ps                                   # healthy
 docker stats --no-stream                            # dst under 512 MiB; IMS unchanged

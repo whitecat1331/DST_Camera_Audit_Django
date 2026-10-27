@@ -1,5 +1,5 @@
 # DST Camera Audit — review instance on the IMS Linode (45.79.220.29).
-# Lives in /opt/dst_camera_audit next to IMS (/opt/access_replacement), which
+# Lives in /home/deploy/dst_camera_audit (no sudo needed) beside IMS (/opt/access_replacement), which
 # keeps ports 80/443 and is never modified by this project. See deploy/README.md.
 name: dst_camera_audit
 
@@ -30,7 +30,7 @@ services:
       # IMS on the same host; its self-signed cert is pinned, not skipped.
       IMS_BASE_URL: https://45.79.220.29
       IMS_CA_FILE: /certs/cert.pem
-      IMS_SSO_CLIENT_ID: ${IMS_SSO_CLIENT_ID:?set IMS_SSO_CLIENT_ID in /opt/dst_camera_audit/.env}
+      IMS_SSO_CLIENT_ID: ${IMS_SSO_CLIENT_ID:?set IMS_SSO_CLIENT_ID in ~/dst_camera_audit/.env}
       IMS_SSO_REDIRECT_URI: https://45.79.220.29:8443/accounts/ims/callback/
       LOG_TO_FILE: "false"
     volumes:

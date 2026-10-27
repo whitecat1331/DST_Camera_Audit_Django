@@ -152,6 +152,22 @@ Each phase is **gated**: its acceptance must pass before the next phase starts.
   4. Then run this phase's acceptance list (SSO sign-in on :8443, IMS unaffected, < 512 MB, capture POSTs 403, and a reviewer reaching :8443 from their own network for I3).
 - The image can't be built on the laptop (no Docker), so the first real build happens on the Linode in step 3.
 
+#### Phase 4 deploy (2026-10-27) — provisioned and running; external access + SSO pending (not accepted)
+Directed by the user ("provision the linode instance"), using the `access-replacement-prod-ssh` skill (`deploy@45.79.220.29`, SSH check OK).
+- **Location changed to `/home/deploy/dst_camera_audit`:** `/opt` is root-owned and `deploy` has no passwordless sudo. Created with `umask 077`: `secrets/` (`db_user` and `db_password` from the laptop `.env`, CRs stripped to 29 and 15 bytes; a fresh 64-char `django_secret_key`; `ims_api_token` and `ims_sso_client_secret` = **placeholder `pending-ims-prod-credentials`**) and `.env` (`IMS_SSO_CLIENT_ID` placeholder).
+- **Production IMS credentials are not on the laptop:** its `.env` targets dev IMS (`127.0.0.1:8051`). `IMS/cmd/mint-dst-integration` was **not** run against production, because its `ON CONFLICT` upsert overwrites an existing `dst_camera_audit` SSO client's secret and redirect URIs, and the production DB password is deliberately not on the laptop. They must come from IMS Admin → External Integrations.
+- **Code:** `git archive` of `2defb37`; the compose file at `815bbd3`. Image `dst_camera_audit:review` 419 MB, built on the Linode in ~32 s. IMS stayed `healthy` and `/healthz` 200 throughout (load 0.57).
+- **Two fixes** found by the first real build/run: `DB_SSLROOTCERT` defaults to the baked CA (`2defb37`: collectstatic imports settings, which correctly refuses `verify-full` without a CA); the healthcheck sends `Host: 45.79.220.29` (`815bbd3`: 127.0.0.1 is deliberately not an allowed host).
+- **Running:** `dst_camera_audit-dst-1` healthy, **157 MiB / 512 MiB**. IMS `healthy` at 52–61 MiB (unchanged); host 1.3 GB available.
+- **Verified on the box** (`https://127.0.0.1:8443` with the public Host header):
+  - login 200; signed-out `/` and `/media-db/…` → 302 to login;
+  - POST start/publish/turn-relays → **403**; `/explorer/` → **403**;
+  - WhiteNoise `/static/app.css` 200; `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin`;
+  - :8443 presents IMS's cert (SHA-256 `98:DB:…:05:E9`).
+- **Container → Supabase:** pooler 6543 `verify-full`, user and secret key loaded from the secret files, 11 published jobs and 20 stored files visible, `DatabaseStorage` active, `lock_shared_db --check` 0/0/0 of 21.
+- **External access FAILS (I6):** from the laptop (VPN off), `https://45.79.220.29:8443` times out after 15 s, while the host listens on `0.0.0.0:8443`. A firewall is dropping it: `ufw` (status needs root) or a Linode Cloud Firewall.
+- **Still pending for acceptance:** I6 firewall; production IMS SSO client + API token; I4 before `sync_installations`; then SSO sign-in on :8443, and a reviewer reaching :8443 from their own network (I3).
+
 ### Phase 5 — One-page review per round (gated)
 - **Work:** `/audits/review/<round>/`: one row per camera in the round (newest `DST_SITE` capture per installation), showing:
   - identifier, pole, agency, LTI/DE
@@ -220,6 +236,8 @@ LTI-only DST run on the camera VPN → VPN off → DE-only DST run → publish b
 - **I4 — open, blocks the Phase 4 deploy:** the shared DB has `cameras.0006_installation_county_installation_created_at_and_more` applied. It belongs to the **CBW firmware plan** (`in-progress-plans/CBW_FIRMWARE_INVENTORY_REPORT.md`) and was sitting uncommitted in the working tree when Phase 1 ran `migrate --database shared`. It adds 13 NOT NULL `Installation` columns with no DB default (`county`, `street`, `site_type`, `created_at`, …). The committed code (`8b20479`) has no such fields (`cameras/models.py`, the migration and `services/ims_sync.py` are uncommitted), so an image built from a commit would fail every `sync_installations` insert. **Resolution:** commit the CBW plan's schema/sync changes before deploying (the user's call: it's that plan's work), or deploy from a tree that includes them.
 - **I5 — open (IMS, outside this plan):** `/opt/access_replacement/certs/key.pem` (IMS's TLS private key) is mode **0666**, world-readable *and* writable. Recommend `chmod 600`; the DST container runs as uid 1000 (`deploy`, the owner), so DST is unaffected by that change.
 
+- **I6 — open, blocks Phase 4 acceptance:** inbound TCP 8443 to `45.79.220.29` is dropped (timeout from outside; the service is healthy on the box). **Resolution (operator):** `sudo ufw allow 8443/tcp` and/or allow 8443 in the Linode Cloud Firewall.
+
 ## Open questions
 None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes.)
 
@@ -234,11 +252,13 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [ ] Phase 5 — one-page review per round
 - [ ] Phase 6 — shared Complete checkbox + Notes (notes editable by anyone signed in, IMS RA-modal style)
 - [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
-- [ ] I4 — CBW plan's cameras.0006 schema committed before the review image is built
+- [ ] I4 — CBW plan's cameras.0006 schema committed before `sync_installations` runs on the Linode
+- [ ] I6 — open inbound 8443 (ufw / Linode Cloud Firewall)
+- [ ] Production IMS SSO client + API token for the review instance (IMS Admin UI; redirect `https://45.79.220.29:8443/accounts/ims/callback/`)
 - [ ] Final acceptance — real audit day end to end
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 7/13. Phases 0–3 accepted. Phase 4 local half committed (5e083cc..853fc6c); the deploy is blocked on I4 (CBW schema uncommitted) plus operator steps (sudo dir, ufw 8443, IMS SSO redirect + credentials).
+in progress — 7/15. Phases 0–3 accepted. Phase 4: review instance provisioned and healthy on the IMS Linode (~/dst_camera_audit, :8443); acceptance waits on I6 (firewall), production IMS credentials, and I4.
 
 `Superseded by:` —
