@@ -1,5 +1,27 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
+
+
+class AuditRound(models.Model):
+    """A named DST audit round (e.g. one time change) grouping published runs."""
+
+    name = models.CharField(max_length=128, unique=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_rounds",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.name
 
 
 class AuditJob(models.Model):
@@ -19,6 +41,7 @@ class AuditJob(models.Model):
         CONFIRM_SITE = "confirm_site", "Confirm Capture (one site)"
         REJECTION_REPORT = "rejection_report", "Rejection CSV Report"
         REJECTION_SITE = "rejection_site", "Rejection CSV (one camera)"
+        PUBLISH = "publish", "Publish to shared DB"
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -55,6 +78,23 @@ class AuditJob(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    # Stable identity across the local and shared databases (publish upsert key).
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    round = models.ForeignKey(
+        AuditRound,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="jobs",
+    )
+    # Structured OvrC reading (see audits/ovrc_time.py). drift_seconds is the
+    # device wall clock minus America/New_York wall clock at ovrc_captured_at.
+    ovrc_fx = models.CharField(max_length=32, blank=True)
+    ovrc_local_time_raw = models.CharField(max_length=64, blank=True)
+    ovrc_zone = models.CharField(max_length=8, blank=True)
+    ovrc_device_time = models.DateTimeField(null=True, blank=True)
+    ovrc_captured_at = models.DateTimeField(null=True, blank=True)
+    drift_seconds = models.IntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -76,9 +116,29 @@ class AuditScreenshot(models.Model):
     label = models.CharField(max_length=128)
     image = models.ImageField(upload_to=audit_upload_to)
     created_at = models.DateTimeField(auto_now_add=True)
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     class Meta:
         ordering = ["created_at"]
 
     def __str__(self) -> str:
         return f"{self.label} (job {self.job_id})"
+
+
+class StoredFile(models.Model):
+    """Image bytes in the shared DB, keyed by the local storage name.
+
+    Written by publish (capture role); served by the review instance.
+    """
+
+    name = models.CharField(max_length=255, unique=True)
+    content_type = models.CharField(max_length=64)
+    size = models.IntegerField()
+    sha256 = models.CharField(max_length=64)
+    data = models.BinaryField()
+    thumb = models.BinaryField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.size} bytes)"

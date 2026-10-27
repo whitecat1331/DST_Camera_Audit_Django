@@ -13,6 +13,8 @@ from django.core.files import File
 from django.db import close_old_connections
 from django.utils import timezone
 
+from audits.ovrc_time import OVRC_FIELD_NAMES, ovrc_fields
+
 logger = logging.getLogger(__name__)
 
 _semaphore = threading.Semaphore(getattr(settings, "AUDIT_MAX_CONCURRENT", 2))
@@ -737,6 +739,7 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
 
     errors: list[str] = []
     times: list[str] = []
+    readings: list[dict] = []
     _set_progress(job_id, f"OvrC local time for {len(unique_fx)} FX…")
     t0 = time.perf_counter()
     try:
@@ -762,6 +765,9 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
                 line,
             )
             times.append(line)
+            readings.append(
+                ovrc_fields(r.fx_number, r.local_time, r.captured_at or timezone.now())
+            )
         logger.info(
             "[AUDIT] Job %s OvrC done count=%s elapsed=%.1fs",
             job_id,
@@ -772,7 +778,9 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
             from audits.models import AuditJob
 
             # One OvrC timestamp line on the job (last FX if several).
-            AuditJob.objects.filter(pk=job_id).update(progress_message=times[-1][:255])
+            AuditJob.objects.filter(pk=job_id).update(
+                progress_message=times[-1][:255], **readings[-1]
+            )
     except CaptureCancelled:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -857,16 +865,19 @@ def _dst_fleet_ovrc_times(
                 errors.append(f"{site_key}: OvrC missing result for {fx}")
 
     child_times: dict[int, list[str]] = {}
+    child_readings: dict[int, list[dict]] = {}
     child_errs: dict[int, list[str]] = {}
     for r in results:
         fx = (r.fx_number or "").strip().upper()
         label = f"ovrc_{fx.lower()}"
         line = _format_ovrc_timestamp_line(fx, r.local_time)
+        reading = ovrc_fields(fx, r.local_time, r.captured_at or timezone.now())
         owners = fx_owners.get(fx) or []
         for child_pk, site_key, _child_dir in owners:
             try:
                 _save_shot(child_pk, Path(r.screenshot_path), label)
                 child_times.setdefault(child_pk, []).append(line)
+                child_readings.setdefault(child_pk, []).append(reading)
                 logger.info(
                     "[DST] Job %s fleet OvrC ok child=%s site=%s fx=%s raw=%s est=%s",
                     parent_job_id,
@@ -904,6 +915,8 @@ def _dst_fleet_ovrc_times(
             # OvrC timestamp is the progress line; warnings stay on error_message.
             if times:
                 child.progress_message = times[-1][:255]
+                for key, value in child_readings[child_pk][-1].items():
+                    setattr(child, key, value)
             elif warns:
                 child.progress_message = f"Done with warnings ({warns})"
             else:
@@ -912,7 +925,13 @@ def _dst_fleet_ovrc_times(
             # audit Finished is not earlier than the OvrC capture wall time.
             child.finished_at = timezone.now()
         child.save(
-            update_fields=["error_message", "status", "progress_message", "finished_at"]
+            update_fields=[
+                "error_message",
+                "status",
+                "progress_message",
+                "finished_at",
+                *OVRC_FIELD_NAMES,
+            ]
         )
 
     logger.info(
