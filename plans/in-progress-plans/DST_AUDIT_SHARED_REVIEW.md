@@ -210,6 +210,20 @@ Directed by the user ("provision the linode instance"), using the `access-replac
   - Only thumbnails load (checked in the network tab).
   - A re-run site shows its newest capture.
 
+#### Phase 5 progress (2026-10-28) — implemented, content acceptance PASS; blocked on I7 (intermittent stalls)
+- **Built (`6e1b83e`):**
+  - `audits/review.py`: `build_round_rows` (newest `DST_SITE` per camera in the round, ordered `finished_at DESC NULLS LAST`; installations in one query by pole/identifier; captures ordered CBW → VNC L1/L2 → DE lanes → OvrC), `summarize`, `filter_rows`, `DRIFT_FLAG_SECONDS = 120`.
+  - `audits/review_views.py` and `templates/audits/review.html`: `/audits/review/` (newest round) and `/audits/review/<id>/`. Any signed-in user. Stats (cameras/LTI/DE/drift/failed), filters (all/failed/drift/LTI/DE), round picker, the thumbnail strip with the existing click-to-enlarge dialog, OvrC device time + FX beside the Eastern wall clock at the read, drift ±min (flag ≥ 2), "newest of N runs", errors inline. A "Review" nav link. The "not complete" filter arrives with Phase 6.
+  - Tests: `audits/test_review.py` (6): newest wins across re-runs, other rounds excluded, capture order, drift/failure flags, the EST label after fall back, filters, **constant query count (2 vs 12 cameras)**, the page renders for `readonly`, 404 for an unknown round, sign-in required. Suite: **70 passed**.
+- **Limitation (inherited design):** drift is measured against **America/New_York**, as the existing DST audit compares to EST. A site legitimately on Central time would show about −60 min; the device's zone label is shown beside the time so a reviewer can tell.
+- **Acceptance on the real round "Acceptance test 2026-10-27"** (through gunicorn as `ployd`):
+  - **3 cameras** from 7 site jobs (1 LTI + 2 DE; DE poles merged across 3 runs);
+  - **8/8 previews are thumbnails** (0 full-size);
+  - summary cameras 3 / LTI 1 / DE 2 / drift 1 / failed 0;
+  - 3/3 rows cross-checked against their job records (newest job link, status, capture count, device time or "Read the CBW capture", drift, "newest of 3 runs") → **PASS**. `266006` shows **ADT +58.9 min, flagged**; `266007` EDT −0.1 min.
+- **I7 — open, blocks Phase 5 acceptance:** intermittent request stalls on the review instance. The review page took **12.7 s cold** and **132.4 s once** server-side (`?show=drift`); `/cameras/` took 81.4 s once earlier. Not reproduced under steady load (32 requests from 4 threads: median 251 ms, max 1.2 s, connects ~208 ms). Postgres is healthy (16/90 backends, no idle-in-transaction, no long queries), so the stall sits between the container and Supavisor. **Hypothesis:** persistent connections (`CONN_MAX_AGE=300`) silently dropped while idle, so the next query hangs until TCP retransmission gives up (~2 min) and Django's health check reconnects. Being tested: idle 60/180/360 s, with and without libpq TCP keepalives.
+- Side finding: Postgres shows **PostgREST running** (`authenticator`), so the Supabase Data API is still enabled. The tables stay locked by `lock_shared_db` (0/21 exposed), but turning the Data API off in the dashboard is still recommended.
+
 ### Phase 6 — Shared Complete checkbox + Notes (gated)
 - **Work:**
   - An `InstallationAuditReview` model (`round` FK, `installation` FK, `completed`, `completed_by`, `completed_at`, `notes`, `notes_updated_by`, `notes_updated_at`, `version`; unique on (round, installation)). It lives only in the shared DB and is never published over.
@@ -278,7 +292,8 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Phase 2 — stable IDs, audit rounds, structured OvrC time, `lock_shared_db` (accepted 2026-10-27)
 - [x] Phase 3 — publish to shared DB (command + panel, can be resumed and re-run) (accepted 2026-10-27)
 - [x] Phase 4 — review instance on the IMS Linode :8443 (incl. I3 reviewer reachability) (accepted 2026-10-28)
-- [ ] Phase 5 — one-page review per round
+- [ ] Phase 5 — one-page review per round (implemented `6e1b83e`; content acceptance PASS; blocked on I7)
+- [ ] I7 — intermittent review-instance request stalls (12.7 s / 132 s / 81 s)
 - [ ] Phase 6 — shared Complete checkbox + Notes (notes editable by anyone signed in, IMS RA-modal style)
 - [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
 - [x] I4 — CBW plan's cameras.0006 schema committed (`dbe111e`) and redeployed; model = Supabase (38/38 columns)
@@ -288,6 +303,6 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 11/15. Phases 0–4 accepted; I1–I4 and I6 resolved; I5 (IMS key 0666) open outside this plan. Next: Phase 5 (one-page review per round).
+in progress — 11/16. Phases 0–4 accepted. Phase 5 implemented and its content acceptance passed; acceptance blocked on I7 (intermittent stalls, under investigation).
 
 `Superseded by:` —
