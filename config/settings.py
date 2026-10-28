@@ -107,6 +107,8 @@ if DST_ROLE not in ("capture", "review"):
 _sqlite_db = {
     "ENGINE": "django.db.backends.sqlite3",
     "NAME": BASE_DIR / "db.sqlite3",
+    # A scheduled run writes from its own process beside runserver.
+    "OPTIONS": {"timeout": 20},
 }
 _shared_db = None
 _db_host = os.getenv("DB_HOST", "").strip()

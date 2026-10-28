@@ -133,11 +133,28 @@ def reap_orphaned_audit_jobs() -> int:
     """
     from audits.models import AuditJob
 
+    from django.db.models import Q
+
+    from audits.models import ScheduledAudit
+    from services.task_scheduler import pid_alive
+
     close_old_connections()
     now = timezone.now()
     qs = AuditJob.objects.filter(
         status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
     )
+    # A scheduled run is its own process: leave it alone while that process lives.
+    for sched in ScheduledAudit.objects.filter(status=ScheduledAudit.Status.RUNNING):
+        if pid_alive(sched.pid):
+            qs = qs.exclude(
+                Q(pk=sched.job_id)
+                | Q(parent_job_id=sched.job_id)
+                | Q(device_type=AuditJob.DeviceType.PUBLISH, created_at__gte=sched.fire_at)
+            )
+        else:
+            ScheduledAudit.objects.filter(pk=sched.pk).update(
+                status=ScheduledAudit.Status.FAILED, message="Interrupted: the run's process ended"
+            )
     count = qs.count()
     if not count:
         return 0
@@ -2621,6 +2638,63 @@ def _start_dst_auto_publish(job) -> threading.Thread | None:
     thread = threading.Thread(target=_publish, name=f"dst-publish-{job.pk}")
     thread.start()
     return thread
+
+
+def create_dst_audit_job(
+    user,
+    *,
+    scope: str,
+    state: str,
+    agency: str,
+    installation_ids: list[int],
+    publish_round: str = "",
+):
+    """Create a queued DST_AUDIT parent for the eligible subset of installation_ids.
+
+    Returns (job, sites). Raises ValueError when nothing is eligible. The
+    caller enqueues it (Start button) or runs it in-process (schedule).
+    """
+    from audits.models import AuditJob
+
+    sites = _active_dst_installations(
+        scope=scope,
+        state=state,
+        agency=agency,
+        installation_ids=installation_ids,
+    )
+    if not sites:
+        raise ValueError("None of the selected sites are eligible for DST audit")
+    job = AuditJob.objects.create(
+        pole_number="DST-ALL",
+        target_host=_encode_dst_audit_meta(scope, state, agency),
+        device_type=AuditJob.DeviceType.DST_AUDIT,
+        created_by=user,
+        progress_message=f"Queued — {len(sites)} site(s)",
+    )
+    # Only persist IDs that survived eligibility checks.
+    write_dst_selection(job.pk, [inst.pk for inst in sites], publish_round=publish_round)
+    return job, sites
+
+
+def mirror_db_cancel(job_id: int, stop: threading.Event, interval: float = 3.0) -> None:
+    """Cancel job_id here when another process marks it cancelled in the DB.
+
+    A scheduled run lives in its own process, so the DST page's Cancel only
+    reaches it through the job's status row.
+    """
+    from audits.models import AuditJob
+
+    while not stop.wait(interval):
+        try:
+            close_old_connections()
+            status = AuditJob.objects.filter(pk=job_id).values_list("status", flat=True).first()
+        except Exception:  # noqa: BLE001 — try again next tick
+            continue
+        if status == AuditJob.Status.CANCELLED and not is_job_cancelled(job_id):
+            logger.info("[AUDIT] Job %s cancelled from another process", job_id)
+            with _cancel_lock:
+                for pk in (job_id, *_job_children.get(job_id, set())):
+                    _cancel_flags.setdefault(pk, threading.Event()).set()
 
 
 def _parse_dst_audit_meta(raw: str) -> dict[str, str]:

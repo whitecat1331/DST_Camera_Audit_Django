@@ -186,6 +186,17 @@ Phase 1 as built:
 - Publish: an optional "Publish to round when done" field next to Start (stored in the run's selection file). After a successful run `_start_dst_auto_publish` runs `publish.publish_after_run` on its own non-daemon thread: a PUBLISH job that shows "Waiting for the VPN to be off to publish" until the shared DB answers (up to `DST_PUBLISH_WAIT_SECONDS`, 12 h), then publishes; on timeout it fails with how to publish by hand.
 - I2: `capture_dragoneye_via_teamviewer` records the session windows open before the connect and `_find_session_window` excludes them. Known limit: if TeamViewer refocuses an already-open window for the same ID instead of opening a new one, the connect now fails rather than capturing; DST closes each session after its capture, so this needs a leftover window for the same FX.
 
+**Phase 3 built ahead of Phase 1's acceptance, by the user's direction (2026-10-28: "I don't see the scheduler to schedule the audit on the DST audit page").** The dummy run is done through the schedule, so one live run accepts Phase 1 and Phase 3 together.
+- `ScheduledAudit` (migration 0011): fire_at, scope/state/agency, installation_ids, publish_round, status, message, pid, job.
+- `services/task_scheduler.py`: one-time task XML (StartBoundary in UTC so the fall-back night is unambiguous; InteractiveToken; WakeToRun; never starts late; runs on battery; `pythonw.exe manage.py run_scheduled_audit <id>`), register/delete/run-now via `schtasks`, no admin needed.
+- `audits/scheduling.py` + `run_scheduled_audit`: claims the row once (a double fire is a no-op), refuses while another DST audit runs, runs the audit in its own process, mirrors a Cancel from the DST page through the job's DB status, waits for the held publish, records the outcome and deletes its task.
+- `reap_orphaned_audit_jobs` (runserver start) now spares a scheduled run's jobs while its process is alive, and fails the schedule if the process is gone.
+- DST page: "Or run unattended at" (datetime-local on the laptop clock, with the clock shown) + "Schedule (N)" for the current selection and round, and a "Scheduled audits" table with Run now / Cancel. Edit = cancel and schedule again.
+- Unit tests: `audits/test_scheduling.py` (13); full suite 128 OK.
+- **Live fire-path check (2026-10-28 15:41):** a throwaway schedule with no eligible sites was registered 75 s ahead; Task Scheduler fired it on the laptop clock with nobody touching it, the command loaded `.env`, refused with "Not started: None of the selected sites are eligible", and deleted its task. The row was deleted afterwards. A real audit has not been fired by the scheduler yet.
+
+**Dummy run sites** (picked 2026-10-28): LTI 600008 (Malibu), 220016 (Savannah), 233014 (Bridgewater): CBW :80 + both VNC lanes answered at 15:3x. DE 266007 (FX1260, York; both lanes today, job 179), I-VBE-0012 (FX1220, New Kent) and I-VBE-0014 (FX1251, JCC) (both lanes 2026-10-27). DE "online" here is a clean recent capture; there's no cheap live check for TeamViewer. VBE units are vehicles, so they may be off at night.
+
 **Live run to accept Phase 1** (user): set `DST_NETWORK_PHASES=true` in `.env`, restart DST, connect the VPN (MFA), select 2 LTI + 2 DE, type a test round in "Publish to round when done", Start, and don't touch the laptop. Accepted when LTI captures happen on the VPN, the VPN drops by itself, both DE sites capture with titles matching their FX, and the round appears on :8443.
 
 
@@ -195,7 +206,7 @@ Phase 1 as built:
 - [ ] Phase 1 — network detector + VPN half → release → direct half, live small run with no manual action between halves, accepted (implemented; unit tests pass; live run pending)
 - [x] Phase 2 — folded into Phase 1 (Phase 0: DST can release the VPN)
 - [ ] I2 — stale TeamViewer window guard, verified in the Phase 1 live run
-- [ ] Phase 3 — one-time local-time schedule via Task Scheduler, fires unattended, accepted
+- [ ] Phase 3 — one-time local-time schedule via Task Scheduler, fires unattended, accepted (implemented ahead of Phase 1 by user direction; fire path checked live; real scheduled run pending)
 - [ ] Phase 4 — preflight + morning report, accepted
 - [ ] Phase 5 — review page picks up newly published results live, accepted
 - [ ] Final acceptance — a real scheduled run, no human after the VPN connect

@@ -8,6 +8,12 @@ urlpatterns = [
     path("dst/start/", views.start_dst_audit, name="dst_audit_start"),
     path("dst/recent/", views.dst_recent_audits, name="dst_recent_audits"),
     path("dst/publish/", views.publish_dst, name="dst_publish"),
+    path("dst/schedule/", views.schedule_dst_audit, name="dst_schedule"),
+    path(
+        "dst/schedule/<int:pk>/<str:action>/",
+        views.schedule_action,
+        name="dst_schedule_action",
+    ),
     path("review/", review_views.review_round, name="review_round"),
     path("review/<int:pk>/", review_views.review_round, name="review_round_pk"),
     path("review/<int:pk>/item/", review_views.review_update, name="review_update"),

@@ -952,6 +952,9 @@ def dst_audit_page(request):
             "settle_seconds": settle,
             "can_publish": can_publish,
             "network_phases": settings.DST_NETWORK_PHASES,
+            "can_schedule": can_audit and settings.DST_ROLE == "capture",
+            "schedules": _dst_schedules(),
+            "device_now": _device_now().strftime("%Y-%m-%d %H:%M %Z"),
             "publish_runs": [r for r in recent_rows if r["finished"]],
             "rounds": list(AuditRound.objects.values_list("name", flat=True)[:20]),
             "active_publish": active_publish,
@@ -1019,13 +1022,29 @@ def dst_recent_audits(request):
     return JsonResponse({"jobs": _dst_recent_audit_rows(12)})
 
 
-@login_required
-@require_POST
-def start_dst_audit(request):
-    """Start a fleet DST audit (power-all → settle → capture → OvrC times)."""
-    if not role_at_least(request.user, "technician"):
-        return JsonResponse({"error": "forbidden"}, status=403)
+def _device_now():
+    from audits.scheduling import device_now
 
+    return device_now()
+
+
+def _dst_schedules():
+    """Upcoming schedules plus the last few that ran, newest first."""
+    from audits.models import ScheduledAudit
+
+    upcoming = list(ScheduledAudit.objects.filter(status=ScheduledAudit.Status.SCHEDULED))
+    recent = list(
+        ScheduledAudit.objects.exclude(status=ScheduledAudit.Status.SCHEDULED).order_by("-fire_at")[:5]
+    )
+    for s in upcoming + recent:
+        # The device's zone with its own DST rules, as Task Scheduler shows it.
+        s.local_label = s.fire_at.astimezone().strftime("%a %Y-%m-%d %H:%M %Z")
+        s.site_count = len(s.installation_ids or [])
+    return upcoming + recent
+
+
+def _dst_run_options(request):
+    """Parse a Start/Schedule request: (options, None) or (None, error response)."""
     if request.content_type and "application/json" in request.content_type:
         try:
             body = json.loads(request.body.decode() or "{}")
@@ -1044,24 +1063,24 @@ def start_dst_audit(request):
         publish_round = request.POST.get("publish_round") or ""
 
     if scope not in {"all", "lti", "de"}:
-        return JsonResponse({"error": "scope must be all, lti, or de"}, status=400)
+        return None, JsonResponse({"error": "scope must be all, lti, or de"}, status=400)
 
     installation_ids: list[int] = []
     if isinstance(raw_ids, str):
         raw_ids = [p for p in raw_ids.replace(";", ",").split(",") if p.strip()]
     if not isinstance(raw_ids, (list, tuple)):
-        return JsonResponse({"error": "installation_ids must be a list"}, status=400)
+        return None, JsonResponse({"error": "installation_ids must be a list"}, status=400)
     for x in raw_ids:
         try:
             installation_ids.append(int(x))
         except (TypeError, ValueError):
-            return JsonResponse({"error": f"invalid installation id: {x!r}"}, status=400)
+            return None, JsonResponse({"error": f"invalid installation id: {x!r}"}, status=400)
     # Preserve order, drop duplicates.
     seen: set[int] = set()
     installation_ids = [i for i in installation_ids if not (i in seen or seen.add(i))]
 
     if not installation_ids:
-        return JsonResponse(
+        return None, JsonResponse(
             {"error": "Select at least one site to audit"},
             status=400,
         )
@@ -1070,13 +1089,34 @@ def start_dst_audit(request):
         from audits.publish import PublishError, clean_round_name, shared_configured
 
         if settings.DST_ROLE != "capture" or not shared_configured():
-            return JsonResponse({"error": "Publishing is only available on the capture laptop with DB_HOST set."}, status=400)
+            return None, JsonResponse({"error": "Publishing is only available on the capture laptop with DB_HOST set."}, status=400)
         try:
             publish_round = clean_round_name(publish_round)
         except PublishError as exc:
-            return JsonResponse({"error": str(exc)}, status=400)
+            return None, JsonResponse({"error": str(exc)}, status=400)
     else:
         publish_round = ""
+
+    return {
+        "scope": scope,
+        "state": state,
+        "agency": agency,
+        "installation_ids": installation_ids,
+        "publish_round": publish_round,
+    }, None
+
+
+@login_required
+@require_POST
+def start_dst_audit(request):
+    """Start a fleet DST audit (power-all → settle → capture → OvrC times)."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    opts, error = _dst_run_options(request)
+    if error:
+        return error
+    scope, state, agency = opts["scope"], opts["state"], opts["agency"]
 
     running = AuditJob.objects.filter(
         device_type=AuditJob.DeviceType.DST_AUDIT,
@@ -1085,35 +1125,20 @@ def start_dst_audit(request):
     if running:
         return JsonResponse({"error": "A DST Audit is already running"}, status=409)
 
-    from audits.runner import (
-        _active_dst_installations,
-        _encode_dst_audit_meta,
-        write_dst_selection,
-    )
+    from audits.runner import create_dst_audit_job
 
-    sites = _active_dst_installations(
-        scope=scope,
-        state=state,
-        agency=agency,
-        installation_ids=installation_ids,
-    )
-    if not sites:
-        return JsonResponse(
-            {"error": "None of the selected sites are eligible for DST audit"},
-            status=400,
+    try:
+        job, sites = create_dst_audit_job(
+            request.user,
+            scope=scope,
+            state=state,
+            agency=agency,
+            installation_ids=opts["installation_ids"],
+            publish_round=opts["publish_round"],
         )
-
-    # Only persist IDs that survived eligibility checks.
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
     resolved_ids = [inst.pk for inst in sites]
-    meta = _encode_dst_audit_meta(scope, state, agency)
-    job = AuditJob.objects.create(
-        pole_number="DST-ALL",
-        target_host=meta,
-        device_type=AuditJob.DeviceType.DST_AUDIT,
-        created_by=request.user,
-        progress_message=f"Queued — {len(sites)} site(s)",
-    )
-    write_dst_selection(job.pk, resolved_ids, publish_round=publish_round)
     enqueue_audit_job(job.pk)
     logger.info(
         "[DST] start job=%s sites=%s selected=%s scope=%s state=%s agency=%s user=%s",
@@ -1876,3 +1901,43 @@ def _dst_site_kind_safe(inst) -> str:
     from audits.runner import _dst_site_kind
 
     return _dst_site_kind(inst) or ""
+
+
+@login_required
+@require_POST
+def schedule_dst_audit(request):
+    """Schedule a one-time DST audit of the selected sites at a device-local time."""
+    from audits.scheduling import ScheduleError, create_schedule, parse_local
+
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if settings.DST_ROLE != "capture":
+        return JsonResponse({"error": "Scheduling is only available on the capture laptop."}, status=400)
+    opts, error = _dst_run_options(request)
+    if error:
+        return error
+    try:
+        body = json.loads(request.body.decode() or "{}")
+        sched = create_schedule(request.user, parse_local(str(body.get("fire_at") or "")), opts)
+    except (json.JSONDecodeError, ScheduleError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    return JsonResponse({"ok": True, "id": sched.pk})
+
+
+@login_required
+@require_POST
+def schedule_action(request, pk, action):
+    from audits.models import ScheduledAudit
+    from audits.scheduling import ScheduleError, cancel_schedule, run_now
+
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if action not in ("cancel", "run"):
+        raise Http404
+    sched = get_object_or_404(ScheduledAudit, pk=pk)
+    try:
+        (cancel_schedule if action == "cancel" else run_now)(sched)
+    except ScheduleError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    logger.info("[SCHED] #%s %s by %s", pk, action, request.user.get_username())
+    return JsonResponse({"ok": True})

@@ -182,3 +182,47 @@ class InstallationAuditReview(models.Model):
 
     def __str__(self) -> str:
         return f"{self.round} / {self.camera_key} -> {self.assigned_to or 'unassigned'}"
+
+
+class ScheduledAudit(models.Model):
+    """A one-time DST audit fired by Windows Task Scheduler on the laptop's clock.
+
+    Capture laptop only. Task Scheduler owns the timing (wake, local clock and
+    time changes); this row owns what to run and what happened.
+    """
+
+    class Status(models.TextChoices):
+        SCHEDULED = "scheduled", "Scheduled"
+        RUNNING = "running", "Running"
+        DONE = "done", "Done"
+        FAILED = "failed", "Failed"
+        CANCELLED = "cancelled", "Cancelled"
+
+    fire_at = models.DateTimeField()
+    scope = models.CharField(max_length=16, default="all")
+    state = models.CharField(max_length=64, blank=True)
+    agency = models.CharField(max_length=128, blank=True)
+    installation_ids = models.JSONField(default=list)
+    publish_round = models.CharField(max_length=128, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.SCHEDULED)
+    message = models.CharField(max_length=500, blank=True)
+    # The run_scheduled_audit process while running (a runserver restart must
+    # not reap a live scheduled run's jobs).
+    pid = models.IntegerField(null=True, blank=True)
+    job = models.ForeignKey(
+        AuditJob, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["fire_at"]
+
+    def __str__(self) -> str:
+        return f"Scheduled audit #{self.pk} at {self.fire_at:%Y-%m-%d %H:%M}"
+
+    @property
+    def task_name(self) -> str:
+        return f"DST scheduled audit {self.pk}"

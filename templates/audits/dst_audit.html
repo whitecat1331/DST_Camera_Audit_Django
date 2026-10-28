@@ -99,9 +99,43 @@
     <input type="text" id="dst-start-round" list="dst-publish-rounds" maxlength="128"
       placeholder="Publish to round when done (optional)" aria-label="Publish the run into this round when it finishes">
   </div>
+  {% if can_schedule %}
+  <div class="dst-actions dst-schedule-actions">
+    <label class="dst-schedule-label" for="dst-schedule-at">Or run unattended at</label>
+    <input type="datetime-local" id="dst-schedule-at" aria-label="Scheduled time on this laptop's clock">
+    <button type="button" class="btn-secondary" id="dst-schedule-btn" disabled>Schedule (0)</button>
+    <span class="muted">Laptop clock now: {{ device_now }}</span>
+  </div>
+  {% endif %}
   {% if network_phases %}
   <p class="muted">Network phases on: LTI runs on your camera VPN, then DST disconnects the VPN for DE and publish. Connect the VPN before you start.</p>
   {% endif %}
+  {% endif %}
+  {% if can_schedule and schedules %}
+  <h3>Scheduled audits</h3>
+  <table class="data-table" id="dst-schedule-table">
+    <thead><tr><th>When (laptop clock)</th><th>Sites</th><th>Round</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {% for s in schedules %}
+      <tr data-id="{{ s.pk }}">
+        <td>{{ s.local_label }}</td>
+        <td>{{ s.site_count }}</td>
+        <td>{{ s.publish_round|default:"—" }}</td>
+        <td>
+          <span class="badge status-{% if s.status == 'done' %}succeeded{% elif s.status == 'scheduled' %}pending{% else %}{{ s.status }}{% endif %}">{{ s.get_status_display }}</span>
+          {% if s.message %}<span class="muted">{{ s.message }}</span>{% endif %}
+          {% if s.job_id %}<a href="{% url 'audit_detail' s.job_id %}">#{{ s.job_id }}</a>{% endif %}
+        </td>
+        <td>
+          {% if s.status == 'scheduled' %}
+          <button type="button" class="btn-secondary dst-schedule-run" data-id="{{ s.pk }}">Run now</button>
+          <button type="button" class="btn-danger dst-schedule-cancel" data-id="{{ s.pk }}">Cancel</button>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
   {% endif %}
   {% else %}
   <p class="lede">Technician role required to start a DST Audit.</p>
@@ -339,6 +373,9 @@
   const START_URL = "{% url 'dst_audit_start' %}";
   const RECENT_URL = "{% url 'dst_recent_audits' %}";
   const CANCEL_TMPL = "{% url 'audit_cancel' pk=0 %}".replace("/0/", "/{id}/");
+  const SCHEDULE_URL = "{% url 'dst_schedule' %}";
+  const SCHEDULE_ACTION_TMPL = "{% url 'dst_schedule_action' pk=0 action='cancel' %}".replace("/0/cancel/", "/{id}/{action}/");
+  const scheduleBtn = document.getElementById("dst-schedule-btn");
   const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const canAudit = {{ can_audit|yesno:"true,false" }};
   const FILTERS = {
@@ -579,6 +616,10 @@
     if (startBtn && canAudit && !jobId) {
       startBtn.disabled = n === 0;
       startBtn.textContent = n === 0 ? "Start DST Audit (0)" : `Start DST Audit (${n})`;
+    }
+    if (scheduleBtn) {
+      scheduleBtn.disabled = n === 0;
+      scheduleBtn.textContent = `Schedule (${n})`;
     }
     renderSelectedCart();
   }
@@ -885,6 +926,67 @@
       pollTimer = null;
     }
   }
+
+  async function postJson(url, body) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRFToken": CSRF, Accept: "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+    return data;
+  }
+
+  if (scheduleBtn) {
+    scheduleBtn.addEventListener("click", async () => {
+      const ids = selectedIds();
+      const at = document.getElementById("dst-schedule-at").value;
+      const round = (document.getElementById("dst-start-round")?.value || "").trim();
+      if (!ids.length) return;
+      if (!at) {
+        alert("Pick the date and time to run (this laptop's clock).");
+        return;
+      }
+      const when = new Date(at).toLocaleString();
+      if (
+        !confirm(
+          `Schedule a DST audit of ${ids.length} site(s) at ${when}?\n\n` +
+            (round ? `Publishes to round "${round}" when done.\n` : "Won't publish (no round typed).\n") +
+            `\nBefore you leave: connect the VPN, keep the laptop plugged in, signed in, ` +
+            `unlocked and awake, with TeamViewer running.`
+        )
+      ) {
+        return;
+      }
+      scheduleBtn.disabled = true;
+      try {
+        await postJson(SCHEDULE_URL, { ...FILTERS, installation_ids: ids, publish_round: round, fire_at: at });
+        window.location.reload();
+      } catch (err) {
+        alert(err.message);
+        syncSelectionUi();
+      }
+    });
+  }
+
+  document.querySelectorAll(".dst-schedule-run, .dst-schedule-cancel").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const run = btn.classList.contains("dst-schedule-run");
+      const msg = run
+        ? "Run this scheduled audit now? It runs exactly as it would at the set time."
+        : "Cancel this scheduled audit?";
+      if (!confirm(msg)) return;
+      btn.disabled = true;
+      try {
+        await postJson(SCHEDULE_ACTION_TMPL.replace("{id}", btn.dataset.id).replace("{action}", run ? "run" : "cancel"));
+        window.location.reload();
+      } catch (err) {
+        alert(err.message);
+        btn.disabled = false;
+      }
+    });
+  });
 
   if (startBtn && canAudit) {
     startBtn.addEventListener("click", async () => {

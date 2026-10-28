@@ -1115,6 +1115,10 @@ a.icon-btn {
 }
 .dst-phases-legend strong { color: var(--ice-frost); }
 .dst-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+.dst-schedule-actions { margin-top: 0.75rem; }
+.dst-schedule-label { display: inline; font-weight: 600; }
+#dst-schedule-table { margin-top: 0.5rem; }
+#dst-schedule-table .muted { display: block; font-size: 0.85rem; }
 .dst-publish-actions { margin-top: 1rem; }
 .dst-publish-actions input[type="text"] { flex: 1 1 18rem; min-width: 14rem; }
 .dst-detail-actions { margin-bottom: 1rem; }
