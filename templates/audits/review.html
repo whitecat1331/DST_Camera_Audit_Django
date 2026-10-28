@@ -191,7 +191,7 @@
   const form = document.getElementById("review-filter-form");
   if (!form) return;
   const apply = form.querySelector(".review-filter-apply");
-  if (apply) apply.hidden = true;
+  if (apply) apply.remove();  // auto-apply replaces it; kept in markup for no-JS
   form.addEventListener("submit", (e) => {
     e.preventDefault();
     const params = new URLSearchParams();
