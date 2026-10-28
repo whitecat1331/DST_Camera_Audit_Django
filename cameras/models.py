@@ -185,7 +185,8 @@ class InstallationDevice(models.Model):
     unit_serial = models.CharField(max_length=128, blank=True)
     prtg_objid = models.CharField(max_length=64, blank=True)
     name = models.CharField(max_length=255, blank=True)
-    host = models.CharField(max_length=64, blank=True, db_index=True)
+    # IMS hosts include ControlByWeb cloud URLs (146+ chars), not just IPs.
+    host = models.CharField(max_length=255, blank=True, db_index=True)
     device_type = models.CharField(max_length=64, blank=True)
     sort_order = models.IntegerField(default=0)
 
