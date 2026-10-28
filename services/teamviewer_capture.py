@@ -141,10 +141,21 @@ def _enum_session_windows(teamviewer_id: str = "") -> list[tuple[int, str, int]]
     return found
 
 
-def _find_session_window(gw, teamviewer_id: str, *, title_hint: str = "") -> _TVWindow | None:
-    """Return the best TeamViewer session window (fresh EnumWindows scan)."""
+def _find_session_window(
+    gw,
+    teamviewer_id: str,
+    *,
+    title_hint: str = "",
+    exclude: frozenset[int] = frozenset(),
+) -> _TVWindow | None:
+    """Return the best TeamViewer session window (fresh EnumWindows scan).
+
+    exclude: windows already open before this connect. Any "<host> - TeamViewer"
+    window qualifies, so a session left open from earlier would otherwise be
+    taken as the new one (an FX1260 lane once captured an "FX1361 L2" window).
+    """
     del gw  # PyGetWindow cache goes stale after login; use Win32 enum instead.
-    windows = _enum_session_windows(teamviewer_id)
+    windows = [w for w in _enum_session_windows(teamviewer_id) if w[0] not in exclude]
     if title_hint:
         hinted = [w for w in windows if title_hint in w[1]]
         if hinted:
@@ -620,6 +631,9 @@ def capture_dragoneye_via_teamviewer(
     t0 = time.perf_counter()
     logger.info("[TV] connect id=%s passwords=%s", teamviewer_id, len(teamviewer_passwords))
 
+    stale = frozenset(hwnd for hwnd, _title, _area in _enum_session_windows())
+    if stale:
+        logger.info("[TV] ignoring %s session window(s) open before connect", len(stale))
     try:
         for idx, tv_pwd in enumerate(teamviewer_passwords, start=1):
             if _cancelled():
@@ -643,7 +657,7 @@ def capture_dragoneye_via_teamviewer(
             while elapsed < wait_for_connection_sec:
                 if _cancelled():
                     raise CaptureCancelled("TeamViewer capture cancelled")
-                win = _find_session_window(gw, teamviewer_id)
+                win = _find_session_window(gw, teamviewer_id, exclude=stale)
                 if win:
                     break
                 if proc.poll() is not None and proc.returncode != 0:
@@ -713,7 +727,9 @@ def capture_dragoneye_via_teamviewer(
 
         # Re-resolve session window in case the handle changed after login.
         try:
-            refreshed = _find_session_window(gw, teamviewer_id, title_hint=session_title_hint)
+            refreshed = _find_session_window(
+                gw, teamviewer_id, title_hint=session_title_hint, exclude=stale
+            )
             if refreshed is not None:
                 win = refreshed
                 session_hwnd = win._hWnd

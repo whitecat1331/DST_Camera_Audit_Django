@@ -951,6 +951,7 @@ def dst_audit_page(request):
             "recent_jobs": recent_rows,
             "settle_seconds": settle,
             "can_publish": can_publish,
+            "network_phases": settings.DST_NETWORK_PHASES,
             "publish_runs": [r for r in recent_rows if r["finished"]],
             "rounds": list(AuditRound.objects.values_list("name", flat=True)[:20]),
             "active_publish": active_publish,
@@ -1034,11 +1035,13 @@ def start_dst_audit(request):
         state = str(body.get("state") or "").strip()
         agency = str(body.get("agency") or "").strip()
         raw_ids = body.get("installation_ids") or body.get("ids") or []
+        publish_round = str(body.get("publish_round") or "")
     else:
         scope = (request.POST.get("scope") or "all").strip().lower()
         state = (request.POST.get("state") or "").strip()
         agency = (request.POST.get("agency") or "").strip()
         raw_ids = request.POST.getlist("installation_ids")
+        publish_round = request.POST.get("publish_round") or ""
 
     if scope not in {"all", "lti", "de"}:
         return JsonResponse({"error": "scope must be all, lti, or de"}, status=400)
@@ -1062,6 +1065,18 @@ def start_dst_audit(request):
             {"error": "Select at least one site to audit"},
             status=400,
         )
+
+    if publish_round.strip():
+        from audits.publish import PublishError, clean_round_name, shared_configured
+
+        if settings.DST_ROLE != "capture" or not shared_configured():
+            return JsonResponse({"error": "Publishing is only available on the capture laptop with DB_HOST set."}, status=400)
+        try:
+            publish_round = clean_round_name(publish_round)
+        except PublishError as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+    else:
+        publish_round = ""
 
     running = AuditJob.objects.filter(
         device_type=AuditJob.DeviceType.DST_AUDIT,
@@ -1098,7 +1113,7 @@ def start_dst_audit(request):
         created_by=request.user,
         progress_message=f"Queued — {len(sites)} site(s)",
     )
-    write_dst_selection(job.pk, resolved_ids)
+    write_dst_selection(job.pk, resolved_ids, publish_round=publish_round)
     enqueue_audit_job(job.pk)
     logger.info(
         "[DST] start job=%s sites=%s selected=%s scope=%s state=%s agency=%s user=%s",
@@ -1515,6 +1530,7 @@ def start_confirm_captures(request):
         installation_id = body.get("installation_id")
     else:
         raw_ids = request.POST.getlist("installation_ids")
+        publish_round = request.POST.get("publish_round") or ""
         installation_id = request.POST.get("installation_id")
 
     installation_ids: list[int] = []

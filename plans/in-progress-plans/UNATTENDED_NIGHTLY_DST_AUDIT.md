@@ -178,11 +178,21 @@ The review instance learns about a publish without a refresh. Publish writes to 
 - ~~Q5 — round per run~~ — **resolved 2026-10-28 (user):** "the audit will include both for now". **One run covers LTI + DE and publishes into one new round** (default name `DST audit {local date}`, editable on the schedule).
 
 ## Status
-in progress — Phase 0 accepted (matrix + release answered; Q4 carried to final acceptance by the user's direction). Phase 1 (with Phase 2 folded in) being implemented 2026-10-28.
+in progress — Phase 0 accepted (matrix + release answered; Q4 carried to final acceptance by the user's direction). **Phase 1 implemented 2026-10-28, not accepted**: unit tests pass (`audits/test_network_phases.py`, 16 tests; full suite 115 OK). Waiting on the live small run, which needs the user on the VPN (MFA).
+
+Phase 1 as built:
+- `services/netstate.py`: `camera_network_up`, `direct_up`, `vpn_up` (`openvpn.exe` running), `management_port` (netstat for openvpn's loopback listener, else `DST_VPN_MGMT_PORT`), `send_sigterm`, `release_vpn` (never raises; returns released + detail).
+- `audits/runner.py`: with `DST_NETWORK_PHASES` on, `_run_dst_audit` probes up to 3 selected LTI CBWs; down → LTI skipped and reported. Captures run LTI first; `_dst_release_vpn` runs before the first DE site (or at the end of an LTI-only run that publishes). A failed release is a warning and DE still runs.
+- Publish: an optional "Publish to round when done" field next to Start (stored in the run's selection file). After a successful run `_start_dst_auto_publish` runs `publish.publish_after_run` on its own non-daemon thread: a PUBLISH job that shows "Waiting for the VPN to be off to publish" until the shared DB answers (up to `DST_PUBLISH_WAIT_SECONDS`, 12 h), then publishes; on timeout it fails with how to publish by hand.
+- I2: `capture_dragoneye_via_teamviewer` records the session windows open before the connect and `_find_session_window` excludes them. Known limit: if TeamViewer refocuses an already-open window for the same ID instead of opening a new one, the connect now fails rather than capturing; DST closes each session after its capture, so this needs a leftover window for the same FX.
+
+**Live run to accept Phase 1** (user): set `DST_NETWORK_PHASES=true` in `.env`, restart DST, connect the VPN (MFA), select 2 LTI + 2 DE, type a test round in "Publish to round when done", Start, and don't touch the laptop. Accepted when LTI captures happen on the VPN, the VPN drops by itself, both DE sites capture with titles matching their FX, and the round appears on :8443.
+
+
 
 ## Checklist
 - [x] Phase 0 — spike: reachability matrix on/off VPN + can DST release the WatchGuard VPN (yes, evidence above; Q4 carried to final acceptance)
-- [ ] Phase 1 — network detector + VPN half → release → direct half, live small run with no manual action between halves, accepted
+- [ ] Phase 1 — network detector + VPN half → release → direct half, live small run with no manual action between halves, accepted (implemented; unit tests pass; live run pending)
 - [x] Phase 2 — folded into Phase 1 (Phase 0: DST can release the VPN)
 - [ ] I2 — stale TeamViewer window guard, verified in the Phase 1 live run
 - [ ] Phase 3 — one-time local-time schedule via Task Scheduler, fires unattended, accepted

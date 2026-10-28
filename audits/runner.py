@@ -1845,16 +1845,18 @@ def _dst_selection_path(job_id: int) -> Path:
     return Path(settings.MEDIA_ROOT) / "audits" / f"dst_selection_{job_id}.json"
 
 
-def write_dst_selection(job_id: int, installation_ids: list[int]) -> Path:
-    """Persist selected installation PKs for a DST audit parent job."""
+def write_dst_selection(
+    job_id: int, installation_ids: list[int], *, publish_round: str = ""
+) -> Path:
+    """Persist selected installation PKs (and run options) for a DST audit parent job."""
     path = _dst_selection_path(job_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     import json
 
-    path.write_text(
-        json.dumps({"installation_ids": [int(x) for x in installation_ids]}),
-        encoding="utf-8",
-    )
+    data: dict = {"installation_ids": [int(x) for x in installation_ids]}
+    if publish_round:
+        data["publish_round"] = publish_round
+    path.write_text(json.dumps(data), encoding="utf-8")
     logger.info(
         "[DST] Job %s selection written count=%s path=%s",
         job_id,
@@ -1862,6 +1864,17 @@ def write_dst_selection(job_id: int, installation_ids: list[int]) -> Path:
         path,
     )
     return path
+
+
+def read_dst_publish_round(job_id: int) -> str:
+    """Round to publish the run into when it finishes ("" = don't publish)."""
+    import json
+
+    try:
+        data = json.loads(_dst_selection_path(job_id).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(data.get("publish_round") or "").strip()
 
 
 def read_dst_selection(job_id: int) -> list[int] | None:
@@ -2170,6 +2183,32 @@ def _run_dst_site_capture(
     return errors
 
 
+def _dst_camera_network_up(lti_sites: list) -> bool:
+    """True when a CBW of the first few LTI sites answers (camera VPN is up)."""
+    from services.ip_map import cbw_ip
+    from services.netstate import camera_network_up
+
+    hosts = []
+    for inst in lti_sites[:3]:
+        try:
+            hosts.append(cbw_ip(_dst_site_key(inst)))
+        except Exception:  # noqa: BLE001 — a pole that doesn't map just isn't probed
+            continue
+    return camera_network_up(hosts)
+
+
+def _dst_release_vpn(job_id: int) -> list[str]:
+    """Release the user's camera VPN before the DE half; returns warnings."""
+    from services.netstate import release_vpn
+
+    result = release_vpn(progress=lambda msg: _set_progress(job_id, msg))
+    logger.info("[DST] Job %s VPN release: %s (%s)", job_id, result.released, result.detail)
+    _set_progress(job_id, f"Network: {result.detail}")
+    if result.released:
+        return []
+    return [f"VPN release failed ({result.detail}); DE captures ran on the VPN"]
+
+
 def _run_dst_audit(
     job_id: int,
     output_dir: Path,
@@ -2227,6 +2266,24 @@ def _run_dst_audit(
     all_errors: list[str] = []
     power_ok = 0
     any_turned_on = False
+
+    # Network phases: LTI on the camera VPN first, then release it for DE.
+    network_phases = bool(getattr(settings, "DST_NETWORK_PHASES", False))
+    if network_phases:
+        if lti_sites and not _dst_camera_network_up(lti_sites):
+            msg = (
+                f"LTI skipped ({len(lti_sites)} site(s)): camera network not reachable. "
+                "Connect the VPN before the run."
+            )
+            all_errors.append(msg)
+            logger.warning("[DST] Job %s %s", job_id, msg)
+            _set_progress(job_id, msg)
+            lti_sites = []
+        sites = lti_sites + de_sites
+        total = len(sites)
+        if not sites:
+            return all_errors, 0
+    vpn_released = False
 
     # ── Phase 1a: CBW relays (parallel) ──────────────────────────────────
     if lti_sites:
@@ -2356,6 +2413,10 @@ def _run_dst_audit(
             kind,
             time.perf_counter() - t_key,
         )
+        if network_phases and kind == "de" and not vpn_released:
+            # TeamViewer and publish need the VPN off; the order never goes back.
+            vpn_released = True
+            all_errors.extend(_dst_release_vpn(job_id))
         _set_progress(job_id, f"Phase 3/4: {index}/{total} capturing {key} ({kind})…")
         _dst_log(job_id, "phase3 creating child AuditJob…")
         t_child = time.perf_counter()
@@ -2501,6 +2562,11 @@ def _run_dst_audit(
             f"{len(all_errors)} warning(s)…",
         )
 
+    if network_phases and not vpn_released and read_dst_publish_round(job_id):
+        # LTI-only run that publishes: the shared DB needs the VPN off too.
+        vpn_released = True
+        all_errors.extend(_dst_release_vpn(job_id))
+
     # Fleet OvrC pass: one login for every DE FX after all TV captures.
     if de_ovrc_assignments:
         _raise_if_cancelled(job_id)
@@ -2526,6 +2592,35 @@ def _run_dst_audit(
     if sites_ok == 0 and not all_errors:
         all_errors.append("No sites captured")
     return all_errors, sites_ok
+
+
+def _start_dst_auto_publish(job) -> threading.Thread | None:
+    """Publish a finished DST run into its round, when the start asked for one.
+
+    Its own thread, outside the worker slot: the publish may wait (held) until
+    the VPN is off. Not a daemon, so a management-command run waits for it.
+    """
+    from audits.publish import PublishError, publish_after_run
+
+    round_name = read_dst_publish_round(job.pk)
+    if not round_name:
+        return None
+
+    def _publish() -> None:
+        close_old_connections()
+        try:
+            pub = publish_after_run(job.pk, round_name, job.created_by)
+            logger.info("[DST] Job %s auto-publish job=%s status=%s", job.pk, pub.pk, pub.status)
+        except PublishError as exc:
+            logger.warning("[DST] Job %s auto-publish refused: %s", job.pk, exc)
+        except Exception:  # noqa: BLE001
+            logger.exception("[DST] Job %s auto-publish crashed", job.pk)
+        finally:
+            close_old_connections()
+
+    thread = threading.Thread(target=_publish, name=f"dst-publish-{job.pk}")
+    thread.start()
+    return thread
 
 
 def _parse_dst_audit_meta(raw: str) -> dict[str, str]:
@@ -2858,6 +2953,7 @@ def _run_job(job_id: int) -> None:
                     len(errors),
                     time.perf_counter() - t0,
                 )
+                _start_dst_auto_publish(job)
                 return
 
             if job.device_type == AuditJob.DeviceType.CONFIRM_BATCH:

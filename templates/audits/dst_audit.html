@@ -94,6 +94,15 @@
     <button type="button" class="btn-danger" id="dst-cancel-btn" hidden>Cancel audit</button>
     <a class="btn-secondary" id="dst-detail-link" href="#" hidden>Open job detail</a>
   </div>
+  {% if can_publish %}
+  <div class="dst-actions">
+    <input type="text" id="dst-start-round" list="dst-publish-rounds" maxlength="128"
+      placeholder="Publish to round when done (optional)" aria-label="Publish the run into this round when it finishes">
+  </div>
+  {% if network_phases %}
+  <p class="muted">Network phases on: LTI runs on your camera VPN, then DST disconnects the VPN for DE and publish. Connect the VPN before you start.</p>
+  {% endif %}
+  {% endif %}
   {% else %}
   <p class="lede">Technician role required to start a DST Audit.</p>
   {% endif %}
@@ -907,7 +916,11 @@
             "X-CSRFToken": CSRF,
             Accept: "application/json",
           },
-          body: JSON.stringify({ ...FILTERS, installation_ids: ids }),
+          body: JSON.stringify({
+            ...FILTERS,
+            installation_ids: ids,
+            publish_round: (document.getElementById("dst-start-round")?.value || "").trim(),
+          }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "start failed");

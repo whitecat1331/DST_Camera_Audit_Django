@@ -287,8 +287,6 @@ def publish_runs(
 
 def start_publish_job(run_ids: list[int], round_name: str, user) -> AuditJob:
     """Run publish_runs on a background thread, tracked as a PUBLISH AuditJob."""
-    from audits.runner import _set_progress
-
     if not _publish_lock.acquire(blocking=False):
         raise PublishError("A publish is already running.")
     try:
@@ -308,35 +306,97 @@ def start_publish_job(run_ids: list[int], round_name: str, user) -> AuditJob:
         _publish_lock.release()
         raise
 
-    def _run() -> None:
-        close_old_connections()
-        try:
-            report = publish_runs(
-                run_ids,
-                round_name,
-                username=getattr(user, "username", None),
-                progress=lambda msg: _set_progress(job.pk, msg),
-            )
-            status, message, error = AuditJob.Status.SUCCEEDED, report.summary(), ""
-            if report.missing_files:
-                error = "Missing image files: " + ", ".join(report.missing_files)
-        except PublishError as exc:
-            status, message, error = AuditJob.Status.FAILED, "Publish failed", str(exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[PUBLISH] job %s crashed", job.pk)
-            status, message = AuditJob.Status.FAILED, "Publish failed"
-            error = f"{type(exc).__name__}: {exc}"
-        finally:
-            _publish_lock.release()
-        AuditJob.objects.filter(pk=job.pk).update(
-            status=status,
-            progress_message=message[:255],
-            error_message=error[:2000],
-            finished_at=timezone.now(),
-        )
-        if SHARED in connections.databases:
-            connections[SHARED].close()
-        close_old_connections()
+    threading.Thread(
+        target=_execute_publish, args=(job, run_ids, round_name, user), name=f"publish-{job.pk}", daemon=True
+    ).start()
+    return job
 
-    threading.Thread(target=_run, name=f"publish-{job.pk}", daemon=True).start()
+
+def _execute_publish(job: AuditJob, run_ids: list[int], round_name: str, user) -> None:
+    """Publish and record the outcome on job; releases _publish_lock (caller holds it)."""
+    from audits.runner import _set_progress
+
+    close_old_connections()
+    try:
+        report = publish_runs(
+            run_ids,
+            round_name,
+            username=getattr(user, "username", None),
+            progress=lambda msg: _set_progress(job.pk, msg),
+        )
+        status, message, error = AuditJob.Status.SUCCEEDED, report.summary(), ""
+        if report.missing_files:
+            error = "Missing image files: " + ", ".join(report.missing_files)
+    except PublishError as exc:
+        status, message, error = AuditJob.Status.FAILED, "Publish failed", str(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[PUBLISH] job %s crashed", job.pk)
+        status, message = AuditJob.Status.FAILED, "Publish failed"
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        _publish_lock.release()
+    AuditJob.objects.filter(pk=job.pk).update(
+        status=status,
+        progress_message=message[:255],
+        error_message=error[:2000],
+        finished_at=timezone.now(),
+    )
+    if SHARED in connections.databases:
+        connections[SHARED].close()
+    close_old_connections()
+
+
+def publish_after_run(
+    run_id: int,
+    round_name: str,
+    user,
+    *,
+    wait_seconds: float | None = None,
+    poll_seconds: float = 30.0,
+    reachable: Callable[[], bool] | None = None,
+) -> AuditJob:
+    """Publish a finished run once the shared DB answers (the VPN is off).
+
+    Held publish: while the camera VPN still blocks the shared DB, the PUBLISH
+    job waits and says so, then publishes by itself as soon as it can.
+    Synchronous; the caller picks the thread.
+    """
+    import time
+
+    from audits.runner import _set_progress
+    from services.netstate import direct_up
+
+    reachable = reachable or direct_up
+    if wait_seconds is None:
+        wait_seconds = float(getattr(settings, "DST_PUBLISH_WAIT_SECONDS", 12 * 3600))
+    round_name = clean_round_name(round_name)
+    job = AuditJob.objects.create(
+        pole_number="publish",
+        target_host=round_name[:64],
+        device_type=AuditJob.DeviceType.PUBLISH,
+        status=AuditJob.Status.RUNNING,
+        created_by=user,
+        started_at=timezone.now(),
+        progress_message=f"Publishing run #{run_id}…",
+    )
+    deadline = time.monotonic() + wait_seconds
+    while not reachable():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            AuditJob.objects.filter(pk=job.pk).update(
+                status=AuditJob.Status.FAILED,
+                progress_message="Publish held: shared DB not reachable",
+                error_message=(
+                    f"The shared DB did not answer for {wait_seconds / 3600:.1f} h (camera VPN "
+                    f"still on?). Turn the VPN off and publish run #{run_id} from the DST page."
+                ),
+                finished_at=timezone.now(),
+            )
+            job.refresh_from_db()
+            return job
+        _set_progress(job.pk, f"Waiting for the VPN to be off to publish ({int(left // 60)} min left)…")
+        time.sleep(min(poll_seconds, left))
+    _publish_lock.acquire()
+    _execute_publish(job, [run_id], round_name, user)
+    job.refresh_from_db()
     return job
