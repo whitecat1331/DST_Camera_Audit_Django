@@ -266,15 +266,15 @@ User report: "DST audit page is taking a long time to load".
 - Performance (I7 resolved): after the direct-connection fix, the user reports "working much better". Since the container restart: **0 `[STUCK]` dumps**; the user's real browser requests median **68 ms**, max **245 ms**; IMS healthy; container 339 MiB / 512.
 
 ### Phase 6 — Reviewer assignment + shared Complete checkbox + Notes (gated)
-**Amended 2026-10-28 (user):** the review work is divided among technicians, currently **`carthur`, `jgreene`, `ployd`**. The user wrote "caruthur", but the signed-in review-site user is `carthur`; confirm. Each camera is assigned to one tech with an `x % number of techs` distribution, and the review page filters by assigned tech.
+**Amended 2026-10-28 (user):** the review work is divided among technicians, currently **`carthur`, `jgreene`, `ployd`**. Each camera is assigned to one tech with an `x % number of techs` distribution, and the review page filters by assigned tech.
 
 - **Assignment design:**
   - **x = the camera's arrival order in the round**, not its position in a sorted list. Positions shift when more cameras are published later (the DE run after the LTI run, re-runs), which would silently move cameras between techs mid-review. Each camera is assigned **once, when it first enters the round**, to `reviewers[seq % n]`, and the result is **stored**. Counts stay equal within ±1, and an assignment never changes by itself.
-  - **Balanced per site type (proposed, confirm):** a separate sequence for LTI and for DE, so each tech gets an equal share of both (LTI review means reading CBW/VNC images, while DE has OvrC times).
+  - **Balanced per site type (confirmed):** a separate sequence per type (LTI, DE). The k-th camera of a type goes to `reviewers[(start_type + k) % n]`, where `start_type` = the round's total assigned count when that type first appears, so the overall total also stays balanced instead of every type starting at tech 0.
   - **Reviewers list:** `DST_REVIEWERS=carthur,jgreene,ployd` (laptop `.env`; publish assigns). The list is **snapshotted on the round** (`AuditRound.reviewers`) at its first publish, so changing the team later does not reshuffle an existing round. A new round uses the then-current list.
   - **Where:** in `publish_runs` (the single writer; inside the run's shared-DB transaction). Publish **only creates** review rows for cameras new to the round and never updates existing ones, so re-publishing keeps assignments, checkmarks and notes.
   - **Backfill:** `manage.py assign_reviewers --round NAME` for rounds published before this change (the acceptance round).
-  - **Manual reassign (proposed, confirm):** a per-row dropdown, usable by any signed-in user and recorded (who/when), for when a tech is out.
+  - **Manual reassign (confirmed):** a per-row dropdown, usable by any signed-in user and recorded (who/when), for when a tech is out. It doesn't change the sequence.
   - Assignee stored as a **username string**, so a tech who hasn't signed in to the review site yet can still be assigned.
 - **Review page:**
   - An "Assigned to" column.
@@ -339,7 +339,7 @@ LTI-only DST run on the camera VPN → VPN off → DE-only DST run → publish b
 - **I6 — resolved 2026-10-28:** the user opened 8443 in the Linode Cloud Firewall. From the laptop: `/accounts/login/` **200 in 0.18 s** ("Login — DST Camera Audit", "Sign in with IMS"); the cert is IMS's (`98:DB:…:05:E9`); signed-out `/` and `/media-db/…` → 302 to login; POST start/publish → 403; `/explorer/` → 403; IMS :443 `/healthz` 200. Previously **open, blocked Phase 4 acceptance:** inbound TCP 8443 to `45.79.220.29` is dropped (timeout from outside; the service is healthy on the box). **Resolution (operator):** `sudo ufw allow 8443/tcp` and/or allow 8443 in the Linode Cloud Firewall.
 
 ## Open questions
-- **Q2 (2026-10-28):** reviewer username `carthur` (signed-in user) vs `caruthur` (as written)? Balance assignments per site type (LTI/DE)? Allow manual reassign from the review page?
+- ~~Q2~~ — **resolved 2026-10-28 (user):** (1) the username is **`carthur`** ("caruthur" was a typo); (2) **balance by site type: yes**; (3) **manual reassign: yes**.
 None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes.)
 
 ## Checklist
