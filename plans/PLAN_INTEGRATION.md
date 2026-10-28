@@ -8,7 +8,7 @@ Priority axis: workflow & skills → QOL & fixes → features by impact. A hard 
 - `plans/in-progress-plans/DST_AUDIT_SHARED_REVIEW.md`: 13/16. Phase 6 is built and deployed, waiting on the user's acceptance. Then the final real-audit-day acceptance.
 
 ## Features by impact
-1. `plans/initial-plans/UNATTENDED_NIGHTLY_DST_AUDIT.md`: Stage `plan`, not started.
+1. `plans/initial-plans/UNATTENDED_NIGHTLY_DST_AUDIT.md`: Stage `plan`, not started. Revised 2026-10-28: the user pre-connects the VPN (MFA), and DST detects and releases it but never connects it; one-time local-time schedule.
    - **Soft order:** after DST_AUDIT_SHARED_REVIEW Phase 6 acceptance. It publishes through that plan's publish + assignment path, and its final acceptance is the unattended version of that plan's real-audit-day acceptance.
    - **Gate:** Phase 0 (the unattended-VPN spike) decides whether the plan is feasible at all.
 
@@ -19,3 +19,4 @@ These sit in a top-level `in-progress-plans/` instead of `plans/in-progress-plan
 
 ## Change log
 - 2026-10-28: index created. Added UNATTENDED_NIGHTLY_DST_AUDIT (new); recorded DST_AUDIT_SHARED_REVIEW status; noted the misplaced top-level plan folder.
+- 2026-10-28: UNATTENDED_NIGHTLY_DST_AUDIT revised (MFA → pre-connected VPN, release instead of connect; one-time schedule).
