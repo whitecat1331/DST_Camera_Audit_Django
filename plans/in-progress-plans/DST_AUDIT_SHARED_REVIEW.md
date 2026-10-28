@@ -236,7 +236,7 @@ LTI-only DST run on the camera VPN → VPN off → DE-only DST run → publish b
 - **I4 — resolved 2026-10-28:** the user approved committing the CBW plan's schema/sync files on their own (`dbe111e`: `cameras/models.py`, `cameras/migrations/0006_…`, `services/ims_sync.py`; the rest of that plan stays uncommitted). Redeployed: in the container, `Installation` model fields = Supabase columns (**38 = 38**, none missing either way); container healthy at 128 MiB, IMS healthy. Previously **open, blocked the Phase 4 deploy:** the shared DB has `cameras.0006_installation_county_installation_created_at_and_more` applied. It belongs to the **CBW firmware plan** (`in-progress-plans/CBW_FIRMWARE_INVENTORY_REPORT.md`) and was sitting uncommitted in the working tree when Phase 1 ran `migrate --database shared`. It adds 13 NOT NULL `Installation` columns with no DB default (`county`, `street`, `site_type`, `created_at`, …). The committed code (`8b20479`) has no such fields (`cameras/models.py`, the migration and `services/ims_sync.py` are uncommitted), so an image built from a commit would fail every `sync_installations` insert. **Resolution:** commit the CBW plan's schema/sync changes before deploying (the user's call: it's that plan's work), or deploy from a tree that includes them.
 - **I5 — open (IMS, outside this plan):** `/opt/access_replacement/certs/key.pem` (IMS's TLS private key) is mode **0666**, world-readable *and* writable. Recommend `chmod 600`; the DST container runs as uid 1000 (`deploy`, the owner), so DST is unaffected by that change.
 
-- **I6 — open, blocks Phase 4 acceptance:** inbound TCP 8443 to `45.79.220.29` is dropped (timeout from outside; the service is healthy on the box). **Resolution (operator):** `sudo ufw allow 8443/tcp` and/or allow 8443 in the Linode Cloud Firewall.
+- **I6 — resolved 2026-10-28:** the user opened 8443 in the Linode Cloud Firewall. From the laptop: `/accounts/login/` **200 in 0.18 s** ("Login — DST Camera Audit", "Sign in with IMS"); the cert is IMS's (`98:DB:…:05:E9`); signed-out `/` and `/media-db/…` → 302 to login; POST start/publish → 403; `/explorer/` → 403; IMS :443 `/healthz` 200. Previously **open, blocked Phase 4 acceptance:** inbound TCP 8443 to `45.79.220.29` is dropped (timeout from outside; the service is healthy on the box). **Resolution (operator):** `sudo ufw allow 8443/tcp` and/or allow 8443 in the Linode Cloud Firewall.
 
 ## Open questions
 None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes.)
@@ -253,12 +253,12 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [ ] Phase 6 — shared Complete checkbox + Notes (notes editable by anyone signed in, IMS RA-modal style)
 - [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
 - [x] I4 — CBW plan's cameras.0006 schema committed (`dbe111e`) and redeployed; model = Supabase (38/38 columns)
-- [ ] I6 — open inbound 8443 (ufw / Linode Cloud Firewall)
+- [x] I6 — inbound 8443 opened (Linode Cloud Firewall); reachable from the laptop
 - [ ] Production IMS SSO client + API token for the review instance (IMS Admin UI; redirect `https://45.79.220.29:8443/accounts/ims/callback/`)
 - [ ] Final acceptance — real audit day end to end
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 8/15. Phases 0–3 accepted; I4 resolved. Phase 4: review instance healthy on the IMS Linode (~/dst_camera_audit, :8443) at dbe111e; acceptance waits on I6 (firewall) and production IMS credentials.
+in progress — 9/15. Phases 0–3 accepted; I4 and I6 resolved. Phase 4: review instance live at https://45.79.220.29:8443; acceptance waits on production IMS credentials (SSO sign-in + sync) and I3 (a reviewer on their own network).
 
 `Superseded by:` —
