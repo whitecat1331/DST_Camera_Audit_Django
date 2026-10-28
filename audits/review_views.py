@@ -15,7 +15,9 @@ from django.views.decorators.http import require_GET, require_POST
 from audits.models import AuditJob, AuditRound, InstallationAuditReview
 from audits.review import (
     DRIFT_FLAG_SECONDS,
-    FILTERS,
+    KINDS,
+    STATUSES,
+    Filters,
     build_round_rows,
     filter_rows,
     summarize,
@@ -25,35 +27,46 @@ from audits.review import (
 NOTES_MAX = 4000
 
 
+def _filters(request, techs: list[str]) -> Filters:
+    """Read the filter panel; unknown values fall back to All."""
+    q = request.GET
+    tech = q.get("tech", "")
+    kind = q.get("kind", "")
+    status = q.get("status", "")
+    return Filters(
+        tech=tech if tech in {"mine", "unassigned", *techs} else "",
+        kind=kind if kind in KINDS else "",
+        status=status if status in STATUSES else "",
+        drift=q.get("drift") == "1",
+        failed=q.get("failed") == "1",
+    )
+
+
 @login_required
 @require_GET
 def review_round(request, pk: int | None = None):
     rounds = list(AuditRound.objects.order_by("-created_at"))
     current = get_object_or_404(AuditRound, pk=pk) if pk is not None else (rounds[0] if rounds else None)
-    show = request.GET.get("show", "all")
-    if show not in FILTERS:
-        show = "all"
     rows = build_round_rows(current) if current else []
     reviewers = list(current.reviewers) if current else []
     progress = tech_progress(rows, reviewers)
     techs = [p["name"] for p in progress]
-    tech = request.GET.get("tech", "")
-    if tech not in {"", "mine", "unassigned", *techs}:
-        tech = ""
+    filters = _filters(request, techs)
+    shown = filter_rows(rows, filters, request.user.username)
+    for p in progress:  # each chip toggles that tech on and off
+        p["toggle"] = filters.query(tech="" if filters.tech == p["name"] else p["name"])
     return render(
         request,
         "audits/review.html",
         {
             "rounds": rounds,
             "current": current,
-            "rows": filter_rows(rows, show, tech, request.user.username),
+            "rows": shown,
             "summary": summarize(rows),
             "progress": progress,
             "reviewers": reviewers,
             "techs": techs,
-            "tech": tech,
-            "show": show,
-            "filters": FILTERS,
+            "f": filters,
             "drift_flag_minutes": DRIFT_FLAG_SECONDS // 60,
         },
     )

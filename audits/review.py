@@ -9,7 +9,8 @@ from the review Linode to Supabase).
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from urllib.parse import urlencode
 
 from django.db.models import F, Q
 
@@ -20,7 +21,8 @@ from audits.thumbs import normalize_thumb_label
 # OvrC shows minutes only (±60 s), so flag only clear drift.
 DRIFT_FLAG_SECONDS = 120
 _LAYER_ORDER = ("cbw", "vnc_l1", "vnc_l2", "de_l1", "de_l2", "de_l3")
-FILTERS = ("all", "incomplete", "failed", "drift", "lti", "de")
+KINDS = ("lti", "de")
+STATUSES = ("incomplete", "complete")
 
 
 @dataclass
@@ -158,19 +160,43 @@ def tech_progress(rows: list[ReviewRow], reviewers: list[str]) -> list[dict]:
     ]
 
 
-def filter_rows(rows: list[ReviewRow], show: str, tech: str = "", username: str = "") -> list[ReviewRow]:
-    if tech == "mine":
+@dataclass(frozen=True)
+class Filters:
+    """The review page's filter panel (IMS-style: independent fields, "" = All)."""
+
+    tech: str = ""  # "" | "mine" | "unassigned" | a username
+    kind: str = ""  # "" | "lti" | "de"
+    status: str = ""  # "" | "incomplete" | "complete"
+    drift: bool = False
+    failed: bool = False
+
+    @property
+    def active(self) -> bool:
+        return self != Filters()
+
+    def query(self, **changes) -> str:
+        """Query string for these filters with ``changes`` applied (active fields only)."""
+        f = replace(self, **changes)
+        params = {k: v for k, v in (("tech", f.tech), ("kind", f.kind), ("status", f.status)) if v}
+        params.update({k: "1" for k in ("drift", "failed") if getattr(f, k)})
+        return "?" + urlencode(params) if params else "?"
+
+
+def filter_rows(rows: list[ReviewRow], f: Filters, username: str = "") -> list[ReviewRow]:
+    if f.tech == "mine":
         rows = [r for r in rows if r.assigned_to == username]
-    elif tech == "unassigned":
+    elif f.tech == "unassigned":
         rows = [r for r in rows if not r.assigned_to]
-    elif tech:
-        rows = [r for r in rows if r.assigned_to == tech]
-    if show == "incomplete":
-        return [r for r in rows if not r.completed]
-    if show == "failed":
-        return [r for r in rows if r.failed]
-    if show == "drift":
-        return [r for r in rows if r.drift_flagged]
-    if show in {"lti", "de"}:
-        return [r for r in rows if r.kind == show]
+    elif f.tech:
+        rows = [r for r in rows if r.assigned_to == f.tech]
+    if f.kind:
+        rows = [r for r in rows if r.kind == f.kind]
+    if f.status == "incomplete":
+        rows = [r for r in rows if not r.completed]
+    elif f.status == "complete":
+        rows = [r for r in rows if r.completed]
+    if f.drift:
+        rows = [r for r in rows if r.drift_flagged]
+    if f.failed:
+        rows = [r for r in rows if r.failed]
     return rows

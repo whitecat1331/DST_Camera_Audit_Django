@@ -11,7 +11,7 @@ from django.utils import timezone
 
 from audits.assignment import assign_new_cameras, assign_unassigned, reviewer_for
 from audits.models import AuditJob, AuditRound, InstallationAuditReview
-from audits.review import build_round_rows, filter_rows, summarize, tech_progress
+from audits.review import Filters, build_round_rows, filter_rows, summarize, tech_progress
 from cameras.models import UserProfile
 
 TEAM = ["carthur", "jgreene", "ployd"]
@@ -126,13 +126,13 @@ class ReviewPageAssignmentTests(TestCase):
 
     def test_filters_and_progress(self):
         rows = build_round_rows(self.round)
-        mine = filter_rows(rows, "all", "mine", "jgreene")
+        mine = filter_rows(rows, Filters(tech="mine"), "jgreene")
         self.assertEqual({r.key for r in mine}, {"lti001", "de000"})
-        self.assertEqual({r.key for r in filter_rows(rows, "all", "ployd")}, {"lti002", "de001"})
-        self.assertEqual({r.key for r in filter_rows(rows, "de", "ployd")}, {"de001"})
+        self.assertEqual({r.key for r in filter_rows(rows, Filters(tech="ployd"))}, {"lti002", "de001"})
+        self.assertEqual({r.key for r in filter_rows(rows, Filters(tech="ployd", kind="de"))}, {"de001"})
         InstallationAuditReview.objects.filter(camera_key="lti001").update(completed=True)
         rows = build_round_rows(self.round)
-        self.assertEqual({r.key for r in filter_rows(rows, "incomplete", "mine", "jgreene")}, {"de000"})
+        self.assertEqual({r.key for r in filter_rows(rows, Filters(tech="mine", status="incomplete"), "jgreene")}, {"de000"})
         self.assertEqual(
             tech_progress(rows, TEAM),
             [
@@ -142,12 +142,32 @@ class ReviewPageAssignmentTests(TestCase):
             ],
         )
         self.assertEqual(summarize(rows)["complete"], 1)
+        self.assertEqual({r.key for r in filter_rows(rows, Filters(status="complete"))}, {"lti001"})
+        self.assertEqual(len(filter_rows(rows, Filters())), 6)
+        self.assertFalse(Filters().active)
+        self.assertTrue(Filters(drift=True).active)
+
+    def test_filter_panel_reflects_and_toggles(self):
+        url = f"/audits/review/{self.round.pk}/"
+        body = self.client.get(url + "?tech=carthur&kind=lti&status=incomplete").content.decode()
+        self.assertIn('<option value="carthur" selected>carthur</option>', body)
+        self.assertIn('<option value="lti" selected>LTI</option>', body)
+        self.assertIn("Showing 2 of 6 cameras", body)
+        # The active tech chip links back to everyone, keeping the other filters.
+        self.assertIn('href="?kind=lti&amp;status=incomplete"', body)
+        self.assertIn('href="?tech=jgreene&amp;kind=lti&amp;status=incomplete"', body)
+        # Clear goes back to the unfiltered round; unfiltered it's disabled.
+        self.assertIn(f'href="{url}" class="btn-secondary "', body)
+        self.assertIn("btn-disabled", self.client.get(url).content.decode())
+        # Garbage values fall back to All.
+        body = self.client.get(url + "?tech=x&kind=y&status=z&drift=yes").content.decode()
+        self.assertIn("Showing 6 of 6 cameras", body)
 
     def test_page_filters_by_tech(self):
         body = self.client.get(f"/audits/review/{self.round.pk}/?tech=mine").content.decode()
         self.assertIn("lti001", body)
         self.assertNotIn("lti000", body)
-        body = self.client.get(f"/audits/review/{self.round.pk}/?tech=carthur&show=lti").content.decode()
+        body = self.client.get(f"/audits/review/{self.round.pk}/?tech=carthur&kind=lti").content.decode()
         self.assertIn('data-key="lti000"', body)
         self.assertIn('data-key="lti003"', body)
         self.assertNotIn('data-key="lti001"', body)

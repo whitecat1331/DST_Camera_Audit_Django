@@ -1313,8 +1313,6 @@ a.icon-btn {
 .review-stats { margin-bottom: 1rem; }
 .dst-stat.is-warn .dst-stat-n { color: var(--warn); }
 .dst-stat.is-danger .dst-stat-n { color: var(--danger); }
-.review-filters { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
-.review-filters .is-active { border-color: var(--ice-bright); color: var(--ice-bright); }
 .review-table td { vertical-align: top; }
 .review-table tr.is-failed td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
 .review-table tr.is-drift:not(.is-failed) td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
@@ -1330,8 +1328,27 @@ a.icon-btn {
 .review-error { color: var(--danger); font-size: 0.8rem; margin-top: 0.3rem; max-width: 22rem; }
 
 /* Review: assignment, Complete, Notes (Phase 6) */
-.review-progress { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; list-style: none; padding: 0; margin: 0 0 1rem; font-size: 0.9rem; }
+.review-progress { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; list-style: none; padding: 0; margin: 0 0 1rem; font-size: 0.9rem; }
+.review-progress-chip { display: inline-block; padding: 0.3rem 0.65rem; border: 1px solid var(--line); border-radius: 999px; color: var(--ink); text-decoration: none; }
+.review-progress-chip:hover { border-color: var(--ice-bright); text-decoration: none; }
+.review-progress-chip.is-active { border-color: var(--ice-bright); background: rgba(78, 184, 255, 0.14); box-shadow: 0 0 0 1px var(--ice-bright) inset; }
 .review-progress-n { font-variant-numeric: tabular-nums; color: var(--ice-bright); }
+
+/* Filter panel: IMS's .table-controls / .filter-group / .filter-select (IMS/css/index.css) */
+.table-controls { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; margin-bottom: 0.75rem; padding: 16px; background: rgba(18,39,66,0.92); border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
+.filter-group { display: flex; flex-direction: column; gap: 8px; font-size: 0.85rem; color: var(--muted); }
+.filter-select {
+  padding: 10px 30px 10px 12px; border: 1px solid rgba(74,138,240,0.2); border-radius: 6px;
+  background: rgba(15,30,48,0.98) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2360a5fa' d='M2 4l4 4 4-4'/%3E%3C/svg%3E") no-repeat right 10px center;
+  color: #c8d6e5; font-size: 13px; cursor: pointer; min-width: 140px; appearance: none;
+}
+.filter-select:focus { outline: 2px solid #60a5fa; border-color: #60a5fa; }
+.filter-select option { background: #0f1e30; color: #c8d6e5; }
+.filter-check-label { display: flex; align-items: center; gap: 8px; margin-top: 22px; font-size: 13px; color: #c8d6e5; cursor: pointer; white-space: nowrap; }
+.filter-check-label-tight { margin-top: 0; }
+.filter-check-label input { accent-color: #60a5fa; }
+.filter-actions { display: flex; gap: 8px; align-self: flex-end; margin-left: auto; }
+.record-count { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.75rem; }
 .review-assign { background: var(--input-bg); color: var(--ink); border: 1px solid var(--line); padding: 0.25rem 0.35rem; font: inherit; font-size: 0.85rem; }
 .review-meta { font-size: 0.72rem; margin-top: 0.2rem; }
 .review-complete { text-align: center; }

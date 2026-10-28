@@ -7,7 +7,7 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from audits.models import AuditJob, AuditRound, AuditScreenshot
-from audits.review import build_round_rows, filter_rows, summarize
+from audits.review import Filters, build_round_rows, filter_rows, summarize
 from cameras.models import Installation, UserProfile
 
 SITE = AuditJob.DeviceType.DST_SITE
@@ -65,9 +65,9 @@ class ReviewRoundTests(TestCase):
             summarize(rows),
             {"cameras": 2, "lti": 1, "de": 1, "failed": 0, "drift": 1, "complete": 0, "unassigned": 2},
         )
-        self.assertEqual([r.key for r in filter_rows(rows, "drift")], ["266134"])
-        self.assertEqual([r.key for r in filter_rows(rows, "lti")], ["233038"])
-        self.assertEqual(filter_rows(rows, "failed"), [])
+        self.assertEqual([r.key for r in filter_rows(rows, Filters(drift=True))], ["266134"])
+        self.assertEqual([r.key for r in filter_rows(rows, Filters(kind="lti"))], ["233038"])
+        self.assertEqual(filter_rows(rows, Filters(failed=True)), [])
 
     def test_small_drift_is_not_flagged(self):
         AuditJob.objects.filter(pk=self.de_new.pk).update(drift_seconds=-48)
@@ -99,7 +99,7 @@ class ReviewRoundTests(TestCase):
         self.assertIn("Sun, Nov 01, 2026 02:10 AM ADT", body)
         self.assertIn("+59.0 min", body)
         self.assertIn("newest of 2 runs", body)
-        self.assertEqual(self.client.get(f"/audits/review/{self.round.pk}/?show=drift").status_code, 200)
+        self.assertEqual(self.client.get(f"/audits/review/{self.round.pk}/?drift=1").status_code, 200)
         self.assertEqual(self.client.get(f"/audits/review/{self.round.pk + 999}/").status_code, 404)
 
     def test_requires_sign_in(self):

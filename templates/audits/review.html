@@ -37,29 +37,57 @@
 </div>
 
 {% if progress %}
-<ul class="review-progress" aria-label="Progress by tech">
+<ul class="review-progress" aria-label="Progress by tech (click to filter)">
   {% for p in progress %}
-  <li data-tech="{{ p.name }}"><strong>{{ p.name }}</strong> <span class="review-progress-n">{{ p.complete }}/{{ p.total }}</span> complete</li>
+  <li><a href="{{ p.toggle }}"
+         class="review-progress-chip {% if f.tech == p.name %}is-active{% endif %}" {% if f.tech == p.name %}aria-current="true" title="Show everyone"{% else %}title="Show only {{ p.name }}"{% endif %}><strong>{{ p.name }}</strong> <span class="review-progress-n">{{ p.complete }}/{{ p.total }}</span> complete</a></li>
   {% endfor %}
   {% if summary.unassigned %}<li class="muted">{{ summary.unassigned }} unassigned</li>{% endif %}
 </ul>
 {% endif %}
 
-<nav class="review-filters" aria-label="Filter by tech">
-  <a href="?show={{ show }}" class="btn-secondary {% if not tech %}is-active{% endif %}" {% if not tech %}aria-current="true"{% endif %}>Everyone</a>
-  <a href="?show={{ show }}&amp;tech=mine" class="btn-secondary {% if tech == "mine" %}is-active{% endif %}" {% if tech == "mine" %}aria-current="true"{% endif %}>Mine</a>
-  {% for t in techs %}
-  <a href="?show={{ show }}&amp;tech={{ t|urlencode }}" class="btn-secondary {% if t == tech %}is-active{% endif %}" {% if t == tech %}aria-current="true"{% endif %}>{{ t }}</a>
-  {% endfor %}
-  <a href="?show={{ show }}&amp;tech=unassigned" class="btn-secondary {% if tech == "unassigned" %}is-active{% endif %}" {% if tech == "unassigned" %}aria-current="true"{% endif %}>Unassigned</a>
-</nav>
-<nav class="review-filters" aria-label="Filter cameras">
-  {% for f in filters %}
-  <a href="?show={{ f }}{% if tech %}&amp;tech={{ tech|urlencode }}{% endif %}" class="btn-secondary {% if f == show %}is-active{% endif %}" {% if f == show %}aria-current="true"{% endif %}>
-    {% if f == "all" %}All{% elif f == "incomplete" %}Not complete{% elif f == "failed" %}Failed{% elif f == "drift" %}Drift flagged{% else %}{{ f|upper }}{% endif %}
-  </a>
-  {% endfor %}
-</nav>
+<form id="review-filter-form" class="table-controls review-filter-panel" method="get" action="">
+  <div class="filter-group">
+    <label for="review-filter-tech">Assigned to</label>
+    <select id="review-filter-tech" name="tech" class="filter-select">
+      <option value="" {% if not f.tech %}selected{% endif %}>All techs</option>
+      <option value="mine" {% if f.tech == "mine" %}selected{% endif %}>Mine ({{ request.user.username }})</option>
+      {% for t in techs %}<option value="{{ t }}" {% if f.tech == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+      <option value="unassigned" {% if f.tech == "unassigned" %}selected{% endif %}>Unassigned</option>
+    </select>
+  </div>
+  <div class="filter-group">
+    <label for="review-filter-kind">Site type</label>
+    <select id="review-filter-kind" name="kind" class="filter-select">
+      <option value="" {% if not f.kind %}selected{% endif %}>All</option>
+      <option value="lti" {% if f.kind == "lti" %}selected{% endif %}>LTI</option>
+      <option value="de" {% if f.kind == "de" %}selected{% endif %}>DE</option>
+    </select>
+  </div>
+  <div class="filter-group">
+    <label for="review-filter-status">Review status</label>
+    <select id="review-filter-status" name="status" class="filter-select">
+      <option value="" {% if not f.status %}selected{% endif %}>All</option>
+      <option value="incomplete" {% if f.status == "incomplete" %}selected{% endif %}>Not complete</option>
+      <option value="complete" {% if f.status == "complete" %}selected{% endif %}>Complete</option>
+    </select>
+  </div>
+  <div class="filter-group">
+    <label for="review-filter-drift" class="filter-check-label">
+      <input id="review-filter-drift" name="drift" type="checkbox" value="1" {% if f.drift %}checked{% endif %}>
+      Drift flagged only
+    </label>
+    <label for="review-filter-failed" class="filter-check-label filter-check-label-tight">
+      <input id="review-filter-failed" name="failed" type="checkbox" value="1" {% if f.failed %}checked{% endif %}>
+      Failed only
+    </label>
+  </div>
+  <div class="filter-actions">
+    <button type="submit" class="btn-secondary review-filter-apply">Apply</button>
+    <a href="{% url 'review_round_pk' pk=current.pk %}" class="btn-secondary {% if not f.active %}btn-disabled{% endif %}">Clear</a>
+  </div>
+</form>
+<div class="record-count">Showing {{ rows|length }} of {{ summary.cameras }} camera{{ summary.cameras|pluralize }}</div>
 
 <div class="table-scroll">
   <table class="data-table review-table" data-update-url="{% url 'review_update' pk=current.pk %}">
@@ -157,6 +185,22 @@
 {% block extra_js %}
 <script src="{% static 'review.js' %}?v=1"></script>
 <script>
+// Filters apply as soon as they change (IMS auto_filter); empty fields are
+// dropped so the URL only carries active filters.
+(function () {
+  const form = document.getElementById("review-filter-form");
+  if (!form) return;
+  const apply = form.querySelector(".review-filter-apply");
+  if (apply) apply.hidden = true;
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const params = new URLSearchParams();
+    new FormData(form).forEach((v, k) => { if (v) params.append(k, v); });
+    const qs = params.toString();
+    window.location = window.location.pathname + (qs ? "?" + qs : "");
+  });
+  form.addEventListener("change", () => form.requestSubmit());
+})();
 (function () {
   const modal = document.getElementById("thumb-modal");
   const modalImg = document.getElementById("thumb-modal-img");
