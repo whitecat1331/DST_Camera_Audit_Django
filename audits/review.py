@@ -13,14 +13,14 @@ from dataclasses import dataclass, field
 
 from django.db.models import F, Q
 
-from audits.models import AuditJob, AuditRound, AuditScreenshot
+from audits.models import AuditJob, AuditRound, AuditScreenshot, InstallationAuditReview
 from audits.ovrc_time import EASTERN
 from audits.thumbs import normalize_thumb_label
 
 # OvrC shows minutes only (±60 s), so flag only clear drift.
 DRIFT_FLAG_SECONDS = 120
 _LAYER_ORDER = ("cbw", "vnc_l1", "vnc_l2", "de_l1", "de_l2", "de_l3")
-FILTERS = ("all", "failed", "drift", "lti", "de")
+FILTERS = ("all", "incomplete", "failed", "drift", "lti", "de")
 
 
 @dataclass
@@ -37,6 +37,15 @@ class ReviewRow:
     kind: str
     attempts: int
     captures: list[Capture] = field(default_factory=list)
+    review: InstallationAuditReview | None = None
+
+    @property
+    def assigned_to(self) -> str:
+        return self.review.assigned_to if self.review else ""
+
+    @property
+    def completed(self) -> bool:
+        return bool(self.review and self.review.completed)
 
     @property
     def failed(self) -> bool:
@@ -103,6 +112,7 @@ def build_round_rows(round_: AuditRound) -> list[ReviewRow]:
         attempts[key] += 1
 
     installations = _installations_by_key(list(newest))
+    reviews = {r.camera_key: r for r in InstallationAuditReview.objects.filter(round=round_)}
     rows: list[ReviewRow] = []
     for key, job in newest.items():
         kind = (job.target_host or "").strip().lower()
@@ -112,6 +122,7 @@ def build_round_rows(round_: AuditRound) -> list[ReviewRow]:
             installation=installations.get(key),
             kind=kind if kind in {"lti", "de"} else "",
             attempts=attempts[key],
+            review=reviews.get(key),
         )
         for shot in job.screenshots.all():
             if shot.image:
@@ -129,10 +140,33 @@ def summarize(rows: list[ReviewRow]) -> dict[str, int]:
         "de": sum(r.kind == "de" for r in rows),
         "failed": sum(r.failed for r in rows),
         "drift": sum(r.drift_flagged for r in rows),
+        "complete": sum(r.completed for r in rows),
+        "unassigned": sum(not r.assigned_to for r in rows),
     }
 
 
-def filter_rows(rows: list[ReviewRow], show: str) -> list[ReviewRow]:
+def tech_progress(rows: list[ReviewRow], reviewers: list[str]) -> list[dict]:
+    """[{name, total, complete}] in the round's reviewer order, then any others."""
+    names = list(reviewers) + sorted({r.assigned_to for r in rows if r.assigned_to} - set(reviewers))
+    return [
+        {
+            "name": n,
+            "total": sum(r.assigned_to == n for r in rows),
+            "complete": sum(r.assigned_to == n and r.completed for r in rows),
+        }
+        for n in names
+    ]
+
+
+def filter_rows(rows: list[ReviewRow], show: str, tech: str = "", username: str = "") -> list[ReviewRow]:
+    if tech == "mine":
+        rows = [r for r in rows if r.assigned_to == username]
+    elif tech == "unassigned":
+        rows = [r for r in rows if not r.assigned_to]
+    elif tech:
+        rows = [r for r in rows if r.assigned_to == tech]
+    if show == "incomplete":
+        return [r for r in rows if not r.completed]
     if show == "failed":
         return [r for r in rows if r.failed]
     if show == "drift":

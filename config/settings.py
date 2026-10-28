@@ -217,6 +217,10 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache", "OPTIONS": {"MAX_ENTRIES": 5000}}}
 SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
 
+# Technicians who split each round's review (usernames as IMS SSO creates
+# them). Used by publish to assign cameras; snapshotted per round.
+DST_REVIEWERS = [u.strip() for u in os.getenv("DST_REVIEWERS", "").split(",") if u.strip()]
+
 LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "dashboard"
 LOGOUT_REDIRECT_URL = "login"

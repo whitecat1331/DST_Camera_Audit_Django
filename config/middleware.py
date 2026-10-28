@@ -18,10 +18,10 @@ _QUIET_SUFFIXES = ("/status/",)
 
 
 # Review instance (DST_ROLE=review): paths that read the capture laptop's disk or
-# start work never apply there, and only sign-in/out may change state. Phase 6
-# adds the review endpoints (Complete / Notes) to REVIEW_WRITE_PREFIXES.
+# start work never apply there; only sign-in/out and the review page's
+# Complete / Notes / assignee edits may change state.
 REVIEW_BLOCKED_PREFIXES = ("/explorer/", "/sync/", "/dragoneye/", "/admin/")
-REVIEW_WRITE_PREFIXES = ("/accounts/",)
+REVIEW_WRITE_PREFIXES = ("/accounts/", "/audits/review/")
 
 
 class ReviewOnlyMiddleware:

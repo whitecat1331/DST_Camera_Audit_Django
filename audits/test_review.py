@@ -61,7 +61,10 @@ class ReviewRoundTests(TestCase):
         self.assertEqual(de.drift_minutes, 59.0)
         self.assertFalse(de.failed)  # the newest run succeeded
         self.assertEqual(de.eastern_at_read, "Nov 01, 2026 02:11 AM EST")
-        self.assertEqual(summarize(rows), {"cameras": 2, "lti": 1, "de": 1, "failed": 0, "drift": 1})
+        self.assertEqual(
+            summarize(rows),
+            {"cameras": 2, "lti": 1, "de": 1, "failed": 0, "drift": 1, "complete": 0, "unassigned": 2},
+        )
         self.assertEqual([r.key for r in filter_rows(rows, "drift")], ["266134"])
         self.assertEqual([r.key for r in filter_rows(rows, "lti")], ["233038"])
         self.assertEqual(filter_rows(rows, "failed"), [])

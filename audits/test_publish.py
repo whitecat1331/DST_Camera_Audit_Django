@@ -152,3 +152,32 @@ class PublishRunsTests(TestCase):
             AuditJob.objects.using(SHARED).get(public_id=self.run.public_id).created_by_id,
             shared_tech.pk,
         )
+
+    @override_settings(DST_REVIEWERS=["carthur", "jgreene", "ployd"])
+    def test_publish_assigns_new_cameras_once(self):
+        from audits.models import InstallationAuditReview
+
+        report = self.publish()
+        self.assertEqual(report.assigned, 1)
+        review = InstallationAuditReview.objects.using(SHARED).get()
+        self.assertEqual((review.camera_key, review.kind, review.assigned_to), ("233038", "de", "carthur"))
+        InstallationAuditReview.objects.using(SHARED).filter(pk=review.pk).update(
+            assigned_to="ployd", completed=True, notes="checked"
+        )
+        # A second run with the same camera plus a new one: only the new one is assigned.
+        run2 = AuditJob.objects.create(
+            pole_number="fleet", device_type=AuditJob.DeviceType.DST_AUDIT,
+            status=AuditJob.Status.SUCCEEDED, finished_at=timezone.now(),
+        )
+        for pole in ("233038", "266006"):
+            AuditJob.objects.create(
+                pole_number=pole, target_host="de", device_type=AuditJob.DeviceType.DST_SITE,
+                status=AuditJob.Status.SUCCEEDED, parent_job=run2,
+            )
+        self.assertEqual(self.publish(run2.pk).assigned, 1)
+        self.assertEqual(self.publish().assigned, 0)
+        got = dict(InstallationAuditReview.objects.using(SHARED).values_list("camera_key", "assigned_to"))
+        self.assertEqual(got, {"233038": "ployd", "266006": "jgreene"})
+        kept = InstallationAuditReview.objects.using(SHARED).get(camera_key="233038")
+        self.assertEqual((kept.completed, kept.notes), (True, "checked"))
+        self.assertEqual(AuditRound.objects.using(SHARED).get().reviewers, ["carthur", "jgreene", "ployd"])

@@ -25,6 +25,9 @@ from django.db import OperationalError, close_old_connections, connections, tran
 from django.db.models import Q
 from django.utils import timezone
 
+from django.conf import settings
+
+from audits.assignment import assign_new_cameras
 from audits.models import AuditJob, AuditRound, AuditScreenshot, StoredFile
 
 logger = logging.getLogger(__name__)
@@ -55,6 +58,7 @@ class PublishReport:
     screenshots: int = 0
     images_uploaded: int = 0
     images_unchanged: int = 0
+    assigned: int = 0
     missing_files: list[str] = field(default_factory=list)
     unmatched_poles: list[str] = field(default_factory=list)
 
@@ -62,7 +66,7 @@ class PublishReport:
         parts = [
             f"Published {self.runs} run(s) to '{self.round_name}': {self.jobs} jobs, "
             f"{self.screenshots} screenshots, {self.images_uploaded} images uploaded, "
-            f"{self.images_unchanged} unchanged"
+            f"{self.images_unchanged} unchanged, {self.assigned} camera(s) newly assigned"
         ]
         if self.missing_files:
             parts.append(f"{len(self.missing_files)} image file(s) missing locally")
@@ -221,6 +225,17 @@ def _publish_run(run: AuditJob, shared_round: AuditRound, report, users, progres
             AuditScreenshot.objects.using(SHARED).filter(pk=row.pk).update(
                 created_at=shot.created_at
             )
+        # Cameras new to the round get their reviewer now (arrival order);
+        # existing review rows are never touched by publish.
+        cameras = [
+            (c.pole_number, c.target_host)
+            for c in sorted(jobs[1:], key=lambda j: (j.created_at, j.pk))
+        ]
+        report.assigned += len(
+            assign_new_cameras(
+                shared_round, cameras, reviewers=settings.DST_REVIEWERS, using=SHARED
+            )
+        )
     report.runs += 1
     report.jobs += len(jobs)
     report.screenshots += len(shots)

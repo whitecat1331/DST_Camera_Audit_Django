@@ -16,6 +16,11 @@ class AuditRound(models.Model):
         related_name="audit_rounds",
     )
     created_at = models.DateTimeField(auto_now_add=True)
+    # Reviewer usernames snapshotted at the round's first assignment, so a later
+    # team change never reshuffles an existing round (see audits/assignment.py).
+    reviewers = models.JSONField(default=list, blank=True)
+    # Per site type: the reviewer index its sequence starts at.
+    assignment_offsets = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -142,3 +147,38 @@ class StoredFile(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.size} bytes)"
+
+
+class InstallationAuditReview(models.Model):
+    """Shared review state for one camera in one round (shared DB only).
+
+    Created by publish when a camera first enters a round, with its assigned
+    reviewer; publish never updates existing rows, so assignments, checkmarks
+    and notes survive re-publishing. Usernames are stored as strings because
+    users differ per database (each instance creates them at SSO sign-in).
+    """
+
+    round = models.ForeignKey(AuditRound, on_delete=models.CASCADE, related_name="reviews")
+    camera_key = models.CharField(max_length=64)
+    kind = models.CharField(max_length=8, blank=True)
+    assignment_seq = models.IntegerField(null=True, blank=True)
+    assigned_to = models.CharField(max_length=150, blank=True, db_index=True)
+    assigned_by = models.CharField(max_length=150, blank=True)
+    assigned_at = models.DateTimeField(null=True, blank=True)
+    completed = models.BooleanField(default=False)
+    completed_by = models.CharField(max_length=150, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    notes_updated_by = models.CharField(max_length=150, blank=True)
+    notes_updated_at = models.DateTimeField(null=True, blank=True)
+    # Optimistic concurrency: every edit must carry the version it read.
+    version = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["round", "camera_key"], name="uniq_review_round_camera"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.round} / {self.camera_key} -> {self.assigned_to or 'unassigned'}"

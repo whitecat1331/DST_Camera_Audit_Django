@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% load media_tags %}
+{% load media_tags static %}
 {% block title %}Review{% if current %} — {{ current.name }}{% endif %} — DST Camera Audit{% endblock %}
 {% block container_class %}wide{% endblock %}
 {% block content %}
@@ -33,18 +33,36 @@
   <div class="dst-stat"><span class="dst-stat-n">{{ summary.de }}</span><span class="dst-stat-l">DE</span></div>
   <div class="dst-stat {% if summary.drift %}is-warn{% endif %}"><span class="dst-stat-n">{{ summary.drift }}</span><span class="dst-stat-l">drift flagged</span></div>
   <div class="dst-stat {% if summary.failed %}is-danger{% endif %}"><span class="dst-stat-n">{{ summary.failed }}</span><span class="dst-stat-l">failed</span></div>
+  <div class="dst-stat"><span class="dst-stat-n" id="review-complete-n">{{ summary.complete }}/{{ summary.cameras }}</span><span class="dst-stat-l">complete</span></div>
 </div>
 
+{% if progress %}
+<ul class="review-progress" aria-label="Progress by tech">
+  {% for p in progress %}
+  <li data-tech="{{ p.name }}"><strong>{{ p.name }}</strong> <span class="review-progress-n">{{ p.complete }}/{{ p.total }}</span> complete</li>
+  {% endfor %}
+  {% if summary.unassigned %}<li class="muted">{{ summary.unassigned }} unassigned</li>{% endif %}
+</ul>
+{% endif %}
+
+<nav class="review-filters" aria-label="Filter by tech">
+  <a href="?show={{ show }}" class="btn-secondary {% if not tech %}is-active{% endif %}" {% if not tech %}aria-current="true"{% endif %}>Everyone</a>
+  <a href="?show={{ show }}&amp;tech=mine" class="btn-secondary {% if tech == "mine" %}is-active{% endif %}" {% if tech == "mine" %}aria-current="true"{% endif %}>Mine</a>
+  {% for t in techs %}
+  <a href="?show={{ show }}&amp;tech={{ t|urlencode }}" class="btn-secondary {% if t == tech %}is-active{% endif %}" {% if t == tech %}aria-current="true"{% endif %}>{{ t }}</a>
+  {% endfor %}
+  <a href="?show={{ show }}&amp;tech=unassigned" class="btn-secondary {% if tech == "unassigned" %}is-active{% endif %}" {% if tech == "unassigned" %}aria-current="true"{% endif %}>Unassigned</a>
+</nav>
 <nav class="review-filters" aria-label="Filter cameras">
   {% for f in filters %}
-  <a href="?show={{ f }}" class="btn-secondary {% if f == show %}is-active{% endif %}" {% if f == show %}aria-current="true"{% endif %}>
-    {% if f == "all" %}All{% elif f == "failed" %}Failed{% elif f == "drift" %}Drift flagged{% else %}{{ f|upper }}{% endif %}
+  <a href="?show={{ f }}{% if tech %}&amp;tech={{ tech|urlencode }}{% endif %}" class="btn-secondary {% if f == show %}is-active{% endif %}" {% if f == show %}aria-current="true"{% endif %}>
+    {% if f == "all" %}All{% elif f == "incomplete" %}Not complete{% elif f == "failed" %}Failed{% elif f == "drift" %}Drift flagged{% else %}{{ f|upper }}{% endif %}
   </a>
   {% endfor %}
 </nav>
 
 <div class="table-scroll">
-  <table class="data-table review-table">
+  <table class="data-table review-table" data-update-url="{% url 'review_update' pk=current.pk %}">
     <thead>
       <tr>
         <th>Camera</th>
@@ -53,11 +71,14 @@
         <th>Device time (OvrC)</th>
         <th>Eastern at read</th>
         <th>Drift</th>
+        <th>Assigned to</th>
+        <th>Complete</th>
+        <th>Notes</th>
       </tr>
     </thead>
     <tbody>
       {% for row in rows %}
-      <tr class="{% if row.failed %}is-failed{% endif %} {% if row.drift_flagged %}is-drift{% endif %}">
+      <tr class="{% if row.failed %}is-failed{% endif %} {% if row.drift_flagged %}is-drift{% endif %} {% if row.completed %}is-complete{% endif %}" data-key="{{ row.key }}" data-label="{{ row.installation.identifier|default:row.key }}{% if row.installation.pole_number %} / {{ row.installation.pole_number }}{% endif %}">
         <td class="review-camera">
           {% if row.installation %}
           <a href="{% url 'camera_detail' pk=row.installation.pk %}"><strong>{{ row.installation.identifier|default:row.key }}</strong></a>
@@ -103,9 +124,24 @@
           <span class="{% if row.drift_flagged %}drift-flag{% else %}drift-ok{% endif %}">{% if row.drift_minutes > 0 %}+{% endif %}{{ row.drift_minutes }} min</span>
           {% else %}<span class="muted">—</span>{% endif %}
         </td>
+        <td class="review-assignee">
+          <select class="review-assign" aria-label="Assigned to" data-prev-value="{{ row.assigned_to }}">
+            <option value="" {% if not row.assigned_to %}selected{% endif %}>Unassigned</option>
+            {% for t in reviewers %}<option value="{{ t }}" {% if t == row.assigned_to %}selected{% endif %}>{{ t }}</option>{% endfor %}
+            {% if row.assigned_to and row.assigned_to not in reviewers %}<option value="{{ row.assigned_to }}" selected>{{ row.assigned_to }}</option>{% endif %}
+          </select>
+          {% if row.review.assigned_by %}<div class="muted review-meta">set by {{ row.review.assigned_by }}</div>{% endif %}
+        </td>
+        <td class="review-complete">
+          <label><input type="checkbox" class="review-complete-box" {% if row.completed %}checked{% endif %} aria-label="Complete"></label>
+          <div class="muted review-meta review-complete-by">{% if row.completed %}{{ row.review.completed_by }}{% endif %}</div>
+        </td>
+        <td class="review-notes" data-notes-value="{{ row.review.notes|default:'' }}" tabindex="0" role="button" aria-label="Edit notes">
+          {% if row.review.notes %}<span class="review-notes-text">{{ row.review.notes|truncatechars:120 }}</span>{% else %}<span class="text-dim">Click to add notes…</span>{% endif %}
+        </td>
       </tr>
       {% empty %}
-      <tr><td colspan="6" class="muted">No cameras match this filter.</td></tr>
+      <tr><td colspan="9" class="muted">No cameras match this filter.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -119,6 +155,7 @@
 {% endblock %}
 
 {% block extra_js %}
+<script src="{% static 'review.js' %}?v=1"></script>
 <script>
 (function () {
   const modal = document.getElementById("thumb-modal");

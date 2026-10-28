@@ -10,6 +10,7 @@ urlpatterns = [
     path("dst/publish/", views.publish_dst, name="dst_publish"),
     path("review/", review_views.review_round, name="review_round"),
     path("review/<int:pk>/", review_views.review_round, name="review_round_pk"),
+    path("review/<int:pk>/item/", review_views.review_update, name="review_update"),
     path("confirm-captures/", views.confirm_captures_page, name="confirm_captures"),
     path(
         "confirm-captures/preview/",
