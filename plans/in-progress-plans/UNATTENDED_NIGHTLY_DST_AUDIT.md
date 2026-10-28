@@ -195,7 +195,10 @@ Phase 1 as built:
 - Unit tests: `audits/test_scheduling.py` (13); full suite 128 OK.
 - **Live fire-path check (2026-10-28 15:41):** a throwaway schedule with no eligible sites was registered 75 s ahead; Task Scheduler fired it on the laptop clock with nobody touching it, the command loaded `.env`, refused with "Not started: None of the selected sites are eligible", and deleted its task. The row was deleted afterwards. A real audit has not been fired by the scheduler yet.
 
-**Dummy run sites** (picked 2026-10-28): LTI 600008 (Malibu), 220016 (Savannah), 233014 (Bridgewater): CBW :80 + both VNC lanes answered at 15:3x. DE 266007 (FX1260, York; both lanes today, job 179), I-VBE-0012 (FX1220, New Kent) and I-VBE-0014 (FX1251, JCC) (both lanes 2026-10-27). DE "online" here is a clean recent capture; there's no cheap live check for TeamViewer. VBE units are vehicles, so they may be off at night.
+**Dummy run sites** (re-picked 2026-10-28 by the user's rule: "look at IMS's sensor data … make sure all sensors are online"; Malibu is paused, so the first pick was wrong). Source: PRTG `table.json` (the feed IMS's enclosure sensors sync from), read-only, because IMS's web login now needs MFA and the VPN blocks SSH to the Linode. Every PRTG sensor in each site's pole group(s) is **Up**, and for LTI the CBW :80 and both VNC lanes also answered over the VPN at pick time:
+- LTI 210073 (Springhill LA), 220054 (Shreveport LA), 220008 (Chatham County GA): Modem, CBW, Solar all Up.
+- DE 266007 (FX1260, York VA; both lanes captured today), 255039 (FX1173, Whigham GA), 244127 (FX1071, Hollywood FL): Modem + both lane CPUs Up (244127 also two Axis cameras); 2 TeamViewer lanes each.
+- Recheck the statuses right before the run; PRTG changes.
 
 **Live run to accept Phase 1** (user): set `DST_NETWORK_PHASES=true` in `.env`, restart DST, connect the VPN (MFA), select 2 LTI + 2 DE, type a test round in "Publish to round when done", Start, and don't touch the laptop. Accepted when LTI captures happen on the VPN, the VPN drops by itself, both DE sites capture with titles matching their FX, and the round appears on :8443.
 
