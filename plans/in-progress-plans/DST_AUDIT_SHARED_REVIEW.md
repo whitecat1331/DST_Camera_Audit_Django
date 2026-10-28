@@ -320,6 +320,24 @@ User report: "DST audit page is taking a long time to load".
 - **Deployed `f19542a`** (user: "deploy"): extracted with `umask 022`, compose unchanged, rebuilt; `healthy`, 127 MiB / 512; IMS healthy (54 MiB). Smoke test as `ployd`: `/audits/review/` 200 (0.9 s cold, ~0.2 s warm), 3 rows; `?tech=mine` / `?tech=carthur` / `?show=incomplete&tech=jgreene` 1 row each; progress shows 0/1 per tech; hashed `review.js` 200; signed-out POST → 403; 0 `[STUCK]`. The test session was deleted by its exact key.
 - **Filter redesign (user 2026-10-28: "it will let me select the tech to filter, but not unselect them. Use IMS to draw inspiration"):** the two pill rows (`?show=` / `?tech=`) are replaced with IMS's `table-controls` panel (`IMS/views/assets_list.html`, `js/auto_filter.js`). It has independent dropdowns, each with an **All** option: Assigned to (All techs / Mine / each tech / Unassigned), Site type (All / LTI / DE), Review status (All / Not complete / Complete). It also has **Drift flagged only** and **Failed only** checkboxes, applies on change (Apply stays in the markup for no-JS), a **Clear** link, and "Showing X of Y cameras". The per-tech progress chips **toggle** that tech on and off, keeping the other filters. `audits.review.Filters` replaces `FILTERS`/`show` (`d201e32`, layout fix `HEAD`). Live check with headless Chrome on :8443 (a temp `ployd` session, deleted by key afterwards): select carthur → 1 of 3; All techs → 3 of 3; chip on → jgreene 1 of 3, chip off → 3 of 3; drift → 1 of 3; Clear → 3 of 3. Suite **92 passed**.
 - **User's first hands-on use:** they added and later cleared a note on 266006 (`notes_updated_by=ployd`, version 4), and reassignment/notes rendered correctly in their screenshot.
+- **Live updates (user 2026-10-28: "I want the notes and the marked complete to be SSE so others can see those values live"), `3111d62`:**
+  - **Server:** `audits/live.py` is a port of IMS's `SSEBroker` (`IMS/sse.go`): per-client queues of 64 that drop when full, a client cap (`DST_SSE_MAX_CLIENTS` 12), a `connected` event, `: ping` every 20 s, `retry: 3000`. Streams end after `DST_SSE_MAX_SECONDS` (600), so EventSource reconnects and re-checks the session (IMS re-validates every 30 min). The stream thread closes its DB connection, so open streams hold none.
+  - **Endpoint and payload:** `GET /audits/review/<round>/events/`. Every successful save broadcasts `{state, field, by, client, progress}` to that round's pages, where `progress` = the round's complete count, per-tech totals and unassigned.
+  - **Client (`static/review.js`):**
+    - applies teammates' changes in place (checkbox, completed-by, assignee, notes snippet) and flashes them, and updates the header count and tech chips;
+    - ignores the echo of its own saves (a per-tab id in `X-Review-Client`);
+    - **never swaps the text under an open notes editor:** it shows "X just changed these notes…", and the compare-and-set conflict still guards the save;
+    - after a reconnect, it re-syncs the visible rows from a fresh fetch of the page;
+    - a "Live updates: on / reconnecting…" badge sits next to the count.
+  - **Deploy change:** **gunicorn 1 worker × 24 threads** (was 2 × 4), because the broker is in-process, like IMS's single process. On 1 vCPU, the second worker gained little. Memory dropped to 91 MiB.
+  - **Tests:** `audits/test_live.py` (7): round scoping, cap, full-queue drop, stream frames/heartbeat/unsubscribe, broadcast payload incl. progress, no broadcast on a failed save, the stream view + 503 at cap, sign-in required. **Suite 99 passed.**
+  - **Live two-browser check on :8443** (two temp `ployd` sessions, headless Chrome, camera 266007):
+    - A ticks Complete → B updates in **0.31 s** with no reload (header and jgreene chip too);
+    - A saves a note → B shows it in **0.27 s**;
+    - B has the editor open while A changes the note → B gets the notice in 0.34 s with its typed text kept, and B's Save → the 409 conflict;
+    - Cancel → B shows A's text.
+
+    266007 was restored to its prior state, both sessions were deleted by key, the streams were released at the next heartbeat (22 s), and 0 `[STUCK]`.
 - **Remaining:** Phase 6 acceptance: two browsers/users, the side-by-side screenshot against IMS's RA modal, a concurrent-note 409, and confirming or dropping Escape = Cancel.
 
 ### Final acceptance — a real audit day end to end
