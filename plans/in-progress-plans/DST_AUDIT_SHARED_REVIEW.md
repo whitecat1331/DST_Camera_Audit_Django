@@ -197,7 +197,7 @@ Directed by the user ("provision the linode instance"), using the `access-replac
 - **I3:** teammates reach it from their own networks (user report).
 - Performance: user confirms it "is better" after the fixes above.
 
-### Phase 5 — One-page review per round (gated)
+### Phase 5 — One-page review per round (gated) — ACCEPTED 2026-10-28
 - **Work:** `/audits/review/<round>/`: one row per camera in the round (newest `DST_SITE` capture per installation), showing:
   - identifier, pole, agency, LTI/DE
   - each device (CBW, VNC L1/L2, or DE lanes) with inline thumbnails and capture timestamps
@@ -260,6 +260,10 @@ User report: "DST audit page is taking a long time to load".
 - **Verification after the fix:** ORM replay **200/200 in 4 s, max 432 ms, 0 stalls/hung**; HTTP bursts (16 thumbs, 16 full images, 16 pages, 2× 24 mixed) **0 errors, max 3.7 s, 0 watchdog dumps**; external login 200 in 0.10 s; IMS healthy. Container memory 339 MiB / 512 (the image cache filling up); watch it.
 - **Wrong turns, kept for the record:** session mode (`0a87263`, reverted in `baeb6ee`); the "idle drop", DNS, and TLS-handshake hypotheses (each refuted by a test above).
 - **Closing I7 needs:** the user browsing normally with no stall, and the watchdog still at 0 `[STUCK]` dumps.
+
+#### Phase 5 acceptance (2026-10-28) — PASS
+- Content on the real round: 3 cameras from 7 site jobs (LTI + DE merged across re-runs), 8/8 previews are thumbnails, 3/3 rows match their job records, `266006` ADT +58.9 min flagged.
+- Performance (I7 resolved): after the direct-connection fix, the user reports "working much better". Since the container restart: **0 `[STUCK]` dumps**; the user's real browser requests median **68 ms**, max **245 ms**; IMS healthy; container 339 MiB / 512.
 
 ### Phase 6 — Shared Complete checkbox + Notes (gated)
 - **Work:**
@@ -329,8 +333,8 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Phase 2 — stable IDs, audit rounds, structured OvrC time, `lock_shared_db` (accepted 2026-10-27)
 - [x] Phase 3 — publish to shared DB (command + panel, can be resumed and re-run) (accepted 2026-10-27)
 - [x] Phase 4 — review instance on the IMS Linode :8443 (incl. I3 reviewer reachability) (accepted 2026-10-28)
-- [ ] Phase 5 — one-page review per round (implemented `6e1b83e`; content acceptance PASS; blocked on I7)
-- [ ] I7 — intermittent review-instance request stalls: root cause found (Supavisor strands connections), fixed by a direct connection (`5dc4d8c`); awaiting the user's browse check
+- [x] Phase 5 — one-page review per round (accepted 2026-10-28)
+- [x] I7 — review-instance stalls: Supavisor stranded connections; fixed with a direct DB connection (`5dc4d8c`); confirmed by the user + 0 watchdog dumps
 - [ ] Phase 6 — shared Complete checkbox + Notes (notes editable by anyone signed in, IMS RA-modal style)
 - [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
 - [x] I4 — CBW plan's cameras.0006 schema committed (`dbe111e`) and redeployed; model = Supabase (38/38 columns)
@@ -340,6 +344,6 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 11/16. Phases 0–4 accepted. Phase 5 content-accepted; I7 fixed (direct DB connection), awaiting the user's browse confirmation, then Phase 6.
+in progress — 13/16. Phases 0–5 accepted; I1–I4, I6, I7 resolved; I5 (IMS key 0666) open outside this plan. Next: Phase 6 (shared Complete checkbox + Notes).
 
 `Superseded by:` —
