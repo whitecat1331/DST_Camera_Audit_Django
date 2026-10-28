@@ -95,11 +95,28 @@ def exchange_sso_code(code: str) -> dict[str, str]:
     return {"username": data["username"], "role": data["role"]}
 
 
+IMS_STATUS_CACHE_SECONDS = 60
+
+
 def check_ims_connection() -> dict[str, Any]:
-    """Return connection status for the dashboard KPI.
+    """Return connection status for the dashboard KPI (cached 60 s).
 
     Keys: status (connected|auth_error|unreachable|not_configured), detail
+
+    Probing costs two HTTPS round trips to IMS (~1.5 s from the review Linode),
+    which made every dashboard load slow; a minute-old KPI is fine.
     """
+    from django.core.cache import cache
+
+    cached = cache.get("ims_connection_status")
+    if cached is not None:
+        return cached
+    result = _probe_ims_connection()
+    cache.set("ims_connection_status", result, IMS_STATUS_CACHE_SECONDS)
+    return result
+
+
+def _probe_ims_connection() -> dict[str, Any]:
     if not settings.IMS_BASE_URL:
         return {"status": "not_configured", "detail": "IMS_BASE_URL missing"}
     if not settings.IMS_API_TOKEN:
