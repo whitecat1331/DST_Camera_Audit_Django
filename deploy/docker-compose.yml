@@ -33,6 +33,8 @@ services:
       IMS_SSO_CLIENT_ID: ${IMS_SSO_CLIENT_ID:?set IMS_SSO_CLIENT_ID in ~/dst_camera_audit/.env}
       IMS_SSO_REDIRECT_URI: https://45.79.220.29:8443/accounts/ims/callback/
       LOG_TO_FILE: "false"
+      # Ops: dump all thread stacks to the log when a request runs > 20 s (config/wsgi.py).
+      DST_DUMP_STACKS: "1"
     volumes:
       # IMS's TLS cert/key: served by gunicorn and pinned for IMS API calls.
       - /opt/access_replacement/certs/cert.pem:/certs/cert.pem:ro
