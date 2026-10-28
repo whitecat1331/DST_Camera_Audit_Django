@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% load media_tags %}
 {% block title %}Audit #{{ job.pk }} — DST Camera Audit{% endblock %}
 {% block content %}
 <p class="crumb"><a href="{% url 'audit_list' %}">Audits</a> / #{{ job.pk }}</p>
@@ -66,7 +67,7 @@
     {% for shot in job.screenshots.all %}
     <figure class="shot">
       <button type="button" class="thumb-btn shot-thumb-btn" data-full="{{ shot.image.url }}" title="Expand {{ shot.label }}">
-        <img src="{{ shot.image.url }}" alt="{{ shot.label }}">
+        <img src="{{ shot.image|thumb_src }}" alt="{{ shot.label }}" loading="lazy">
       </button>
       <figcaption>
         {{ shot.label }}

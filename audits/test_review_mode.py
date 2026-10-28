@@ -98,3 +98,21 @@ class DatabaseStorageTests(TestCase):
             storage.save("audits/9/new.png", __import__("io").BytesIO(b"x"))
         with self.assertRaises(FileNotFoundError):
             storage.open("audits/0/missing.png")
+
+
+class ThumbSrcFilterTests(TestCase):
+    def test_review_storage_gives_thumb_url_and_disk_storage_gives_url(self):
+        from django.core.files.storage import FileSystemStorage
+        from django.db.models.fields.files import FieldFile
+
+        from audits.models import AuditScreenshot
+        from audits.templatetags.media_tags import thumb_src
+
+        field = AuditScreenshot._meta.get_field("image")
+        db_file = FieldFile(None, field, "audits/9/cbw.png")
+        db_file.storage = DatabaseStorage()
+        self.assertEqual(thumb_src(db_file), "/media-db/audits/9/cbw.png?thumb=1")
+        disk_file = FieldFile(None, field, "audits/9/cbw.png")
+        disk_file.storage = FileSystemStorage(base_url="/media/")
+        self.assertEqual(thumb_src(disk_file), "/media/audits/9/cbw.png")
+        self.assertEqual(thumb_src(None), "")
