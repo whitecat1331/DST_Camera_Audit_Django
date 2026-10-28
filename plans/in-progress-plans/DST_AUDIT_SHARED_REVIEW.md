@@ -115,7 +115,7 @@ Each phase is **gated**: its acceptance must pass before the next phase starts.
   - **Blocked port (simulates the camera VPN; `DB_PORT=6544`):** fails in **23 s** with "Can't reach the shared DB … If the camera VPN is on, turn it off and publish again." This matches the 23 s measured on the real VPN in Phase 1.
 - **Test data left in place:** the shared DB now holds round **"Acceptance test 2026-10-27"** with runs #159 (LTI), #77, #74 and #70 (DE): 11 jobs, 20 screenshots, 20 images. Locally those runs carry the same round tag, plus publish job #173 and OvrC job #172. These are kept as fixtures for Phases 4–5. **Delete that round from both DBs before the first real round** (checklist item).
 
-### Phase 4 — Review instance on the IMS Linode :8443 (gated)
+### Phase 4 — Review instance on the IMS Linode :8443 (gated) — ACCEPTED 2026-10-28
 - **Work:**
   1. `DatabaseStorage` plus a signed-in `media/<name>` view that serves `StoredFile` bytes and thumbnails with `ETag`/`Cache-Control`.
   2. The review role **hides and rejects (403)** every capture, relay, OvrC, cancel, confirm, VBE, rejection-run and publish endpoint, and the capture explorer (it reads local disk).
@@ -189,6 +189,14 @@ Directed by the user ("provision the linode instance"), using the `access-replac
 - **Operator note (my error):** cleaning up a test session, my filter deleted every `ployd` ModelBackend session, which **signed the user's browser out** of :8443; re-sign-in is needed. Later timing runs deleted only their own session key. Five undecodable sessions in the shared DB (signed with the laptop's key during earlier local test runs) are harmless leftovers.
 - **Possible follow-ups if it is still slow in the browser:** move the Supabase project closer to the Linode (32 ms RTT dominates `/cameras/`), or batch `/cameras/`' 27 queries.
 
+#### Phase 4 acceptance (2026-10-28) — PASS
+- SSO sign-in on :8443 through production IMS (2FA): **works** (user `ployd`, confirmed by the user).
+- IMS on 443 unaffected: `healthy`, `/healthz` 200, memory ~50–61 MiB before and after every deploy.
+- DST under its limit: ≤ 302 MiB peak (during the 847-row sync), ~130–180 MiB steady, of 512 MiB.
+- Capture POSTs → 403 (start, publish, turn-relays, cancel, capture-pole), plus `/explorer/`, `/sync/`, `/admin/` → 403, externally and in tests.
+- **I3:** teammates reach it from their own networks (user report).
+- Performance: user confirms it "is better" after the fixes above.
+
 ### Phase 5 — One-page review per round (gated)
 - **Work:** `/audits/review/<round>/`: one row per camera in the round (newest `DST_SITE` capture per installation), showing:
   - identifier, pole, agency, LTI/DE
@@ -252,7 +260,7 @@ LTI-only DST run on the camera VPN → VPN off → DE-only DST run → publish b
 ## Issue digest
 - **I1 — resolved 2026-10-27:** Supabase rejected the stored password (a commented `DB_PASSWORD_PRODUCTION` value with an inline comment after it). The user replaced it; auth passes on 6543 and 5432.
 - **I2 — resolved by design 2026-10-27:** the camera VPN (OpenVPN, full tunnel) blocks outbound 5432/6543, and IMS IT won't open ports. Resolution: data flow C′ (capture locally, publish with the VPN off). Rejected alternatives: host-route bypass (fragile, may breach VPN policy), Tailscale relay (an extra dependency), HTTPS ingest via the Linode (needs 443, which IMS holds).
-- **I3 — open, checked in Phase 4:** the camera VPN only allowed 443 among the ports tested. Reviewers must be able to reach `:8443` from their own networks. If they can't, review moves to 443 behind a reverse proxy shared with IMS.
+- **I3 — resolved 2026-10-28:** the user reports their teammates can reach and use https://45.79.220.29:8443 from their own networks. Previously **open, checked in Phase 4:** the camera VPN only allowed 443 among the ports tested. Reviewers must be able to reach `:8443` from their own networks. If they can't, review moves to 443 behind a reverse proxy shared with IMS.
 
 - **I4 — resolved 2026-10-28:** the user approved committing the CBW plan's schema/sync files on their own (`dbe111e`: `cameras/models.py`, `cameras/migrations/0006_…`, `services/ims_sync.py`; the rest of that plan stays uncommitted). Redeployed: in the container, `Installation` model fields = Supabase columns (**38 = 38**, none missing either way); container healthy at 128 MiB, IMS healthy. Previously **open, blocked the Phase 4 deploy:** the shared DB has `cameras.0006_installation_county_installation_created_at_and_more` applied. It belongs to the **CBW firmware plan** (`in-progress-plans/CBW_FIRMWARE_INVENTORY_REPORT.md`) and was sitting uncommitted in the working tree when Phase 1 ran `migrate --database shared`. It adds 13 NOT NULL `Installation` columns with no DB default (`county`, `street`, `site_type`, `created_at`, …). The committed code (`8b20479`) has no such fields (`cameras/models.py`, the migration and `services/ims_sync.py` are uncommitted), so an image built from a commit would fail every `sync_installations` insert. **Resolution:** commit the CBW plan's schema/sync changes before deploying (the user's call: it's that plan's work), or deploy from a tree that includes them.
 - **I5 — open (IMS, outside this plan):** `/opt/access_replacement/certs/key.pem` (IMS's TLS private key) is mode **0666**, world-readable *and* writable. Recommend `chmod 600`; the DST container runs as uid 1000 (`deploy`, the owner), so DST is unaffected by that change.
@@ -269,7 +277,7 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Phase 1 — roles + shared schema + API roles locked out + reaper off in review (accepted 2026-10-27)
 - [x] Phase 2 — stable IDs, audit rounds, structured OvrC time, `lock_shared_db` (accepted 2026-10-27)
 - [x] Phase 3 — publish to shared DB (command + panel, can be resumed and re-run) (accepted 2026-10-27)
-- [ ] Phase 4 — review instance on the IMS Linode :8443 (incl. I3 reviewer reachability) — local half implemented + verified; deploy pending, not accepted
+- [x] Phase 4 — review instance on the IMS Linode :8443 (incl. I3 reviewer reachability) (accepted 2026-10-28)
 - [ ] Phase 5 — one-page review per round
 - [ ] Phase 6 — shared Complete checkbox + Notes (notes editable by anyone signed in, IMS RA-modal style)
 - [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
@@ -280,6 +288,6 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 10/15. Phases 0–3 accepted. Phase 4: SSO sign-in works on :8443; the slowness was investigated and fixed (N+1, reconnects, IMS probe, full-size previews). Remaining Phase 4 acceptance: user confirms speed in the browser, and I3 (a reviewer on their own network).
+in progress — 11/15. Phases 0–4 accepted; I1–I4 and I6 resolved; I5 (IMS key 0666) open outside this plan. Next: Phase 5 (one-page review per round).
 
 `Superseded by:` —
