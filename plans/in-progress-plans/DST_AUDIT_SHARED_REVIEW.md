@@ -310,14 +310,15 @@ User report: "DST audit page is taking a long time to load".
   - The "not complete" filter respects the checkbox.
   - Re-publishing a round does not reset reviews.
 
-#### Phase 6 implementation (2026-10-28) — built, shared DB migrated; not deployed, not accepted
+#### Phase 6 implementation (2026-10-28) — built and deployed; not accepted
 - **Code (`f19542a`):** `audits/assignment.py` (sequence math, round snapshot, backfill); publish assigns inside the run's shared transaction (`PublishReport.assigned`); `manage.py assign_reviewers`; `InstallationAuditReview` + `AuditRound.reviewers`/`assignment_offsets` (`audits/0010`); `POST /audits/review/<round>/item/` (`completed` / `notes` / `assigned_to`, any signed-in user, added to `REVIEW_WRITE_PREFIXES`); the page's tech filters (Everyone / Mine / each tech / Unassigned) combined with all / not complete / failed / drift / LTI / DE, per-tech progress, a reassign dropdown, the Complete checkbox + "x/y complete", and the Notes cell + `static/review.js` (RA-modal port, `dst-notes-modal-*` CSS).
 - **Concurrency refinement:** Complete and assignee are explicit sets (last write wins; the response returns current state). **Notes are compare-and-set against the text the editor opened with**, rather than the row `version`, so a teammate ticking Complete doesn't make your note save fail. A real note conflict returns 409 with the other text; the modal stays open with yours, showing theirs. Save again replaces theirs, Cancel keeps theirs. `version` is still bumped on every change.
 - **A row is created on first edit** for a camera in the round that has none (published before assignment existed), and stays unassigned.
 - **Tests:** `audits/test_assignment.py` (15) + one publish test. They cover x % n, per-type balance with offsets, never moving existing rows, the snapshot, duplicate/blank keys, backfill, the command, filters/progress, page tech filters, constant page query count, complete/uncomplete, notes save + 409 + CRLF + 4000-char limit, reassign validation, 404/400/sign-in, row-on-first-edit, and the review role allowing edits. **Suite: 91 passed.**
 - **Shared DB:** `migrate --database shared` (0010) and `lock_shared_db` → **22/22 locked**. Backfill: `assign_reviewers --round "Acceptance test 2026-10-27"` → 266006 carthur, 266007 jgreene (DE published first), 266059 ployd (LTI offset 2).
 - **Laptop `.env`:** `DST_REVIEWERS=carthur,jgreene,ployd`. The review container doesn't need it (it never publishes).
-- **Remaining:** deploy `f19542a` to the Linode (`umask 022` for the extract), then Phase 6 acceptance: two browsers/users, the side-by-side screenshot against IMS's RA modal, a concurrent-note 409, and confirming or dropping Escape = Cancel.
+- **Deployed `f19542a`** (user: "deploy"): extracted with `umask 022`, compose unchanged, rebuilt; `healthy`, 127 MiB / 512; IMS healthy (54 MiB). Smoke test as `ployd`: `/audits/review/` 200 (0.9 s cold, ~0.2 s warm), 3 rows; `?tech=mine` / `?tech=carthur` / `?show=incomplete&tech=jgreene` 1 row each; progress shows 0/1 per tech; hashed `review.js` 200; signed-out POST → 403; 0 `[STUCK]`. The test session was deleted by its exact key.
+- **Remaining:** Phase 6 acceptance: two browsers/users, the side-by-side screenshot against IMS's RA modal, a concurrent-note 409, and confirming or dropping Escape = Cancel.
 
 ### Final acceptance — a real audit day end to end
 LTI-only DST run on the camera VPN → VPN off → DE-only DST run → publish both into one round → reviewers on :8443 see one list, tick Complete and add Notes.
