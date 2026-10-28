@@ -176,6 +176,19 @@ Directed by the user ("provision the linode instance"), using the `access-replac
 - **Operational note:** a full sync takes ~6 min over the pooler (row-by-row device/sensor writes). Run it detached (`docker compose exec -d dst sh -c "python manage.py sync_installations > /tmp/sync.log 2>&1"`): an SSH drop mid-sync (the laptop's wired link went down) reset the session, though that run did complete.
 - **Remaining Phase 4 acceptance:** (1) **the user signs in at https://45.79.220.29:8443 through "Sign in with IMS"** (2FA), and lands on the dashboard showing the published acceptance round; (2) I3, a reviewer opens :8443 from their own network.
 
+#### Phase 4 — "loading extremely slowly" (user report 2026-10-28): measured and fixed
+- **User report:** SSO sign-in on :8443 **works** (acceptance step 1 ✅ for the user `ployd`), but pages load extremely slowly.
+- **Measured** (Linode → Supabase ca-central-1): each query is a **32 ms** round trip; a new pooler connection **~330 ms** (once 4.8 s); the review runs everything over that link, where the laptop has local SQLite.
+- **Causes and fixes:**
+  1. **N+1:** `Installation.fx_numbers` reads `self.devices` per row, and `_active_dst_installations` (DST Audit page, Confirm Captures, runner) iterated all 847 active installations without prefetching, at ~28 s per pass. Fix: `prefetch_related("devices")` (`80853ff`), plus a regression test (`audits/test_query_counts.py`, ≤3 queries for 12 installations). **`/audits/dst/`: minutes → 0.9–1.3 s (11 queries).**
+  2. **Reconnect per request:** `CONN_MAX_AGE=0` paid ~330 ms per request. Fix: `DB_CONN_MAX_AGE` (default 300 s) with health checks (`80853ff`); safe with transaction pooling since prepared statements are off.
+  3. **Live IMS probe on every dashboard view:** `check_ims_connection()` made two HTTPS calls to IMS (~1.5 s). Fix: cached 60 s per process (`d6563b4`). **`/`: 1.6–2.2 s → ~380 ms warm.**
+  4. **Full-size images as previews:** preview `<img>` tags pulled ~2.5 MB PNGs from Supabase (server 190–460 ms each, then the transfer). Fix: the `thumb_src` filter serves the ~21 KB stored thumbnail (~100 ms), and a click still opens the full image (`196523c`).
+- **After (through gunicorn from a cold restart):** `/audits/` 0.18 s, `/audits/5/` 0.25 s, `/cameras/` 1.1 s (27 queries; still latency-bound), `/audits/dst/` 0.9–1.3 s, `/map/` 1.3 s (folium CPU on 1 vCPU, 3 queries). Container ≤ 180 MiB; IMS healthy throughout.
+- **Unexplained one-off:** a single `GET /cameras/` took **81.4 s** server-side right after a redeploy. It did not reproduce in later cold runs (1.1 s). Probably a slow pooler connect (cf. the 4.8 s connect), but unconfirmed: watch the `[HTTP] … ms=` log lines.
+- **Operator note (my error):** cleaning up a test session, my filter deleted every `ployd` ModelBackend session, which **signed the user's browser out** of :8443; re-sign-in is needed. Later timing runs deleted only their own session key. Five undecodable sessions in the shared DB (signed with the laptop's key during earlier local test runs) are harmless leftovers.
+- **Possible follow-ups if it is still slow in the browser:** move the Supabase project closer to the Linode (32 ms RTT dominates `/cameras/`), or batch `/cameras/`' 27 queries.
+
 ### Phase 5 — One-page review per round (gated)
 - **Work:** `/audits/review/<round>/`: one row per camera in the round (newest `DST_SITE` capture per installation), showing:
   - identifier, pole, agency, LTI/DE
@@ -267,6 +280,6 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 10/15. Phases 0–3 accepted; I4 and I6 resolved; production IMS creds installed and the first sync passed (847). Phase 4 acceptance waits on the user's SSO sign-in on :8443 and I3.
+in progress — 10/15. Phases 0–3 accepted. Phase 4: SSO sign-in works on :8443; the slowness was investigated and fixed (N+1, reconnects, IMS probe, full-size previews). Remaining Phase 4 acceptance: user confirms speed in the browser, and I3 (a reviewer on their own network).
 
 `Superseded by:` —
