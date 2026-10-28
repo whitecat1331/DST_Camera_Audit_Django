@@ -11,6 +11,7 @@ urlpatterns = [
     path("review/", review_views.review_round, name="review_round"),
     path("review/<int:pk>/", review_views.review_round, name="review_round_pk"),
     path("review/<int:pk>/item/", review_views.review_update, name="review_update"),
+    path("review/<int:pk>/events/", review_views.review_events, name="review_events"),
     path("confirm-captures/", views.confirm_captures_page, name="confirm_captures"),
     path(
         "confirm-captures/preview/",

@@ -25,8 +25,11 @@ USER dst
 
 EXPOSE 8443
 # TLS is terminated by gunicorn with IMS's certificate (mounted at /certs).
+# One worker, like IMS's single process: the live-update broker (audits/live.py)
+# is in-process, so every review page must share it. Threads carry the
+# concurrency; live streams are capped at DST_SSE_MAX_CLIENTS (12) of the 24.
 CMD ["gunicorn", "config.wsgi:application", \
      "--bind", "0.0.0.0:8443", \
      "--certfile", "/certs/cert.pem", "--keyfile", "/certs/key.pem", \
-     "--workers", "2", "--threads", "4", "--timeout", "60", \
+     "--workers", "1", "--threads", "24", "--timeout", "60", \
      "--access-logfile", "-"]

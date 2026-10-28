@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 
 from django.contrib.auth.decorators import login_required
-from django.db import IntegrityError, transaction
-from django.db.models import F
-from django.http import JsonResponse
+from django.db import IntegrityError, connections, transaction
+from django.db.models import Count, F, Q
+from django.http import JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
 
+from audits import live
 from audits.models import AuditJob, AuditRound, InstallationAuditReview
 from audits.review import (
     DRIFT_FLAG_SECONDS,
@@ -82,6 +83,23 @@ def _state(review: InstallationAuditReview) -> dict:
         "notes": review.notes,
         "notes_updated_by": review.notes_updated_by,
     }
+
+
+def _progress(round_: AuditRound) -> dict:
+    """Round-wide counters for the header, pushed with every live change."""
+    techs, complete, unassigned = {}, 0, 0
+    rows = (
+        InstallationAuditReview.objects.filter(round=round_)
+        .values("assigned_to")
+        .annotate(total=Count("id"), complete=Count("id", filter=Q(completed=True)))
+    )
+    for r in rows:
+        complete += r["complete"]
+        if r["assigned_to"]:
+            techs[r["assigned_to"]] = {"total": r["total"], "complete": r["complete"]}
+        else:
+            unassigned += r["total"]
+    return {"complete": complete, "unassigned": unassigned, "techs": techs}
 
 
 def _review_for(round_: AuditRound, key: str) -> InstallationAuditReview | None:
@@ -169,4 +187,37 @@ def review_update(request, pk: int):
     else:
         return JsonResponse({"error": "Unknown field."}, status=400)
     review.refresh_from_db()
-    return JsonResponse({"state": _state(review)})
+    state = _state(review)
+    live.broker.broadcast(
+        round_.pk,
+        "review",
+        {
+            "state": state,
+            "field": field,
+            "by": user,
+            "client": request.headers.get("X-Review-Client", ""),
+            "progress": _progress(round_),
+        },
+    )
+    return JsonResponse({"state": state})
+
+
+@login_required
+@require_GET
+def review_events(request, pk: int):
+    """SSE stream of live review changes for one round."""
+    round_ = get_object_or_404(AuditRound, pk=pk)
+    q = live.broker.try_subscribe(round_.pk)
+    if q is None:
+        return JsonResponse({"error": "Too many live connections."}, status=503)
+
+    def body():
+        # The stream never queries; give this thread's DB connection back
+        # instead of holding it for the stream's lifetime.
+        connections.close_all()
+        yield from live.stream(q)
+
+    response = StreamingHttpResponse(body(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response

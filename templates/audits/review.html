@@ -40,9 +40,9 @@
 <ul class="review-progress" aria-label="Progress by tech (click to filter)">
   {% for p in progress %}
   <li><a href="{{ p.toggle }}"
-         class="review-progress-chip {% if f.tech == p.name %}is-active{% endif %}" {% if f.tech == p.name %}aria-current="true" title="Show everyone"{% else %}title="Show only {{ p.name }}"{% endif %}><strong>{{ p.name }}</strong> <span class="review-progress-n">{{ p.complete }}/{{ p.total }}</span> complete</a></li>
+         class="review-progress-chip {% if f.tech == p.name %}is-active{% endif %}" data-tech="{{ p.name }}" {% if f.tech == p.name %}aria-current="true" title="Show everyone"{% else %}title="Show only {{ p.name }}"{% endif %}><strong>{{ p.name }}</strong> <span class="review-progress-n">{{ p.complete }}/{{ p.total }}</span> complete</a></li>
   {% endfor %}
-  {% if summary.unassigned %}<li class="muted">{{ summary.unassigned }} unassigned</li>{% endif %}
+  <li class="muted" id="review-unassigned" {% if not summary.unassigned %}hidden{% endif %}><span class="review-unassigned-n">{{ summary.unassigned }}</span> unassigned</li>
 </ul>
 {% endif %}
 
@@ -87,10 +87,12 @@
     <a href="{% url 'review_round_pk' pk=current.pk %}" class="btn-secondary {% if not f.active %}btn-disabled{% endif %}">Clear</a>
   </div>
 </form>
-<div class="record-count">Showing {{ rows|length }} of {{ summary.cameras }} camera{{ summary.cameras|pluralize }}</div>
+<div class="record-count">Showing {{ rows|length }} of {{ summary.cameras }} camera{{ summary.cameras|pluralize }}
+  <span id="review-live" class="review-live is-off" title="Complete, notes and assignments from teammates appear here without refreshing">Live updates: connecting…</span>
+</div>
 
 <div class="table-scroll">
-  <table class="data-table review-table" data-update-url="{% url 'review_update' pk=current.pk %}">
+  <table class="data-table review-table" data-update-url="{% url 'review_update' pk=current.pk %}" data-events-url="{% url 'review_events' pk=current.pk %}" data-user="{{ request.user.username }}">
     <thead>
       <tr>
         <th>Camera</th>
@@ -183,7 +185,7 @@
 {% endblock %}
 
 {% block extra_js %}
-<script src="{% static 'review.js' %}?v=1"></script>
+<script src="{% static 'review.js' %}?v=2"></script>
 <script>
 // Filters apply as soon as they change (IMS auto_filter); empty fields are
 // dropped so the URL only carries active filters.

@@ -1413,3 +1413,8 @@ a.icon-btn {
   font-family: inherit;
 }
 .dst-notes-error { margin-top: 10px; color: #f87171; font-size: 0.82rem; white-space: pre-wrap; max-height: 180px; overflow: auto; }
+.review-live { margin-left: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--line); }
+.review-live.is-on { color: #4ade80; border-color: rgba(74, 222, 128, 0.45); }
+.review-live.is-on::before { content: "\25CF  "; }
+.review-live.is-off { color: var(--muted); }
+.dst-notes-notice { margin-top: 10px; color: var(--warn); font-size: 0.82rem; }
