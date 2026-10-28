@@ -168,6 +168,14 @@ Directed by the user ("provision the linode instance"), using the `access-replac
 - **External access FAILS (I6):** from the laptop (VPN off), `https://45.79.220.29:8443` times out after 15 s, while the host listens on `0.0.0.0:8443`. A firewall is dropping it: `ufw` (status needs root) or a Linode Cloud Firewall.
 - **Still pending for acceptance:** I6 firewall; production IMS SSO client + API token; I4 before `sync_installations`; then SSO sign-in on :8443, and a reviewer reaching :8443 from their own network (I3).
 
+#### Phase 4 — production IMS credentials + first sync (2026-10-28)
+- **Credentials:** the user's IMS account has TOTP 2FA, so a scripted login can't finish (one attempt failed on a trailing space in the user env var `IMS_PASSWORD`; the corrected attempt reached `/login/mfa`, which cleared the rate-limit counter). Instead, `tmp/provision_ims_via_browser.py` opened a **visible Chrome** (Selenium) at IMS `/login` after checking the server's cert against the pin `98:DB:…:05:E9`. **The user signed in (incl. 2FA)**; the script reused that session over the pinned client to `POST /admin/external-integrations/tokens/create` and `/sso/create`. Result: **API token "DST Camera Audit review (Linode :8443)"** (`ase_installations:read`) and **SSO client `dst_camera_audit_review`** (new id; IMS's create refuses duplicates, so no existing client was touched), redirect `https://45.79.220.29:8443/accounts/ims/callback/`. Both were piped over SSH straight into `~/dst_camera_audit/secrets/` (69 bytes each) and `.env`; nothing printed or stored on the laptop. Logged out, Chrome closed.
+- **Container recreated:** settings report client id `dst_camera_audit_review`, secret and token loaded, redirect as above.
+- **Bug found by the first Postgres sync, fixed (`d185cc4`):** `InstallationDevice.host` was `varchar(64)`, but 10 IMS devices have ControlByWeb cloud URLs up to **146** chars (e.g. `I-ASE-700002`). SQLite never enforced `max_length`, so only Postgres caught it (`DataError: value too long for type character varying(64)`). Widened to 255 (`cameras/0007_widen_device_host`), migrated locally + `shared`, `lock_shared_db` 21/21. Note: those URLs appear to embed a ControlByWeb cloud key; they were already stored in IMS and local DST, and in Supabase they sit behind the lockdown.
+- **First production sync PASS:** `sync_installations` in the container → IMS API via the pinned cert (container → host's public IP): **847 rows fetched, 806 created + 41 updated, 3,441 devices**, longest host 146. 846/847 have `street`, 697 `site_type` (`county` is empty in IMS's payload today). Spot checks: `233038` → I-LTI-233038 Bainbridge GA; `I-VBE-0011` → New Kent Co VA; `266134` → I-DE-266134 Knoxville TN. Peak container memory 302 MiB during the sync (< 512); IMS healthy throughout.
+- **Operational note:** a full sync takes ~6 min over the pooler (row-by-row device/sensor writes). Run it detached (`docker compose exec -d dst sh -c "python manage.py sync_installations > /tmp/sync.log 2>&1"`): an SSH drop mid-sync (the laptop's wired link went down) reset the session, though that run did complete.
+- **Remaining Phase 4 acceptance:** (1) **the user signs in at https://45.79.220.29:8443 through "Sign in with IMS"** (2FA), and lands on the dashboard showing the published acceptance round; (2) I3, a reviewer opens :8443 from their own network.
+
 ### Phase 5 — One-page review per round (gated)
 - **Work:** `/audits/review/<round>/`: one row per camera in the round (newest `DST_SITE` capture per installation), showing:
   - identifier, pole, agency, LTI/DE
@@ -254,11 +262,11 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
 - [x] I4 — CBW plan's cameras.0006 schema committed (`dbe111e`) and redeployed; model = Supabase (38/38 columns)
 - [x] I6 — inbound 8443 opened (Linode Cloud Firewall); reachable from the laptop
-- [ ] Production IMS SSO client + API token for the review instance (IMS Admin UI; redirect `https://45.79.220.29:8443/accounts/ims/callback/`)
+- [x] Production IMS SSO client `dst_camera_audit_review` + API token installed (2026-10-28); first sync 847 installations
 - [ ] Final acceptance — real audit day end to end
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 9/15. Phases 0–3 accepted; I4 and I6 resolved. Phase 4: review instance live at https://45.79.220.29:8443; acceptance waits on production IMS credentials (SSO sign-in + sync) and I3 (a reviewer on their own network).
+in progress — 10/15. Phases 0–3 accepted; I4 and I6 resolved; production IMS creds installed and the first sync passed (847). Phase 4 acceptance waits on the user's SSO sign-in on :8443 and I3.
 
 `Superseded by:` —
