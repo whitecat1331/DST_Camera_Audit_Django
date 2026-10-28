@@ -1816,7 +1816,9 @@ def _active_dst_installations(
         if agency:
             qs = qs.filter(agency__iexact=agency)
 
-    qs = qs.order_by("primary_platform", "pole_number", "identifier")
+    # fx_numbers / site kind read inst.devices; prefetch so a fleet page is a
+    # handful of queries, not one per installation (32 ms each to Supabase).
+    qs = qs.order_by("primary_platform", "pole_number", "identifier").prefetch_related("devices")
     by_id = {inst.pk: inst for inst in qs}
     candidates = (
         [by_id[i] for i in ids if i in by_id]

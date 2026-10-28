@@ -139,8 +139,10 @@ if _db_host:
         "PASSWORD": _db_password,
         "NAME": os.getenv("DB_NAME", "postgres").strip(),
         "OPTIONS": _db_options,
-        # Pooler owns connection reuse; .iterator() cursors break under it.
-        "CONN_MAX_AGE": 0,
+        # Keep client connections to the pooler: a new one costs ~330 ms (TLS +
+        # auth) from the Linode. Safe with transaction pooling because
+        # prepared statements are off; .iterator() cursors still break under it.
+        "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "300")),
         "CONN_HEALTH_CHECKS": True,
         "DISABLE_SERVER_SIDE_CURSORS": True,
     }
