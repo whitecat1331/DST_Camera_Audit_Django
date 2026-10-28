@@ -116,3 +116,65 @@ class ThumbSrcFilterTests(TestCase):
         disk_file.storage = FileSystemStorage(base_url="/media/")
         self.assertEqual(thumb_src(disk_file), "/media/audits/9/cbw.png")
         self.assertEqual(thumb_src(None), "")
+
+
+class PoolFriendlyCachingTests(TestCase):
+    """IMS-style caching: fewer DB round trips per request on the review instance."""
+
+    def setUp(self):
+        from audits import media_views
+
+        media_views._cache.clear()
+        media_views._cache_size = 0
+        self.user = get_user_model().objects.create_user("viewer2")
+        self.client.force_login(self.user)
+        self.row = stored(name="audits/9/de_l1.png", data=PNG, thumb=b"jpeg-thumb-bytes")
+
+    def test_repeat_thumbnail_is_served_from_memory(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        url = DatabaseStorage().url(self.row.name) + "?thumb=1"
+        with CaptureQueriesContext(connection) as first:
+            self.assertEqual(self.client.get(url).content, b"jpeg-thumb-bytes")
+        with CaptureQueriesContext(connection) as second:
+            self.assertEqual(self.client.get(url).content, b"jpeg-thumb-bytes")
+        file_queries = lambda q: [x for x in q if "audits_storedfile" in x["sql"]]  # noqa: E731
+        self.assertEqual(len(file_queries(first)), 1)
+        self.assertEqual(len(file_queries(second)), 0)
+        # Only Django's per-request user lookup remains: the session comes from
+        # the cached_db cache and the image bytes from the in-process cache.
+        self.assertEqual([x["sql"].split('"')[1] for x in second], ["auth_user"])
+
+    def test_cache_is_bounded_by_bytes(self):
+        from audits import media_views
+
+        old = media_views._CACHE_BYTES
+        media_views._CACHE_BYTES = 40
+        try:
+            for n in range(5):
+                media_views._cache_put((f"f{n}", "thumb"), "sha", "image/jpeg", b"x" * 10)
+            self.assertLessEqual(media_views._cache_size, 40)
+            self.assertNotIn(("f0", "thumb"), media_views._cache)
+            self.assertIn(("f4", "thumb"), media_views._cache)
+        finally:
+            media_views._CACHE_BYTES = old
+
+    @override_settings(DST_ROLE="review")
+    def test_review_dashboard_kpis_cached(self):
+        from django.core.cache import cache
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        cache.clear()
+        with mock_ims():
+            self.client.get("/")
+            with CaptureQueriesContext(connection) as again:
+                self.client.get("/")
+        self.assertFalse([q for q in again if "COUNT(*)" in q["sql"]])
+
+
+def mock_ims():
+    from unittest import mock
+
+    return mock.patch("cameras.views.check_ims_connection", return_value={"status": "connected", "detail": ""})

@@ -5,6 +5,7 @@ from django.db.models import Q
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.contrib import messages
+from django.core.cache import cache
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 from django.utils.safestring import mark_safe
@@ -33,36 +34,50 @@ logger = logging.getLogger(__name__)
 def dashboard(request):
     recent_jobs = AuditJob.objects.select_related("created_by")[:10]
     ims_status = check_ims_connection()
-    seeded = ensure_default_csv_loaded(settings.BASE_DIR)
-    if seeded:
-        messages.info(
-            request,
-            f"Loaded DragonEye TeamViewer IDs from project CSV ({seeded['count']} rows).",
-        )
-    tv_count = DragonEyeTeamViewerId.objects.count()
-    tv_source = (
-        DragonEyeTeamViewerId.objects.order_by("-updated_at")
-        .values_list("source_filename", flat=True)
-        .first()
-        or ""
-    )
+    # The project TeamViewer CSV lives on the capture laptop only.
+    if settings.DST_ROLE != "review":
+        seeded = ensure_default_csv_loaded(settings.BASE_DIR)
+        if seeded:
+            cache.delete(DASHBOARD_KPI_CACHE_KEY)
+            messages.info(
+                request,
+                f"Loaded DragonEye TeamViewer IDs from project CSV ({seeded['count']} rows).",
+            )
     context = {
-        "installation_count": Installation.objects.filter(is_active=True).count(),
-        "mapped_count": Installation.objects.filter(is_active=True)
-        .exclude(gps_lat__isnull=True)
-        .exclude(gps_long__isnull=True)
-        .count(),
+        **(
+            cache.get_or_set(DASHBOARD_KPI_CACHE_KEY, _dashboard_kpis, DASHBOARD_KPI_SECONDS)
+            if settings.DST_ROLE == "review"
+            else _dashboard_kpis()  # local SQLite: always live
+        ),
+        "ims_status": ims_status,
+        "recent_jobs": recent_jobs,
+        "can_audit": role_at_least(request.user, "technician"),
+    }
+    return render(request, "cameras/dashboard.html", context)
+
+
+# Like IMS's dashStatsCache: KPI counts are served from memory (refreshed at
+# most once a minute per process), so a dashboard render isn't seven extra
+# Supabase round trips.
+DASHBOARD_KPI_CACHE_KEY = "dashboard_kpis"
+DASHBOARD_KPI_SECONDS = 60
+
+
+def _dashboard_kpis() -> dict:
+    active = Installation.objects.filter(is_active=True)
+    return {
+        "installation_count": active.count(),
+        "mapped_count": active.exclude(gps_lat__isnull=True).exclude(gps_long__isnull=True).count(),
         "job_count": AuditJob.objects.count(),
         "running_count": AuditJob.objects.filter(
             status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING]
         ).count(),
-        "ims_status": ims_status,
-        "recent_jobs": recent_jobs,
-        "can_audit": role_at_least(request.user, "technician"),
-        "dragoneye_tv_count": tv_count,
-        "dragoneye_tv_source": tv_source,
+        "dragoneye_tv_count": DragonEyeTeamViewerId.objects.count(),
+        "dragoneye_tv_source": DragonEyeTeamViewerId.objects.order_by("-updated_at")
+        .values_list("source_filename", flat=True)
+        .first()
+        or "",
     }
-    return render(request, "cameras/dashboard.html", context)
 
 
 @login_required

@@ -211,6 +211,12 @@ if not DEBUG:
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# Like IMS's in-memory session cache: authenticated requests read the session
+# from process memory instead of a DB round trip (~32 ms each to Supabase from
+# the review Linode, and a slot in its ~16-connection pooler).
+CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache", "OPTIONS": {"MAX_ENTRIES": 5000}}}
+SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
+
 LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "dashboard"
 LOGOUT_REDIRECT_URL = "login"
