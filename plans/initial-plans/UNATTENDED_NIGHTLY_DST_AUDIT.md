@@ -87,7 +87,8 @@ Throwaway code in `tmp/`; it never ships. Answers two questions:
    - Does a `signal SIGTERM` over it, or the WatchGuard client's own disconnect, end the tunnel with no prompt and restore routes?
    - Does the WatchGuard GUI then behave (no auto-reconnect, no error loop)?
    - Admin rights needed?
-- **Accepted when:** the matrix is recorded for every dependency, and the release question is answered yes or no with evidence. Either answer is fine: "no" selects the held-publish path.
+3. **Long connection (Q4):** connect, leave the VPN idle past 8 h, and record whether it stays up or re-prompts MFA and drops (the WatchGuard log + periodic CBW probe, logged with timestamps).
+- **Accepted when:** the matrix is recorded for every dependency, the release question is answered yes or no with evidence, and the 8 h behavior is observed. Either release answer is fine: "no" selects the held-publish path.
 - **Hard limit:** the user connects the VPN (MFA) for the test.
 
 ### Phase 1 — Network detector + VPN-half/direct-half run (gated)
@@ -122,10 +123,18 @@ Throwaway code in `tmp/`; it never ships. Answers two questions:
 3. Operator notes in `README.md`: connect the VPN before leaving, keep the laptop plugged in, unlocked and awake, TeamViewer signed in, and keep the fire time within ~7 h of connecting.
 - **Accepted when:** each preflight failure is simulated (no desktop, TeamViewer closed, VPN down, sleep on) and recorded with a clear message; the card shows a real run.
 
+### Phase 5 — The review page picks up newly published results (gated)
+The review instance learns about a publish without a refresh. Publish writes to Supabase from the laptop, so the review instance's in-process SSE broker (`audits/live.py`) never hears about it.
+1. A light watcher on the review instance checks each round's published-job count / newest `created_at` every ~30 s: one query, and only while someone has that round open.
+2. On a change it broadcasts `round_updated` over the existing SSE stream.
+3. The page shows "New results published — N cameras added" and pulls in the new rows. A reload keeps the filters; the rows already on screen and an open notes editor are untouched.
+4. A brand-new round appears in the round picker.
+- **Accepted when:** unit tests cover change detection and no event when nothing changed; live: with a review page open on :8443, a publish from the laptop shows the banner within ~30 s, and the new cameras appear with their assignees.
+
 ### Final acceptance — a real scheduled run, no human after VPN connect
 1. The user connects the VPN in the evening and sets a one-time schedule.
 2. At the set local time DST runs all eligible sites, releases the VPN (or holds the publish), and publishes to the round, assigned to carthur/jgreene/ployd.
-3. Reviewers work it on :8443 the next morning.
+3. An open review page on :8443 shows the new results without a refresh, and the reviewers work it the next morning.
 
 ## Issue digest
 None yet.
@@ -133,12 +142,12 @@ None yet.
 ## Open questions
 - ~~Q1 — MFA~~ — **resolved 2026-10-28 (user):** yes, on the initial connection. The user pre-connects the VPN, and DST never connects it.
 - ~~Q3 — schedule~~ — **resolved 2026-10-28 (user):** a one-time fire at a set time on the device's local clock.
-- **Q2 — which machine?** Presumably this laptop, since the user connects the VPN on it. It must stay plugged in, signed in, unlocked and awake, because a locked screen stops the DE (TeamViewer) captures.
-- **Q4 — the 8 h renegotiation:** does the Firebox re-prompt MFA at `reneg-sec 28800` and drop the tunnel? It decides how late the fire time can be. Observe it during Phase 0, or the user may know.
-- **Q5 — round per scheduled run:** a new round each time (recommended), or append to a named round (e.g. the time-change round, when LTI and DE are captured on different nights)?
+- ~~Q2 — which machine~~ — **resolved 2026-10-28 (user):** **this laptop**. It must stay plugged in, signed in, unlocked and awake, because a locked screen stops the DE (TeamViewer) captures. **When the run finishes, the results must update the review page on the Linode automatically.** That means publish runs at the end of every scheduled run (Phase 1/2), and open review pages learn about the new cameras (Phase 5).
+- **Q4 — the 8 h renegotiation** — **user: "we just need to test it to find out."** Phase 0 includes a long-connection observation: connect, leave the VPN idle past 8 h, and record whether it stays up or re-prompts MFA. That sets the maximum gap between connecting and the fire time.
+- ~~Q5 — round per run~~ — **resolved 2026-10-28 (user):** "the audit will include both for now". **One run covers LTI + DE and publishes into one new round** (default name `DST audit {local date}`, editable on the schedule).
 
 ## Status
-open — not started. Stage `plan`; revised 2026-10-28 for MFA (the user pre-connects the VPN) and the one-time schedule.
+open — not started. Stage `plan`; revised 2026-10-28 for MFA (the user pre-connects the VPN), the one-time schedule, this laptop, one LTI+DE round per run, and live pickup on the review page.
 
 ## Checklist
 - [ ] Phase 0 — spike: reachability matrix on/off VPN + can DST release the WatchGuard VPN (yes/no with evidence)
@@ -146,4 +155,5 @@ open — not started. Stage `plan`; revised 2026-10-28 for MFA (the user pre-con
 - [ ] Phase 2 — held publish + auto-publish on VPN off, accepted (or folded per Phase 0)
 - [ ] Phase 3 — one-time local-time schedule via Task Scheduler, fires unattended, accepted
 - [ ] Phase 4 — preflight + morning report, accepted
+- [ ] Phase 5 — review page picks up newly published results live, accepted
 - [ ] Final acceptance — a real scheduled run, no human after the VPN connect
