@@ -8,11 +8,11 @@ IMS keeps 80/443, and `/opt/access_replacement` is never edited.
 ```
 /home/deploy/dst_camera_audit/      (~deploy; no sudo needed)
 ├── docker-compose.yml      ← deploy/docker-compose.yml
-├── .env                    ← IMS_SSO_CLIENT_ID=… (compose variable, not secret)
+├── .env                    ← IMS_SSO_CLIENT_ID=…, DB_HOST=db.<project-ref>.supabase.co (compose variables)
 ├── app/                    ← source tree (git archive of the release commit)
 └── secrets/                ← one value per file, chmod 600, owner deploy
     ├── django_secret_key
-    ├── db_user             ← postgres.<project-ref>
+    ├── db_user             ← postgres (direct connection; db_user.pooler keeps postgres.<project-ref>)
     ├── db_password
     ├── ims_api_token       ← scope ase_installations:read
     └── ims_sso_client_secret
@@ -34,6 +34,20 @@ IMS keeps 80/443, and `/opt/access_replacement` is never edited.
    readable at `0600`. As of 2026-10-27 the key is `0666` (world-writable);
    tighten it with `chmod 600 /opt/access_replacement/certs/key.pem`. That is an
    IMS change, so verify IMS afterwards.
+
+## Database connection (why it isn't the pooler)
+
+The review instance connects **directly** to Postgres (`db.<ref>.supabase.co:5432`,
+IPv6), not through Supavisor. From this Linode, about 1 in 8 Supavisor
+connections (both nodes, both modes, any reply size) stopped receiving replies
+for 17 s to minutes while Postgres had already finished the query. The direct
+host had no stalls (plan I7). The direct host is IPv6-only and Docker's bridge
+network has no IPv6, so the container uses `network_mode: host` and gunicorn
+binds `:8443` on the host itself. The laptop still publishes through the pooler.
+
+**Extract the source with a normal umask** (`umask 022`). Under `umask 077`,
+Docker `COPY` keeps the `0700`/`0600` modes and the uid 1000 container can't
+import `config` (that crash-looped the container once).
 
 ## Deploy / update
 

@@ -245,6 +245,22 @@ User report: "DST audit page is taking a long time to load".
 - **Not yet explained:** in transaction mode the review instance runs at most 8 queries at once (8 threads) < 16. What filled the pool during the user's stalls at 10:12 and 10:32 is unknown (my held test connections and the session-mode switch did not overlap those times). Something else holds server connections (another client of this project, or long transactions); next is sampling `pg_stat_activity` + Supavisor client counts when the watchdog fires.
 - **Recommended mitigation (operator):** raise the Supavisor **Pool Size** for this project (Supabase → Database → Settings → Connection pooling; `max_connections` is 90, so e.g. 40 leaves headroom).
 
+#### I7 resolution (2026-10-28) — root cause: Supavisor (ca-central-1) strands connections; fixed by connecting directly
+- **User direction:** "use IMS's tricks for loading and concurrency" (the Supabase pooler settings aren't visible to the user).
+- **IMS tricks applied (`a7cb46b`):** `cached_db` sessions (IMS's in-memory session cache), a byte-bounded per-process cache of published images (48 MB, 10 min), and dashboard KPI counts cached 60 s on the review instance (IMS's `dashStatsCache`). A repeat thumbnail goes from 3 queries to 1. Tests: `PoolFriendlyCachingTests`.
+- **Caching alone didn't fix it:** bursts still stalled about 1 request in 16, including a cached thumbnail whose only query was the user lookup.
+- **Isolating spikes from the Linode:**
+  1. *Django ORM, no HTTP:* one of 8 threads crawled 17–37 s per request, then hung, so it's **one bad connection**, bad from its first query.
+  2. *Raw psycopg per Supavisor node × binding style:* stalls/hangs on **both nodes** (`3.97.240.24`, `3.98.197.182`), with both extended-protocol and client-side binding.
+  3. *Reply size* (`select repeat('x', N)`, 100 B–200 KB): hangs at 2 KB and 40 KB, none at 8 KB, so **not size-dependent; random per connection**.
+  4. The stuck sockets were `tx=0 rx=0`, retransmits 0 (delivered and ACKed), and Postgres showed nothing active: **Supavisor stopped relaying replies**.
+  5. *Direct Postgres* (`db.<ref>.supabase.co`, IPv6, from host networking): **240/240, max 67 ms, 0 hung**.
+- **Fix (`5dc4d8c`):** the review instance uses the **direct connection** with `network_mode: host` (Docker's bridge lacks IPv6; enabling it needs root). `DB_HOST` is in `~/dst_camera_audit/.env`; the `db_user` secret is `postgres` (`db_user.pooler` kept for rollback). The laptop still publishes through the pooler.
+- **Incident during the switch:** my remote step ran `tar -x` under `umask 077`, so the image's `/app` was unreadable to uid 1000 and the container **crash-looped for a few minutes** (`No module named 'config.wsgi'`). Fixed by re-extracting with `umask 022`; documented in `deploy/README.md`. IMS was unaffected.
+- **Verification after the fix:** ORM replay **200/200 in 4 s, max 432 ms, 0 stalls/hung**; HTTP bursts (16 thumbs, 16 full images, 16 pages, 2× 24 mixed) **0 errors, max 3.7 s, 0 watchdog dumps**; external login 200 in 0.10 s; IMS healthy. Container memory 339 MiB / 512 (the image cache filling up); watch it.
+- **Wrong turns, kept for the record:** session mode (`0a87263`, reverted in `baeb6ee`); the "idle drop", DNS, and TLS-handshake hypotheses (each refuted by a test above).
+- **Closing I7 needs:** the user browsing normally with no stall, and the watchdog still at 0 `[STUCK]` dumps.
+
 ### Phase 6 — Shared Complete checkbox + Notes (gated)
 - **Work:**
   - An `InstallationAuditReview` model (`round` FK, `installation` FK, `completed`, `completed_by`, `completed_at`, `notes`, `notes_updated_by`, `notes_updated_at`, `version`; unique on (round, installation)). It lives only in the shared DB and is never published over.
@@ -314,7 +330,7 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Phase 3 — publish to shared DB (command + panel, can be resumed and re-run) (accepted 2026-10-27)
 - [x] Phase 4 — review instance on the IMS Linode :8443 (incl. I3 reviewer reachability) (accepted 2026-10-28)
 - [ ] Phase 5 — one-page review per round (implemented `6e1b83e`; content acceptance PASS; blocked on I7)
-- [ ] I7 — intermittent review-instance request stalls (12.7 s / 132 s / 81 s)
+- [ ] I7 — intermittent review-instance request stalls: root cause found (Supavisor strands connections), fixed by a direct connection (`5dc4d8c`); awaiting the user's browse check
 - [ ] Phase 6 — shared Complete checkbox + Notes (notes editable by anyone signed in, IMS RA-modal style)
 - [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
 - [x] I4 — CBW plan's cameras.0006 schema committed (`dbe111e`) and redeployed; model = Supabase (38/38 columns)
@@ -324,6 +340,6 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 11/16. Phases 0–4 accepted. Phase 5 implemented and its content acceptance passed; acceptance blocked on I7 (intermittent stalls, under investigation).
+in progress — 11/16. Phases 0–4 accepted. Phase 5 content-accepted; I7 fixed (direct DB connection), awaiting the user's browse confirmation, then Phase 6.
 
 `Superseded by:` —
