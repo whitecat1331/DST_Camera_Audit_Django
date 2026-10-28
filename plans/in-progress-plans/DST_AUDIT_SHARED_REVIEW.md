@@ -265,9 +265,23 @@ User report: "DST audit page is taking a long time to load".
 - Content on the real round: 3 cameras from 7 site jobs (LTI + DE merged across re-runs), 8/8 previews are thumbnails, 3/3 rows match their job records, `266006` ADT +58.9 min flagged.
 - Performance (I7 resolved): after the direct-connection fix, the user reports "working much better". Since the container restart: **0 `[STUCK]` dumps**; the user's real browser requests median **68 ms**, max **245 ms**; IMS healthy; container 339 MiB / 512.
 
-### Phase 6 — Shared Complete checkbox + Notes (gated)
-- **Work:**
-  - An `InstallationAuditReview` model (`round` FK, `installation` FK, `completed`, `completed_by`, `completed_at`, `notes`, `notes_updated_by`, `notes_updated_at`, `version`; unique on (round, installation)). It lives only in the shared DB and is never published over.
+### Phase 6 — Reviewer assignment + shared Complete checkbox + Notes (gated)
+**Amended 2026-10-28 (user):** the review work is divided among technicians, currently **`carthur`, `jgreene`, `ployd`**. The user wrote "caruthur", but the signed-in review-site user is `carthur`; confirm. Each camera is assigned to one tech with an `x % number of techs` distribution, and the review page filters by assigned tech.
+
+- **Assignment design:**
+  - **x = the camera's arrival order in the round**, not its position in a sorted list. Positions shift when more cameras are published later (the DE run after the LTI run, re-runs), which would silently move cameras between techs mid-review. Each camera is assigned **once, when it first enters the round**, to `reviewers[seq % n]`, and the result is **stored**. Counts stay equal within ±1, and an assignment never changes by itself.
+  - **Balanced per site type (proposed, confirm):** a separate sequence for LTI and for DE, so each tech gets an equal share of both (LTI review means reading CBW/VNC images, while DE has OvrC times).
+  - **Reviewers list:** `DST_REVIEWERS=carthur,jgreene,ployd` (laptop `.env`; publish assigns). The list is **snapshotted on the round** (`AuditRound.reviewers`) at its first publish, so changing the team later does not reshuffle an existing round. A new round uses the then-current list.
+  - **Where:** in `publish_runs` (the single writer; inside the run's shared-DB transaction). Publish **only creates** review rows for cameras new to the round and never updates existing ones, so re-publishing keeps assignments, checkmarks and notes.
+  - **Backfill:** `manage.py assign_reviewers --round NAME` for rounds published before this change (the acceptance round).
+  - **Manual reassign (proposed, confirm):** a per-row dropdown, usable by any signed-in user and recorded (who/when), for when a tech is out.
+  - Assignee stored as a **username string**, so a tech who hasn't signed in to the review site yet can still be assigned.
+- **Review page:**
+  - An "Assigned to" column.
+  - Filters: **Mine** (the signed-in user), **each tech** (`?tech=<username>`), **Unassigned**, combinable with the existing all/failed/drift/LTI/DE/not-complete.
+  - Per-tech progress in the header (e.g. `jgreene 3/7 complete`).
+- **Work (Complete + Notes, unchanged from before):**
+  - An `InstallationAuditReview` model (`round` FK, `camera_key` (the site/pole key; also an optional `installation` FK), **`assigned_to` (username), `assignment_seq`, `assigned_by`/`assigned_at` (for manual reassigns)**, `completed`, `completed_by`, `completed_at`, `notes`, `notes_updated_by`, `notes_updated_at`, `version`; unique on (round, camera_key)). Created by publish; it lives only in the shared DB and existing rows are never published over.
   - An inline Complete checkbox per row, with a "Complete x/y" counter.
   - Saves carry `version`, so concurrent edits produce a warning instead of an overwrite.
   - **Any signed-in user can tick Complete and edit Notes** (`readonly+`; user decisions 2026-10-27). Each change records who and when, so open access stays accountable.
@@ -288,6 +302,8 @@ User report: "DST audit page is taking a long time to load".
     - **After save:** update the cell's snippet and `data-notes-value`, then flash `highlight-success` for 1 s; on error, flash `highlight-error` for 2 s. A `version` conflict response shows the warning and keeps the modal text, so nothing typed is lost.
     - DST is already dark-themed (`color-scheme: dark`; `--ice-*` palette in `static/app.css`), so IMS's slate colors fit without re-theming.
 - **Accepted when:**
+  - **Assignment:** a publish into a new round assigns every camera; per-tech counts differ by at most 1 (per site type if balanced by type). Publishing another run into the round assigns only the new cameras and leaves existing assignments untouched. Re-publishing changes nothing. Unit tests cover the sequence math, the snapshot, idempotency and the backfill.
+  - **Filter:** "Mine" and `?tech=` show exactly that tech's cameras; counts match the header.
   - A check or note made in one browser shows in a second browser (a different user) after refresh.
   - A `readonly` user can tick Complete and edit notes. The modal's look and behavior match IMS's RA modal: side-by-side screenshot, plus ✕ and backdrop click save while Cancel discards.
   - Concurrent note edits produce the conflict warning.
@@ -323,6 +339,7 @@ LTI-only DST run on the camera VPN → VPN off → DE-only DST run → publish b
 - **I6 — resolved 2026-10-28:** the user opened 8443 in the Linode Cloud Firewall. From the laptop: `/accounts/login/` **200 in 0.18 s** ("Login — DST Camera Audit", "Sign in with IMS"); the cert is IMS's (`98:DB:…:05:E9`); signed-out `/` and `/media-db/…` → 302 to login; POST start/publish → 403; `/explorer/` → 403; IMS :443 `/healthz` 200. Previously **open, blocked Phase 4 acceptance:** inbound TCP 8443 to `45.79.220.29` is dropped (timeout from outside; the service is healthy on the box). **Resolution (operator):** `sudo ufw allow 8443/tcp` and/or allow 8443 in the Linode Cloud Firewall.
 
 ## Open questions
+- **Q2 (2026-10-28):** reviewer username `carthur` (signed-in user) vs `caruthur` (as written)? Balance assignments per site type (LTI/DE)? Allow manual reassign from the review page?
 None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes.)
 
 ## Checklist
@@ -335,7 +352,7 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Phase 4 — review instance on the IMS Linode :8443 (incl. I3 reviewer reachability) (accepted 2026-10-28)
 - [x] Phase 5 — one-page review per round (accepted 2026-10-28)
 - [x] I7 — review-instance stalls: Supavisor stranded connections; fixed with a direct DB connection (`5dc4d8c`); confirmed by the user + 0 watchdog dumps
-- [ ] Phase 6 — shared Complete checkbox + Notes (notes editable by anyone signed in, IMS RA-modal style)
+- [ ] Phase 6 — reviewer assignment (x % n by arrival order, stored) + tech filter + shared Complete checkbox + Notes (IMS RA-modal style)
 - [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
 - [x] I4 — CBW plan's cameras.0006 schema committed (`dbe111e`) and redeployed; model = Supabase (38/38 columns)
 - [x] I6 — inbound 8443 opened (Linode Cloud Firewall); reachable from the laptop
