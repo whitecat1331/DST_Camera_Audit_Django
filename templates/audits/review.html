@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% load media_tags %}
+{% block title %}Review{% if current %} — {{ current.name }}{% endif %} — DST Camera Audit{% endblock %}
+{% block container_class %}wide{% endblock %}
+{% block content %}
+<div class="browse-head">
+  <div>
+    <h1>DST Audit Review</h1>
+    <p class="lede">
+      One row per camera in the round, using its newest capture. Device time is the
+      FX clock read from OvrC; it should match Eastern time at the moment it was read.
+      Drift of {{ drift_flag_minutes }}+ minutes is flagged.
+    </p>
+  </div>
+  {% if rounds %}
+  <form class="review-round-picker" method="get" onchange="window.location = this.round.value">
+    <label for="review-round">Round</label>
+    <select id="review-round" name="round">
+      {% for r in rounds %}
+      <option value="{% url 'review_round_pk' pk=r.pk %}" {% if r.pk == current.pk %}selected{% endif %}>{{ r.name }}</option>
+      {% endfor %}
+    </select>
+  </form>
+  {% endif %}
+</div>
+
+{% if not current %}
+<p class="lede muted">No audit rounds have been published yet.</p>
+{% else %}
+<div class="dst-stats review-stats">
+  <div class="dst-stat"><span class="dst-stat-n">{{ summary.cameras }}</span><span class="dst-stat-l">cameras</span></div>
+  <div class="dst-stat"><span class="dst-stat-n">{{ summary.lti }}</span><span class="dst-stat-l">LTI</span></div>
+  <div class="dst-stat"><span class="dst-stat-n">{{ summary.de }}</span><span class="dst-stat-l">DE</span></div>
+  <div class="dst-stat {% if summary.drift %}is-warn{% endif %}"><span class="dst-stat-n">{{ summary.drift }}</span><span class="dst-stat-l">drift flagged</span></div>
+  <div class="dst-stat {% if summary.failed %}is-danger{% endif %}"><span class="dst-stat-n">{{ summary.failed }}</span><span class="dst-stat-l">failed</span></div>
+</div>
+
+<nav class="review-filters" aria-label="Filter cameras">
+  {% for f in filters %}
+  <a href="?show={{ f }}" class="btn-secondary {% if f == show %}is-active{% endif %}" {% if f == show %}aria-current="true"{% endif %}>
+    {% if f == "all" %}All{% elif f == "failed" %}Failed{% elif f == "drift" %}Drift flagged{% else %}{{ f|upper }}{% endif %}
+  </a>
+  {% endfor %}
+</nav>
+
+<div class="table-scroll">
+  <table class="data-table review-table">
+    <thead>
+      <tr>
+        <th>Camera</th>
+        <th>Status</th>
+        <th>Captures</th>
+        <th>Device time (OvrC)</th>
+        <th>Eastern at read</th>
+        <th>Drift</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr class="{% if row.failed %}is-failed{% endif %} {% if row.drift_flagged %}is-drift{% endif %}">
+        <td class="review-camera">
+          {% if row.installation %}
+          <a href="{% url 'camera_detail' pk=row.installation.pk %}"><strong>{{ row.installation.identifier|default:row.key }}</strong></a>
+          <div class="muted">Pole {{ row.installation.pole_number|default:"—" }} · {{ row.installation.agency|default:"—" }}{% if row.installation.state %}, {{ row.installation.state }}{% endif %}</div>
+          {% else %}
+          <strong>{{ row.key }}</strong>
+          <div class="muted">No matching installation</div>
+          {% endif %}
+          {% if row.kind %}<span class="badge kind-{{ row.kind }}">{{ row.kind|upper }}</span>{% endif %}
+        </td>
+        <td>
+          <a href="{% url 'audit_detail' pk=row.job.pk %}" class="badge status-{{ row.job.status }}">{{ row.job.get_status_display }}</a>
+          {% if row.attempts > 1 %}<div class="muted">newest of {{ row.attempts }} runs</div>{% endif %}
+          {% if row.job.error_message %}<div class="review-error">{{ row.job.error_message|truncatechars:160 }}</div>{% endif %}
+        </td>
+        <td>
+          <div class="review-captures">
+            {% for c in row.captures %}
+            <figure class="review-capture">
+              <button type="button" class="thumb-btn" data-full="{{ c.shot.image.url }}" title="{{ row.key }} — {{ c.key }}">
+                <img src="{{ c.shot.image|thumb_src }}" alt="{{ c.key }} capture" loading="lazy">
+              </button>
+              <figcaption>{{ c.key }} <span class="muted">{{ c.shot.created_at|date:"H:i T" }}</span></figcaption>
+            </figure>
+            {% empty %}
+            <span class="muted">No captures</span>
+            {% endfor %}
+          </div>
+        </td>
+        <td class="review-time">
+          {% if row.job.ovrc_local_time_raw %}
+          {{ row.job.ovrc_local_time_raw }}
+          {% if row.job.ovrc_fx %}<div class="muted">{{ row.job.ovrc_fx }}</div>{% endif %}
+          {% elif row.kind == "lti" %}
+          <span class="muted">Read the CBW capture</span>
+          {% else %}
+          <span class="muted">—</span>
+          {% endif %}
+        </td>
+        <td class="review-time">{{ row.eastern_at_read|default:"—" }}</td>
+        <td class="review-drift">
+          {% if row.drift_minutes is not None %}
+          <span class="{% if row.drift_flagged %}drift-flag{% else %}drift-ok{% endif %}">{% if row.drift_minutes > 0 %}+{% endif %}{{ row.drift_minutes }} min</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="6" class="muted">No cameras match this filter.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<dialog id="thumb-modal" class="thumb-modal">
+  <form method="dialog"><button class="modal-close" value="close" aria-label="Close">×</button></form>
+  <img id="thumb-modal-img" alt="Capture preview">
+</dialog>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  const modal = document.getElementById("thumb-modal");
+  const modalImg = document.getElementById("thumb-modal-img");
+  if (!modal || !modalImg) return;
+  document.querySelectorAll(".thumb-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      modalImg.src = btn.dataset.full || "";
+      modalImg.alt = btn.title || "Capture preview";
+      modal.showModal();
+    });
+  });
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.close(); });
+})();
+</script>
+{% endblock %}

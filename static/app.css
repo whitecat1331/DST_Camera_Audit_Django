@@ -1307,3 +1307,24 @@ a.icon-btn {
   .device-layer { border-right: none; }
   .explorer-layout.has-preview { grid-template-columns: 1fr; }
 }
+
+/* DST audit review (one row per camera) */
+.review-round-picker { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.85rem; color: var(--muted); }
+.review-stats { margin-bottom: 1rem; }
+.dst-stat.is-warn .dst-stat-n { color: var(--warn); }
+.dst-stat.is-danger .dst-stat-n { color: var(--danger); }
+.review-filters { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+.review-filters .is-active { border-color: var(--ice-bright); color: var(--ice-bright); }
+.review-table td { vertical-align: top; }
+.review-table tr.is-failed td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
+.review-table tr.is-drift:not(.is-failed) td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+.review-camera .badge { margin-top: 0.35rem; }
+.review-captures { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.review-capture { margin: 0; width: 132px; }
+.review-capture img { width: 132px; height: 88px; object-fit: cover; display: block; border: 1px solid var(--line); }
+.review-capture figcaption { font-size: 0.75rem; margin-top: 0.2rem; }
+.review-time { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.review-drift { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.drift-flag { color: var(--warn); font-weight: 700; }
+.drift-ok { color: var(--ok); }
+.review-error { color: var(--danger); font-size: 0.8rem; margin-top: 0.3rem; max-width: 22rem; }

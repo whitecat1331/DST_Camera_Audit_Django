@@ -1,6 +1,6 @@
 from django.urls import path
 
-from audits import views
+from audits import review_views, views
 
 urlpatterns = [
     path("", views.audit_list, name="audit_list"),
@@ -8,6 +8,8 @@ urlpatterns = [
     path("dst/start/", views.start_dst_audit, name="dst_audit_start"),
     path("dst/recent/", views.dst_recent_audits, name="dst_recent_audits"),
     path("dst/publish/", views.publish_dst, name="dst_publish"),
+    path("review/", review_views.review_round, name="review_round"),
+    path("review/<int:pk>/", review_views.review_round, name="review_round_pk"),
     path("confirm-captures/", views.confirm_captures_page, name="confirm_captures"),
     path(
         "confirm-captures/preview/",
