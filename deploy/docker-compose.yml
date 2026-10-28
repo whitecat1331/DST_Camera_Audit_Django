@@ -12,8 +12,10 @@ services:
     # Run as the host's deploy user (owner of IMS's cert/key) so the mounted
     # key stays readable once it is tightened to 0600 (it is 0666 today).
     user: "1000:1000"
-    ports:
-      - "8443:8443"
+    # Host networking: the direct Supabase connection is IPv6-only, and Docker's
+    # default bridge has no IPv6 (enabling it needs root). gunicorn binds :8443
+    # on the host itself; IMS keeps 80/443.
+    network_mode: host
     # IMS shares this 2 GB box; DST can never starve it.
     mem_limit: 512m
     environment:
@@ -21,12 +23,13 @@ services:
       DJANGO_DEBUG: "false"
       DJANGO_ALLOWED_HOSTS: 45.79.220.29
       DJANGO_CSRF_TRUSTED_ORIGINS: https://45.79.220.29:8443
-      # Shared Supabase DB via Supavisor transaction mode (6543). Not session
-      # mode: there each kept-alive gunicorn thread (CONN_MAX_AGE) pins a server
-      # connection, and the project's small pool was exhausted — new queries
-      # queued for minutes (I7). In transaction mode idle clients hold none.
-      DB_HOST: aws-1-ca-central-1.pooler.supabase.com
-      DB_PORT: "6543"
+      # Shared Supabase DB over the DIRECT Postgres connection, not Supavisor:
+      # from this Linode, ~1 in 8 pooler connections (both nodes, both pooler
+      # modes) stopped receiving replies for 17 s to minutes (I7); the direct
+      # host had 0 stalls in the same test. db_user secret = "postgres" here.
+      # DB_HOST = db.<project-ref>.supabase.co, set in ~/dst_camera_audit/.env.
+      DB_HOST: ${DB_HOST:?set DB_HOST in ~/dst_camera_audit/.env}
+      DB_PORT: "5432"
       DB_NAME: postgres
       DB_SSLMODE: verify-full
       DB_SSLROOTCERT: certs/supabase_ca.crt
