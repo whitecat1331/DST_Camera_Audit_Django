@@ -1,11 +1,11 @@
-# Initial plan — Unattended scheduled DST audit on a pre-connected VPN
+# Plan of action — Unattended scheduled DST audit on a pre-connected VPN (2026-10-28)
 
 Discussed: 2026-10-28, in the DST shared-review thread.
 - The user asked: "when I select all eligible, my DST project knows how to route the traffic if it is a VPN call or not … set this as a schedule … let it run over night, so it can't require human intervention."
 - Then: "We have to use the option that doesn't require IT intervention."
 - Then: "MFA yes it does for the initial connection. I am thinking I connect to the VPN before and then DST will route traffic accordingly instead of initiating the connection. Schedule, one time fire at a specific time according to the time set on the local device."
 
-Stage: plan
+Stage: in progress (promoted 2026-10-28: the user said "It will be remote over vpn … Update the plan and start implementation")
 Related:
 - plans/in-progress-plans/DST_AUDIT_SHARED_REVIEW.md (publish + assignment + review; its "Final acceptance — a real audit day" is the manual version of this plan's final acceptance)
 - in-progress-plans/CBW_FIRMWARE_INVENTORY_REPORT.md (no overlap; also probes CBWs over the camera VPN)
@@ -92,9 +92,11 @@ Throwaway code in `tmp/`; it never ships. Answers two questions:
 - **Hard limit:** the user connects the VPN (MFA) for the test.
 
 ### Phase 1 — Network detector + VPN-half/direct-half run (gated)
-1. `services/netstate.py` (probes, classification) and a single table of the network each step needs.
-2. Refactor `_run_dst_audit` into the VPN half → release → direct half, ordered by the Phase 0 matrix. The boot waits follow the power-on groups.
-3. The release step: programmatic disconnect if Phase 0 said yes; otherwise the held-publish state.
+Per the Phase 0 matrix: LTI relays + captures need the camera network; OvrC works both ways; TeamViewer (DE) and publish need the VPN off.
+1. `services/netstate.py`: reachability probes (camera network = a selected LTI CBW :80 answers; direct = the shared DB answers), VPN detection (`openvpn.exe` running) and `release_vpn()` (force-close `wgsslvpnc.exe`, then `signal SIGTERM` on the OpenVPN management port, default 127.0.0.1:1337, then wait for the tunnel to go).
+2. With `DST_NETWORK_PHASES` on, `_run_dst_audit` runs: power-on (LTI relays only if the camera network answers; DE via OvrC) → boot wait → **LTI captures** → **release** → **DE captures** → OvrC time pass. Camera network down at start → LTI skipped and reported.
+3. Optional publish round on the start request; after the run finishes, publish waits for the shared DB (held publish, "waiting for VPN off") and publishes into the round. This is Phase 2 folded in, because Phase 0 showed DST can release the VPN.
+3a. I2 fix: TeamViewer windows open before the connect are never taken as the new session's window.
 4. A setting `DST_NETWORK_PHASES` (off until accepted). With it off, behavior is exactly as today.
 5. Progress shows the current network.
 - **Accepted when:**
@@ -102,7 +104,7 @@ Throwaway code in `tmp/`; it never ships. Answers two questions:
   - a **live small run** from the button (VPN connected by the user, 2 LTI + 2 DE) completes with no manual action between halves and is published to a test round visible on :8443 (or held, then auto-published when the user disconnects);
   - the existing tests still pass.
 
-### Phase 2 — Held publish + auto-publish on VPN off (gated; folded into Phase 1 if Phase 0 shows DST can always release)
+### Phase 2 — Held publish + auto-publish on VPN off (folded into Phase 1: Phase 0 showed DST can release the VPN; the held state is the publish step waiting for the shared DB)
 1. A pending-publish record.
 2. A watcher (a short Task Scheduler repeat, or the DST process) that publishes as soon as the state is `direct`.
 3. The dashboard shows "waiting for VPN off".
@@ -136,7 +138,7 @@ The review instance learns about a publish without a refresh. Publish writes to 
 2. At the set local time DST runs all eligible sites, releases the VPN (or holds the publish), and publishes to the round, assigned to carthur/jgreene/ployd.
 3. An open review page on :8443 shows the new results without a refresh, and the reviewers work it the next morning.
 
-## Phase 0 results (2026-10-28, the user on the VPN, then released by DST) — spike run, not yet reviewed by the user
+## Phase 0 results (2026-10-28, the user on the VPN, then released by DST) — accepted by the user's direction to implement (2026-10-28); Q4 moved to final acceptance
 - **Reachability matrix** (`tmp/spike/matrix.py`):
 
   | Dependency | VPN on | VPN off (office Wi-Fi 10.100.30.0/24) |
@@ -165,23 +167,24 @@ The review instance learns about a publish without a refresh. Publish writes to 
 - **Housekeeping:** spike retry job 176/177 was orphaned when its tool call was interrupted (stopped at 15:00:02), and was cancelled by hand. All spike jobs (174/175, 176/177, 178/179) are local only; none were published.
 
 ## Issue digest
-- **I1 — open: LTI may not need the VPN at all on the office network.** From office Wi-Fi with the VPN off, every LTI CBW/VNC probe succeeded (routed through 10.100.60.x). If the overnight run happens on the office network, the run needs **no VPN and no switching**, and the VPN half/release only matters when the laptop is remote. **Ask the user** where the laptop runs overnight. Then confirm it with a full one-site LTI capture off the VPN (CBW web login + VNC screenshot, not just TCP).
-- **I2 — open: an on-VPN DE capture used a window titled "FX1361 L2" for FX1260 L1** (job 174/175). Off the VPN the title was correct. Possibly a stale or mis-matched TeamViewer window was captured. It moot if DE stays off the VPN, but `_resolve_capture_window` should refuse a window whose title names a different FX; check whether job 175's `de_l1.png` shows FX1260.
+- **I1 — resolved 2026-10-28 (user): the laptop runs remote, over the VPN** ("It will be remote over vpn; that is why we have to do this"). Office Wi-Fi reaching LTI without the VPN doesn't apply. The run is LTI on the VPN → DST releases the VPN → DE + publish direct. Detection is by reachability, so a run that happens to be on the office network still works (cameras reachable, nothing to release).
+- **I2 — open, fixed in Phase 1: an on-VPN DE capture used a window titled "FX1361 L2" for FX1260 L1** (job 174/175). Off the VPN the title was correct. A TeamViewer session window left open from earlier was taken as the new session's window, because the session finder accepts any `"<host> - TeamViewer"` window. Fix: windows that existed before the connect are excluded from the new session's window search. Resolved when the unit test passes and the Phase 1 live run's DE titles match their FX.
 
 ## Open questions
 - ~~Q1 — MFA~~ — **resolved 2026-10-28 (user):** yes, on the initial connection. The user pre-connects the VPN, and DST never connects it.
 - ~~Q3 — schedule~~ — **resolved 2026-10-28 (user):** a one-time fire at a set time on the device's local clock.
 - ~~Q2 — which machine~~ — **resolved 2026-10-28 (user):** **this laptop**. It must stay plugged in, signed in, unlocked and awake, because a locked screen stops the DE (TeamViewer) captures. **When the run finishes, the results must update the review page on the Linode automatically.** That means publish runs at the end of every scheduled run (Phase 1/2), and open review pages learn about the new cameras (Phase 5).
-- **Q4 — the 8 h renegotiation** — **user: "we just need to test it to find out."** Phase 0 includes a long-connection observation: connect, leave the VPN idle past 8 h, and record whether it stays up or re-prompts MFA. That sets the maximum gap between connecting and the fire time.
+- **Q4 — the 8 h renegotiation** — **user: "we just need to test it to find out."** Not observed in Phase 0; the user directed implementation to start (2026-10-28), so the observation moves to the final acceptance (connect in the evening, fire > 8 h later is avoided until it's observed; the run logs the VPN state at fire time). Phase 0 includes a long-connection observation: connect, leave the VPN idle past 8 h, and record whether it stays up or re-prompts MFA. That sets the maximum gap between connecting and the fire time.
 - ~~Q5 — round per run~~ — **resolved 2026-10-28 (user):** "the audit will include both for now". **One run covers LTI + DE and publishes into one new round** (default name `DST audit {local date}`, editable on the schedule).
 
 ## Status
-open — not started. Stage `plan`; revised 2026-10-28 for MFA (the user pre-connects the VPN), the one-time schedule, this laptop, one LTI+DE round per run, and live pickup on the review page.
+in progress — Phase 0 accepted (matrix + release answered; Q4 carried to final acceptance by the user's direction). Phase 1 (with Phase 2 folded in) being implemented 2026-10-28.
 
 ## Checklist
-- [ ] Phase 0 — spike: reachability matrix on/off VPN + can DST release the WatchGuard VPN (yes/no with evidence)
+- [x] Phase 0 — spike: reachability matrix on/off VPN + can DST release the WatchGuard VPN (yes, evidence above; Q4 carried to final acceptance)
 - [ ] Phase 1 — network detector + VPN half → release → direct half, live small run with no manual action between halves, accepted
-- [ ] Phase 2 — held publish + auto-publish on VPN off, accepted (or folded per Phase 0)
+- [x] Phase 2 — folded into Phase 1 (Phase 0: DST can release the VPN)
+- [ ] I2 — stale TeamViewer window guard, verified in the Phase 1 live run
 - [ ] Phase 3 — one-time local-time schedule via Task Scheduler, fires unattended, accepted
 - [ ] Phase 4 — preflight + morning report, accepted
 - [ ] Phase 5 — review page picks up newly published results live, accepted
