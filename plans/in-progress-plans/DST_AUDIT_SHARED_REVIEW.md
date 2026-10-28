@@ -391,6 +391,6 @@ None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes
 - [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
 
 ## Status
-in progress — 13/16. Phases 0–5 accepted; I1–I4, I6, I7 resolved; I5 (IMS key 0666) open outside this plan. Next: Phase 6 (shared Complete checkbox + Notes).
+in progress — 13/16. Phases 0–5 accepted. Phase 6 is built and deployed (assignment, filters, Complete/Notes, live SSE) and awaits the user's acceptance. I1–I4, I6, I7 resolved; I5 (IMS key 0666) open outside this plan. Next: Phase 6 acceptance, then the final real-audit-day acceptance.
 
 `Superseded by:` —
