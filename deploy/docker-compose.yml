@@ -21,9 +21,13 @@ services:
       DJANGO_DEBUG: "false"
       DJANGO_ALLOWED_HOSTS: 45.79.220.29
       DJANGO_CSRF_TRUSTED_ORIGINS: https://45.79.220.29:8443
-      # Shared Supabase DB — transaction pooler (same shape as IMS).
+      # Shared Supabase DB via Supavisor **session** mode (5432), not transaction
+      # mode (6543): in transaction mode some queries were stranded inside the
+      # pooler (sent and ACKed, never reached Postgres, no reply), hanging a
+      # gunicorn thread for minutes (I7). Session mode pins each kept-alive
+      # client connection (CONN_MAX_AGE) to one server connection; 8 threads.
       DB_HOST: aws-1-ca-central-1.pooler.supabase.com
-      DB_PORT: "6543"
+      DB_PORT: "5432"
       DB_NAME: postgres
       DB_SSLMODE: verify-full
       DB_SSLROOTCERT: certs/supabase_ca.crt
