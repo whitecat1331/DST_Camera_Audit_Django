@@ -136,8 +136,37 @@ The review instance learns about a publish without a refresh. Publish writes to 
 2. At the set local time DST runs all eligible sites, releases the VPN (or holds the publish), and publishes to the round, assigned to carthur/jgreene/ployd.
 3. An open review page on :8443 shows the new results without a refresh, and the reviewers work it the next morning.
 
+## Phase 0 results (2026-10-28, the user on the VPN, then released by DST) — spike run, not yet reviewed by the user
+- **Reachability matrix** (`tmp/spike/matrix.py`):
+
+  | Dependency | VPN on | VPN off (office Wi-Fi 10.100.30.0/24) |
+  |---|---|---|
+  | LTI CBW `10.3.38.177`, `10.6.59.177` :80 | OK | **OK** (traceroute via 10.100.30.1 → 10.100.60.10/.80 → camera, 5 hops) |
+  | LTI VNC lanes :5900 | OK (266059 lane 2 timed out both ways: probably no lane 2) | OK |
+  | Supabase pooler 6543 / 5432 | **blocked** | OK |
+  | Review site :8443 | **blocked** | OK |
+  | OvrC (HTTPS) | OK | OK |
+  | TeamViewer 5938 | **blocked** (falls back to 443; the client reports online) | OK |
+  | IMS :443 | OK | OK |
+- **DE on the VPN: unreliable (user: "the VPN cannot sustain a connection over TV, I've ran into this before").** One-site DE audit 266007 (job 174):
+  - L1 captured, but in a window titled **"FX1361 L2"**, so it is possibly the wrong session;
+  - **L2 failed both 70 s connect tries**;
+  - OvrC OK (−35 s).
+
+  **Off the VPN (job 178): both lanes OK in 152 s**, with correct window titles; L2 connected in 10 s; OvrC −51 s. → **DE always runs off the VPN.**
+- **DST can release the VPN unattended, with no admin and no MFA:**
+  - The WatchGuard tray app (`wgsslvpnc.exe`) ignores a normal close: no main window; a polite `taskkill` was a no-op.
+  - Force-closing it (user process) leaves the tunnel up (`openvpn.exe` runs under the `wgsslvpnsrc` service) but frees OpenVPN's management socket **`127.0.0.1:1337`** (no password; banner `>INFO:OpenVPN Management Interface Version 1`; one client at a time, so it was queued while the app held it).
+  - `signal SIGTERM` over it → `SUCCESS: signal SIGTERM thrown` → within 6 s the TAP adapter is disconnected, the `0.0.0.0/1` + `128.0.0.0/1` routes are gone, `openvpn` has exited, and the default route is back on Wi-Fi.
+  - Supabase, :8443 and TeamViewer 5938 are then reachable.
+  - Client: OpenVPN 2.4.12. The Firebox itself pushes `redirect-gateway def1, block-outside-dns`.
+  - **Side effect:** the WatchGuard tray app is closed afterwards, and the user re-opens it to connect next time (MFA).
+- **8 h renegotiation (Q4): not yet observed.** Needs a long connection.
+- **Housekeeping:** spike retry job 176/177 was orphaned when its tool call was interrupted (stopped at 15:00:02), and was cancelled by hand. All spike jobs (174/175, 176/177, 178/179) are local only; none were published.
+
 ## Issue digest
-None yet.
+- **I1 — open: LTI may not need the VPN at all on the office network.** From office Wi-Fi with the VPN off, every LTI CBW/VNC probe succeeded (routed through 10.100.60.x). If the overnight run happens on the office network, the run needs **no VPN and no switching**, and the VPN half/release only matters when the laptop is remote. **Ask the user** where the laptop runs overnight. Then confirm it with a full one-site LTI capture off the VPN (CBW web login + VNC screenshot, not just TCP).
+- **I2 — open: an on-VPN DE capture used a window titled "FX1361 L2" for FX1260 L1** (job 174/175). Off the VPN the title was correct. Possibly a stale or mis-matched TeamViewer window was captured. It moot if DE stays off the VPN, but `_resolve_capture_window` should refuse a window whose title names a different FX; check whether job 175's `de_l1.png` shows FX1260.
 
 ## Open questions
 - ~~Q1 — MFA~~ — **resolved 2026-10-28 (user):** yes, on the initial connection. The user pre-connects the VPN, and DST never connects it.
