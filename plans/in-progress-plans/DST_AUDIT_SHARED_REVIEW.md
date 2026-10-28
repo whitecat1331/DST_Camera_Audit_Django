@@ -224,6 +224,19 @@ Directed by the user ("provision the linode instance"), using the `access-replac
 - **I7 — open, blocks Phase 5 acceptance:** intermittent request stalls on the review instance. The review page took **12.7 s cold** and **132.4 s once** server-side (`?show=drift`); `/cameras/` took 81.4 s once earlier. Not reproduced under steady load (32 requests from 4 threads: median 251 ms, max 1.2 s, connects ~208 ms). Postgres is healthy (16/90 backends, no idle-in-transaction, no long queries), so the stall sits between the container and Supavisor. **Hypothesis:** persistent connections (`CONN_MAX_AGE=300`) silently dropped while idle, so the next query hangs until TCP retransmission gives up (~2 min) and Django's health check reconnects. Being tested: idle 60/180/360 s, with and without libpq TCP keepalives.
 - Side finding: Postgres shows **PostgREST running** (`authenticator`), so the Supabase Data API is still enabled. The tables stay locked by `lock_shared_db` (0/21 exposed), but turning the Data API off in the dashboard is still recommended.
 
+#### I7 investigation log (2026-10-28) — still open
+User report: "DST audit page is taking a long time to load".
+- **Reproduced once:** of three `/audits/dst/` requests through gunicorn, #1 and #3 took ~1.3 s and **#2 hung past the 60 s client timeout and was never logged** (still in flight server-side). The same thread-blocking pattern explains 12.7 s / 132 s / 81 s earlier: each stall holds one of the 8 gunicorn threads (2 workers × 4).
+- **Ruled out, with evidence:**
+  - *Postgres:* 16/90 backends, no idle-in-transaction, no long queries.
+  - *Idle-dropped pooler connections:* a first query after 60/180/360 s idle took 32–35 ms with or without TCP keepalives.
+  - *DNS:* `getaddrinfo` A+AAAA 2–32 ms in the container (Docker 127.0.0.11 → Linode resolvers).
+  - *gunicorn TLS handshake blocked by idle sockets:* two idle TCP connections to :8443 did not slow requests (13–23 ms).
+  - *Synthetic load:* 25 sequential mixed requests (no hang) and 32 requests from 4 threads (median 251 ms, max 1.2 s).
+- **Observation:** while #2 hung, the container had **no** TCP connection to the pooler, so the stuck thread was not waiting on a DB socket.
+- **Cold start (separate, smaller):** the first `/audits/dst/` after a restart takes ~11 s through gunicorn (in-process test client cold: ~0.8 s). Not yet explained.
+- **Instrumentation deployed (`a3503a1`, `d398352`):** with `DST_DUMP_STACKS=1` (on in `deploy/docker-compose.yml`), `config/wsgi.py` (a) registers faulthandler on `SIGRTMIN+1` and (b) runs a watchdog that dumps every thread's stack once when a request runs > `DST_STUCK_SECONDS` (20). Find it with `docker compose logs dst | grep -A80 "\[STUCK\]"`. Next: let real browser use hit a hang, then read the dump.
+
 ### Phase 6 — Shared Complete checkbox + Notes (gated)
 - **Work:**
   - An `InstallationAuditReview` model (`round` FK, `installation` FK, `completed`, `completed_by`, `completed_at`, `notes`, `notes_updated_by`, `notes_updated_at`, `version`; unique on (round, installation)). It lives only in the shared DB and is never published over.
