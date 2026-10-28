@@ -147,7 +147,11 @@ class NetworkPhaseOrderTests(TestCase):
             mock.patch.object(runner, "_dst_site_kind", side_effect=lambda s: s.kind),
             mock.patch.object(runner, "_dst_site_key", side_effect=lambda s: s.key),
             mock.patch.object(runner, "_power_on_lti_site", side_effect=lti_power),
-            mock.patch.object(runner, "_power_on_all_de_sites", return_value=(2, False, [])),
+            mock.patch.object(
+                runner,
+                "_power_on_all_de_sites",
+                side_effect=lambda job_id, sites: self.events.append("ovrc dcam on") or (len(sites), False, []),
+            ),
             mock.patch.object(runner, "_dst_camera_network_up", return_value=camera_up),
             mock.patch.object(runner, "_dst_release_vpn", side_effect=release),
             mock.patch.object(runner, "_run_dst_site_capture", side_effect=capture),
@@ -155,30 +159,30 @@ class NetworkPhaseOrderTests(TestCase):
         ):
             return runner._run_dst_audit(self.parent.pk, runner.Path(MEDIA) / "run")
 
-    @override_settings(DST_NETWORK_PHASES=True)
-    def test_lti_then_release_then_de(self):
+    def test_lti_half_then_release_then_de_half_never_interleaved(self):
         errors, ok = self.run_audit()
         self.assertEqual(ok, 4)
         self.assertEqual(errors, [])
-        captures = [e for e in self.events if not e.startswith("relay")]
-        self.assertEqual(captures, ["capture L1", "capture L2", "release", "capture D1", "capture D2", "ovrc"])
+        # DE power-on (OvrC) waits until the VPN is gone, like the DE captures.
+        self.assertEqual(
+            self.events[2:],
+            ["capture L1", "capture L2", "release", "ovrc dcam on", "capture D1", "capture D2", "ovrc"],
+        )
+        self.assertEqual(sorted(self.events[:2]), ["relay L1", "relay L2"])
 
-    @override_settings(DST_NETWORK_PHASES=True)
     def test_camera_network_down_skips_lti_and_reports(self):
         errors, ok = self.run_audit(camera_up=False)
         self.assertEqual(ok, 2)
         self.assertIn("LTI skipped (2 site(s))", errors[0])
         self.assertEqual(
-            self.events, ["release", "capture D1", "capture D2", "ovrc"]
+            self.events, ["release", "ovrc dcam on", "capture D1", "capture D2", "ovrc"]
         )  # no relays, no LTI captures
 
-    @override_settings(DST_NETWORK_PHASES=True)
     def test_failed_release_is_a_warning_and_de_still_runs(self):
         errors, ok = self.run_audit(released=False)
         self.assertEqual(ok, 4)
         self.assertEqual(errors, ["VPN release failed (x); DE captures ran on the VPN"])
 
-    @override_settings(DST_NETWORK_PHASES=True)
     def test_lti_only_run_that_publishes_releases_at_the_end(self):
         self.sites = [s for s in self.sites if s.kind == "lti"]
         self.run_audit(publish_round="R1")
@@ -188,12 +192,10 @@ class NetworkPhaseOrderTests(TestCase):
         self.run_audit()  # no publish round → VPN left alone
         self.assertNotIn("release", self.events)
 
-    @override_settings(DST_NETWORK_PHASES=False)
-    def test_off_keeps_todays_order(self):
+    def test_child_jobs_are_numbered_in_run_order(self):
         self.run_audit()
-        captures = [e for e in self.events if e.startswith("capture")]
-        self.assertEqual(captures, ["capture D1", "capture L1", "capture D2", "capture L2"])
-        self.assertNotIn("release", self.events)
+        children = AuditJob.objects.filter(parent_job=self.parent).order_by("pk")
+        self.assertEqual([c.pole_number for c in children], ["L1", "L2", "D1", "D2"])
 
 
 @override_settings(MEDIA_ROOT=MEDIA)

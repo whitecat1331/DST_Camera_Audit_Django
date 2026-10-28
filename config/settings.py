@@ -301,9 +301,6 @@ AUDIT_STEP_CONCURRENT = int(os.getenv("AUDIT_STEP_CONCURRENT", "3"))
 AUDIT_SLOT_WAIT_SECONDS = int(os.getenv("AUDIT_SLOT_WAIT_SECONDS", "300"))
 # After DST Audit turns cameras on, wait before starting captures (boot settle).
 DST_POWER_SETTLE_SECONDS = int(os.getenv("DST_POWER_SETTLE_SECONDS", "90"))
-# Unattended runs on the user's pre-connected camera VPN: LTI first, then DST
-# releases the VPN (it never connects it: MFA) for DE + publish. Off = as before.
-DST_NETWORK_PHASES = os.getenv("DST_NETWORK_PHASES", "false").lower() in ("1", "true", "yes")
 # WatchGuard openvpn.exe management port, used when netstat can't name it.
 DST_VPN_MGMT_PORT = int(os.getenv("DST_VPN_MGMT_PORT", "1337"))
 # How long a held publish waits for the shared DB (VPN off) before giving up.

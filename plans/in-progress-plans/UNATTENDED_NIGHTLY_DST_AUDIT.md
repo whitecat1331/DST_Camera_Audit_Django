@@ -94,10 +94,10 @@ Throwaway code in `tmp/`; it never ships. Answers two questions:
 ### Phase 1 — Network detector + VPN-half/direct-half run (gated)
 Per the Phase 0 matrix: LTI relays + captures need the camera network; OvrC works both ways; TeamViewer (DE) and publish need the VPN off.
 1. `services/netstate.py`: reachability probes (camera network = a selected LTI CBW :80 answers; direct = the shared DB answers), VPN detection (`openvpn.exe` running) and `release_vpn()` (force-close `wgsslvpnc.exe`, then `signal SIGTERM` on the OpenVPN management port, default 127.0.0.1:1337, then wait for the tunnel to go).
-2. With `DST_NETWORK_PHASES` on, `_run_dst_audit` runs: power-on (LTI relays only if the camera network answers; DE via OvrC) → boot wait → **LTI captures** → **release** → **DE captures** → OvrC time pass. Camera network down at start → LTI skipped and reported.
+2. `_run_dst_audit` always runs (I3): LTI relays (only if the camera network answers) → boot wait → **every LTI capture** → **release** → OvrC DCAM on for DE → boot wait → **every DE capture** → OvrC time pass. Camera network down at start → LTI skipped and reported.
 3. Optional publish round on the start request; after the run finishes, publish waits for the shared DB (held publish, "waiting for VPN off") and publishes into the round. This is Phase 2 folded in, because Phase 0 showed DST can release the VPN.
 3a. I2 fix: TeamViewer windows open before the connect are never taken as the new session's window.
-4. A setting `DST_NETWORK_PHASES` (off until accepted). With it off, behavior is exactly as today.
+4. ~~A setting `DST_NETWORK_PHASES` (off until accepted).~~ Removed 2026-10-28 (I3): the user wants this order always.
 5. Progress shows the current network.
 - **Accepted when:**
   - unit tests: phase order for each scope (all / lti / de); VPN down at start → LTI skipped and reported, DE + publish run; release fails → publish held;
@@ -169,6 +169,11 @@ The review instance learns about a publish without a refresh. Publish writes to 
 ## Issue digest
 - **I1 — resolved 2026-10-28 (user): the laptop runs remote, over the VPN** ("It will be remote over vpn; that is why we have to do this"). Office Wi-Fi reaching LTI without the VPN doesn't apply. The run is LTI on the VPN → DST releases the VPN → DE + publish direct. Detection is by reachability, so a run that happens to be on the office network still works (cameras reachable, nothing to release).
 - **I2 — open, fixed in Phase 1: an on-VPN DE capture used a window titled "FX1361 L2" for FX1260 L1** (job 174/175). Off the VPN the title was correct. A TeamViewer session window left open from earlier was taken as the new session's window, because the session finder accepts any `"<host> - TeamViewer"` window. Fix: windows that existed before the connect are excluded from the new session's window search. Resolved when the unit test passes and the Phase 1 live run's DE titles match their FX.
+- **I3 — fixed, awaiting the live rerun: the first Phase 1 live run (job 180, 2026-10-28 15:49) ran the old interleaved order.** The user: "It should start with LTI, finish and disconnect VPN, then continue with DE. Not interleave or any other way." Evidence: the first child was DE 255039 (FX1173). Both lanes failed with "TeamViewer session failed" on the VPN, and the user cancelled the run. Two causes:
+  1. The new order sat behind `DST_NETWORK_PHASES`. It was added to `.env` at 15:42, but the serving runserver process (PID 15636) started at 15:37, and `.env` is only read at startup, so the flag was off.
+  2. Even with the flag on, the DE OvrC power-on still ran at the start, on the VPN. It timed out (15:50:23 `TimeoutException`).
+
+  Fix: the flag is removed, so the strict order is the only order. `_run_dst_audit` is now: LTI relays → boot wait → every LTI capture → release the VPN → OvrC DCAM on for DE → boot wait → every DE capture → OvrC time pass. It's split into `_dst_power_on_lti`, `_dst_settle`, `_dst_capture_half` and `_dst_capture_site`. The unit test asserts the exact event sequence and the child job order (L1, L2, D1, D2). Suite 128 OK. **Resolved when** the user's rerun shows that sequence live.
 
 ## Open questions
 - ~~Q1 — MFA~~ — **resolved 2026-10-28 (user):** yes, on the initial connection. The user pre-connects the VPN, and DST never connects it.
@@ -182,7 +187,7 @@ in progress — Phase 0 accepted (matrix + release answered; Q4 carried to final
 
 Phase 1 as built:
 - `services/netstate.py`: `camera_network_up`, `direct_up`, `vpn_up` (`openvpn.exe` running), `management_port` (netstat for openvpn's loopback listener, else `DST_VPN_MGMT_PORT`), `send_sigterm`, `release_vpn` (never raises; returns released + detail).
-- `audits/runner.py`: with `DST_NETWORK_PHASES` on, `_run_dst_audit` probes up to 3 selected LTI CBWs; down → LTI skipped and reported. Captures run LTI first; `_dst_release_vpn` runs before the first DE site (or at the end of an LTI-only run that publishes). A failed release is a warning and DE still runs.
+- `audits/runner.py`: `_run_dst_audit` probes up to 3 selected LTI CBWs; down → LTI skipped and reported. Captures run LTI first; `_dst_release_vpn` runs before the first DE site (or at the end of an LTI-only run that publishes). A failed release is a warning and DE still runs. (Order revised by I3: DE power-on now also waits for the release.)
 - Publish: an optional "Publish to round when done" field next to Start (stored in the run's selection file). After a successful run `_start_dst_auto_publish` runs `publish.publish_after_run` on its own non-daemon thread: a PUBLISH job that shows "Waiting for the VPN to be off to publish" until the shared DB answers (up to `DST_PUBLISH_WAIT_SECONDS`, 12 h), then publishes; on timeout it fails with how to publish by hand.
 - I2: `capture_dragoneye_via_teamviewer` records the session windows open before the connect and `_find_session_window` excludes them. Known limit: if TeamViewer refocuses an already-open window for the same ID instead of opening a new one, the connect now fails rather than capturing; DST closes each session after its capture, so this needs a leftover window for the same FX.
 
@@ -200,7 +205,7 @@ Phase 1 as built:
 - DE 266007 (FX1260, York VA; both lanes captured today), 255039 (FX1173, Whigham GA), 244127 (FX1071, Hollywood FL): Modem + both lane CPUs Up (244127 also two Axis cameras); 2 TeamViewer lanes each.
 - Recheck the statuses right before the run; PRTG changes.
 
-**Live run to accept Phase 1** (user): set `DST_NETWORK_PHASES=true` in `.env`, restart DST, connect the VPN (MFA), select 2 LTI + 2 DE, type a test round in "Publish to round when done", Start, and don't touch the laptop. Accepted when LTI captures happen on the VPN, the VPN drops by itself, both DE sites capture with titles matching their FX, and the round appears on :8443.
+**Live run to accept Phase 1** (user): connect the VPN (MFA), select 2 LTI + 2 DE, type a test round in "Publish to round when done", Start, and don't touch the laptop. Accepted when LTI captures happen on the VPN, the VPN drops by itself, both DE sites capture with titles matching their FX, and the round appears on :8443.
 
 
 

@@ -80,13 +80,14 @@
   </div>
 
   <ol class="dst-phases-legend">
-    <li><strong>1 · Power on</strong> — All selected sites first (LTI CBW relays in parallel; one OvrC login for every DE DCAM)</li>
-    <li><strong>2 · Settle</strong> — Wait {{ settle_seconds }}s for cameras to boot (skipped if everything was already on)</li>
-    <li><strong>3 · Capture</strong> — Per site: LTI CBW + VNC, or DE TeamViewer lanes</li>
-    <li><strong>4 · OvrC times</strong> — One OvrC pass for all FX local times (keeps ADT/EDT from the portal)</li>
+    <li><strong>1 · LTI, on the camera VPN</strong> — CBW relays on (parallel), wait {{ settle_seconds }}s to boot if any were off, then capture every LTI site (CBW + VNC)</li>
+    <li><strong>2 · Disconnect the VPN</strong> — DST drops your WatchGuard VPN (it never connects it)</li>
+    <li><strong>3 · DE, off the VPN</strong> — one OvrC login turns DCAM on, wait {{ settle_seconds }}s if any were off, then capture every DE site (TeamViewer lanes)</li>
+    <li><strong>4 · OvrC times</strong> — one OvrC pass for all FX local times (keeps ADT/EDT from the portal), then publish if a round is typed</li>
   </ol>
 
   {% if can_audit %}
+  <p class="muted">Connect the camera VPN before you start. DST runs every LTI site on the VPN, then disconnects it and runs every DE site.</p>
   <div class="dst-actions">
     <button type="button" class="btn-fire" id="dst-start-btn" disabled>
       {% if active_job %}DST Audit running…{% else %}Start DST Audit (0){% endif %}
@@ -106,9 +107,6 @@
     <button type="button" class="btn-secondary" id="dst-schedule-btn" disabled>Schedule (0)</button>
     <span class="muted">Laptop clock now: {{ device_now }}</span>
   </div>
-  {% endif %}
-  {% if network_phases %}
-  <p class="muted">Network phases on: LTI runs on your camera VPN, then DST disconnects the VPN for DE and publish. Connect the VPN before you start.</p>
   {% endif %}
   {% endif %}
   {% if can_schedule and schedules %}
@@ -999,9 +997,9 @@
       if (
         !confirm(
           `Start DST Audit for ${ids.length} selected site(s)?\n\n` +
-            `1) Power on ALL selected (LTI relays + one OvrC DCAM pass)\n` +
-            `2) Wait {{ settle_seconds }}s to boot (skipped if already on)\n` +
-            `3) Capture each site (CBW+VNC or TeamViewer)\n` +
+            `1) LTI on the camera VPN: relays on, boot wait, every LTI capture\n` +
+            `2) Disconnect the VPN\n` +
+            `3) DE off the VPN: OvrC DCAM on, boot wait, every TeamViewer capture\n` +
             `4) One OvrC pass for all device local times\n\n` +
             `You can cancel from this page.`
         )

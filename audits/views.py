@@ -951,7 +951,6 @@ def dst_audit_page(request):
             "recent_jobs": recent_rows,
             "settle_seconds": settle,
             "can_publish": can_publish,
-            "network_phases": settings.DST_NETWORK_PHASES,
             "can_schedule": can_audit and settings.DST_ROLE == "capture",
             "schedules": _dst_schedules(),
             "device_now": _device_now().strftime("%Y-%m-%d %H:%M %Z"),
