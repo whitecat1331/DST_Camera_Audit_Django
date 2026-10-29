@@ -187,6 +187,26 @@ The review instance learns about a publish without a refresh. Publish writes to 
 
   Candidate fix, not verified: set the tray's own `Global\wgsslvpnc_ExitEvent` (a graceful exit that should run its cleanup) instead of `taskkill /F`. After the release, check the Wi-Fi gateway and DNS, and stop with a clear message if they're broken. Needs a live test with the user on the VPN. **Resolved when** a release on home Wi-Fi leaves DNS and the internet working with no reboot.
 
+  **Spike, 2026-10-28 20:17, home Wi-Fi, VPN connected by the user** (`tmp/spike/graceful_release.py`). `SetEvent` on the tray's exit event led to the following:
+  - Within 1.3 s, `openvpn.exe` exited and the VPN's /1 routes were gone, while DNS, the router and `www.google.com:443` all still answered.
+  - The client log shows `Closing TUN/TAP interface`, then `Processing route filters … OK` (its own cleanup), then `Connection Closed.`
+  - Windows shows NETGEAR06 with Internet connectivity, with no reboot.
+  - The tray app stays open with no dialog.
+
+  **Fix built (`dbb2fc6`):**
+  - `release_vpn` signals the exit event and never force-closes the tray. It uses SIGTERM only when the tray isn't running.
+  - It waits up to 30 s for the tunnel to go, then up to 60 s for `internet_ok` (DNS plus HTTPS).
+  - A broken network after the release is flagged `network_ok=False`. The runner then skips the DE half with a clear message instead of failing every lane.
+  - Suite: 133 OK.
+
+  **Live check of the built code, 2026-10-28 20:36, home Wi-Fi, user connected.**
+  - Before: VPN up; tray running; internet OK; shared DB blocked.
+  - `release_vpn()` returned `ReleaseResult(released=True, detail='VPN released; internet OK', network_ok=True)` in 3.5 s.
+  - After: VPN down; tray still open; internet OK; shared DB answering.
+  - Client log: `EXITING,SIGTERM`, then `Processing route filters … OK`, then `Connection Closed.` Windows shows NETGEAR06 with Internet connectivity.
+
+  **I4 resolved** for the release itself. The next full run (Phase 1/3 acceptance) confirms it inside an audit.
+
 ## Open questions
 - ~~Q1 — MFA~~ — **resolved 2026-10-28 (user):** yes, on the initial connection. The user pre-connects the VPN, and DST never connects it.
 - ~~Q3 — schedule~~ — **resolved 2026-10-28 (user):** a one-time fire at a set time on the device's local clock.
@@ -226,7 +246,7 @@ Phase 1 as built:
 - [ ] Phase 1 — network detector + VPN half → release → direct half, live small run with no manual action between halves, accepted (implemented; unit tests pass; live run pending)
 - [x] Phase 2 — folded into Phase 1 (Phase 0: DST can release the VPN)
 - [ ] I2 — stale TeamViewer window guard, verified in the Phase 1 live run
-- [ ] I4 — VPN release must not break Wi-Fi (graceful tray exit + post-release network check), verified live on home Wi-Fi
+- [x] I4 — VPN release must not break Wi-Fi (graceful tray exit + post-release network check), verified live on home Wi-Fi 2026-10-28 20:36
 - [ ] Phase 3 — one-time local-time schedule via Task Scheduler, fires unattended, accepted (implemented ahead of Phase 1 by user direction; fire path checked live; real scheduled run pending)
 - [ ] Phase 4 — preflight + morning report, accepted
 - [ ] Phase 5 — review page picks up newly published results live, accepted
