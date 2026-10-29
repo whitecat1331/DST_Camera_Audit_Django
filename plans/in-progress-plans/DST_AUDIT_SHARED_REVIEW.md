@@ -1,0 +1,397 @@
+# Plan of action — DST Audit shared review (capture locally → publish to Supabase → one-page review with Complete + Notes) — 2026-10-27
+
+- `Discussed:` 2026-10-27 — chat with Patrick. The DST audit has to run on the operator's laptop because only it can reach the camera network (CBW `10.x.y.177`, VNC), but other people need to review the results as one list, mark each camera audited, and share notes.
+  - Options weighed: (A) an export bundle viewed in a separate app; (B) export/import pages inside DST; (C) local DST and the Linode DST sharing one Supabase database; (C′) **local capture into SQLite, then publish finished runs to Supabase; the Linode DST reviews from Supabase.**
+  - C was chosen first, then replaced by **C′** after Phase 0 proved the camera VPN blocks Postgres (I2) and IT won't open ports.
+- `Stage:` plan → promoted to `plans/in-progress-plans/` 2026-10-27, when the user directed the `.env` / settings work to start.
+- `Thread:` Claude Code session 2026-10-27 (DST audit shared review); not a Zed thread.
+- `Workspace:` `C:\Users\ployd\Desktop\DST_Camera_Audit`
+- `Related:` `in-progress-plans/CBW_FIRMWARE_INVENTORY_REPORT.md`, `in-progress-plans/AUGUST_REJECTIONS_CSV_REPORT.md` — no overlap or conflict. Both are report commands that keep running on the laptop's SQLite, which this plan does not move.
+
+## Problem
+
+- **Results are stuck on the laptop.** A DST fleet run is one `DST_AUDIT` `AuditJob` with one `DST_SITE` child per site (`audits/runner.py:2341`). Each child has `AuditScreenshot` rows whose images live on local disk under `media/audits/<job_id>/` (`audits/models.py:66`). The database is local SQLite. Nobody else can see a run.
+- **Reviewing means clicking through job by job.** There is no single list of installation → devices → captures → timestamps → device time.
+- **OvrC device time is not a real field.** It is packed into `AuditJob.progress_message` as `"OvrC FX1261: …"` and parsed back out of the string (`audits/runner.py:692`, `audits/runner.py:699`).
+- **Nowhere to record review state.** There is no shared "this camera has been audited" mark and no shared notes.
+- **Network constraint (proven in Phase 0):** the camera VPN blocks outbound Postgres, so the laptop can reach Supabase **only with the VPN off**.
+- **Scale today:** `media/audits` holds 556 images, 603 MB, median 1.4 MB each (full-size PNGs), measured 2026-10-27.
+
+## Decisions made
+
+| Decision | Choice |
+|---|---|
+| Data flow | **The laptop always captures into local SQLite** (VPN on or off). After the runs, with the VPN off, **"Publish to shared DB"** copies finished runs to Supabase. **Only the Linode DST reads and writes Supabase** (review page, Complete, Notes). |
+| Audit day | 1) VPN **on**: DST Audit with **LTI only** (CBW + VNC). 2) VPN **off**: DST Audit with **DE only** (TeamViewer + OvrC over the internet; `services/teamviewer_capture.py` and `services/ovrc_capture.py` have no `10.x`/camera-network dependency). 3) VPN off: publish both runs into one **audit round**. |
+| Audit round | Publishing tags runs with a round (e.g. "2026-11-01 fall back"). The review page shows **one row per camera per round**, using the newest site capture in the round, so the LTI run, the DE run and any re-runs merge into one list. |
+| Review state | A shared **Complete** checkbox plus a shared **Notes** field per **camera per round**. Records who changed it and when. The next round starts unchecked. |
+| Roles | `DST_ROLE=capture` (laptop, default): `default` = SQLite, plus a `shared` alias from `DB_*` used only by publish. `DST_ROLE=review` (Linode): `default` = Supabase from `DB_*`. |
+| Image storage | The laptop keeps files on disk (unchanged). Publish writes image bytes **plus a thumbnail made on the laptop** into a Supabase `bytea` table. The review instance serves them through a database-backed Django storage backend. |
+| Connection | Supabase **transaction pooler** (6543, `postgres.<project-ref>`, `verify-full` with `certs/supabase_ca.crt`), same as IMS (`IMS/db.go:48`). `migrate --database shared` and bulk work over the **session pooler (5432)**. `connect_timeout` 10 s per address. |
+| Supabase project | A new project in **`aws-1-ca-central-1`**, separate from IMS (project ref checked against IMS dev and prod). Compute: **Micro (1 GB)**. |
+| Hosting | The **IMS Linode on port 8443** (cost). Details under Hosting. |
+
+**Sizing note.** For the database, Micro (1 GB) is enough. The data is about 0.6 GB, there are a handful of users, and the review page loads thumbnails (~30–60 KB). Moving to Small (2 GB) is worthwhile only if the review page acceptance shows slow page loads.
+
+## Environment variables
+
+| Variable | Laptop (`capture`) | Linode (`review`) | Docker secret on Linode |
+|---|---|---|---|
+| `DST_ROLE` | `capture` (default) | `review` | env in compose |
+| `DB_HOST` | Supabase pooler host. Enables the `shared` alias; does **not** change the working DB. | Required | env |
+| `DB_PORT` | `6543` (5432 for `migrate --database shared`) | `6543` | env |
+| `DB_USER` | `postgres.<project-ref>` | same | `/run/secrets/db_user` |
+| `DB_PASSWORD` | set | set | `/run/secrets/db_password` |
+| `DB_NAME` | `postgres` | same | env |
+| `DB_SSLMODE` | `verify-full` | same | env |
+| `DB_SSLROOTCERT` | `certs/supabase_ca.crt` (repo-relative) | same; certificate in the image or mounted | env |
+| `DB_CONNECT_TIMEOUT` | `10` (fails fast on the VPN) | `10` | env |
+| `DJANGO_SECRET_KEY`, `IMS_API_TOKEN`, `IMS_SSO_CLIENT_SECRET` | `.env` | — | `/run/secrets/django_secret_key`, `ims_api_token`, `ims_sso_client_secret` |
+
+- Secret files are loaded by `_load_secret_file` in `config/settings.py`, which mirrors IMS `config.LoadSecretFile`. A value already in the environment or `.env` wins.
+- IMS's Go pool settings (`DB_MAX_OPEN_CONNS`, …) are deliberately **not** wired. Django has no client-side pool, and DST keeps `CONN_MAX_AGE=0` under the pooler.
+
+## Phases
+
+Each phase is **gated**: its acceptance must pass before the next phase starts.
+
+### Phase 0 — Spike: network reach (gated) — ACCEPTED 2026-10-27
+- **Question, reframed after I2:** where can the laptop reach Supabase, and do DE captures need the VPN?
+- **Evidence:** `tmp/spike_supabase_connect.py` (throwaway).
+  - **VPN off: PASS.** 6543 connected in 0.44 s and 5432 in 0.35 s; `SELECT 1` OK; PostgreSQL 17.11; `search_path` = `"$user", public, extensions` (not empty); 2 MB `bytea` round trip 1.28 s and 1.23 s with the data intact.
+  - **Camera VPN (OpenVPN TAP, full tunnel, `10.100.80.5`): 5432 and 6543 blocked.** 443 is open to the internet, the Supabase pooler and the IMS Linode. Linode port 22 is blocked. CBW `10.3.38.177:80` is open (ICMP is blocked).
+  - **DE capture code** has no camera-network dependency (grep of the TeamViewer, OvrC and DragonEye services).
+- **Result:** publish runs with the VPN off; LTI capture runs with the VPN on; DE capture works either way. Proving DE capture off-VPN at runtime is part of the final end-to-end acceptance.
+
+### Phase 1 — Roles, shared schema, Supabase locked down (gated) — ACCEPTED 2026-10-27
+- **Work:**
+  1. ✅ `config/settings.py`: `DST_ROLE` capture/review, `DB_*` → `shared` alias (capture) or `default` (review), Docker-secret loader, `connect_timeout`. `requirements.txt`: `psycopg[binary]`. `.env.example` documented. `certs/supabase_ca.crt`.
+  2. ✅ Supabase locked down **in the database** (it doesn't depend on the dashboard Data API toggle, which can't be checked without the anon key: `/rest/v1/` answers 401 "No API key" either way):
+     - all table, sequence and function privileges revoked from `anon` and `authenticated` in `public`;
+     - default privileges for role `postgres` revoked too, so future tables start out locked;
+     - RLS enabled on every table.
+
+     Originally `tmp/lockdown_shared.py`; promoted in Phase 2 to `manage.py lock_shared_db` (the tmp script was deleted). Run it after every `migrate --database shared`, because RLS is not turned on automatically for new tables (the privilege revocation is).
+  3. ✅ `manage.py migrate --database shared` over 5432 with the VPN off: all 30 migrations applied (admin, audits 0001–0006, auth, cameras 0001–0006, contenttypes, sessions).
+  4. ✅ `audits/apps.py`: the orphan-job reaper returns early when `DST_ROLE == "review"`. It already ran only under `runserver`, and the Linode runs gunicorn; this guard is defense in depth.
+- **Accepted when:**
+  - `manage.py check` is clean in both roles.
+  - Capture with `DB_HOST` set still uses SQLite for `default`. ✅ Verified 2026-10-27.
+  - `migrate --database shared` is clean. ✅
+  - The public roles can't read the tables. ✅ Before the lockdown, `anon`/`authenticated` could SELECT **19/19** tables (including `auth_user` and `django_session`) and RLS was off on 19/19; after it, 0/19, 0/19 and RLS on everywhere. Running as `anon` itself: `permission denied for table auth_user`. A table created afterwards (probe, rolled back) is not readable by `anon`/`authenticated`. Django (owner role) still reads `shared` normally; local `default` still has 171 `AuditJob` rows on SQLite.
+  - Reaper: with `DST_ROLE=review` + `runserver` it is not scheduled; with `capture` it is. ✅
+  - On the VPN, any `shared` access fails within ~20 s instead of hanging. ✅ Verified: about 23 s with two addresses at 10 s each.
+
+### Phase 2 — Stable IDs, rounds, structured OvrC time (gated) — ACCEPTED 2026-10-27
+- **Work (done):**
+  1. `audits/models.py`: `public_id` UUID (unique) on `AuditJob` and `AuditScreenshot`; an `AuditRound` model plus a nullable `AuditJob.round` FK; OvrC fields on `AuditJob`: `ovrc_fx`, `ovrc_local_time_raw`, `ovrc_zone`, `ovrc_device_time` (absolute instant from the zone abbreviation), `ovrc_captured_at`, and `drift_seconds`.
+  2. **Drift definition (changed from the draft):** `drift_seconds` is the device's **wall clock** minus **America/New_York wall clock at the scrape moment**, not `finished_at`. Evidence: FX1261 recorded `02:10 AM ADT` at 05:11 UTC (01:11 Eastern), which is right in absolute time but an hour ahead on the wall clock. That wall-clock error is the DST signal, and comparing absolute instants would hide it. OvrC shows minutes only, so drift is accurate to about ±60 s.
+  3. `audits/ovrc_time.py` (new, pure functions): `parse_ovrc_local`, `ovrc_fields`, `ovrc_fields_from_line`, and `OVRC_FIELD_NAMES`. It handles the current scrape format, the legacy converted `Aug 1, 2026, 11:47 p.m. EST` format, a missing zone, and garbage input.
+  4. `services/ovrc_capture.py`: `OvrcTimeResult.captured_at` (UTC, set right after the scrape). `audits/runner.py`: `_capture_ovrc_times` and `_dst_fleet_ovrc_times` write the fields next to the existing progress line, which views still read, so no view changes were needed.
+  5. Migration `audits/0007_publish_ids_rounds_ovrc_fields` (hand-written: nullable UUID → backfill → unique; the OvrC backfill uses `finished_at` because legacy rows have no scrape time). Migration `audits/0008_sync_device_type_status_choices`: **pre-existing drift** from `82bfb63` (rejection job types added without a migration); a no-op in SQL.
+  6. `audits/management/commands/lock_shared_db.py` (replaces `tmp/lockdown_shared.py`): `--check` exits non-zero if exposed, and the default run applies the lockdown. **Run it after every `migrate --database shared`.**
+- **Acceptance evidence:**
+  - `manage.py test audits`: **23 passed** (15 new in `audits/test_ovrc_time.py` plus the existing rejection tests). `makemigrations --check`: no changes.
+  - Local SQLite (backed up first to `tmp/db.sqlite3.pre-0007.bak`): 0007/0008 applied. 171/171 jobs and 225/225 screenshots have distinct `public_id`s. **7/7** jobs with an `OvrC FX…` line were backfilled with drift: FX1260 EDT −0.6 / −0.1 min, **FX1261 ADT +59.4 / +58.9 min** (the known wrong-zone device).
+  - Shared DB (VPN off, 5432): 0007/0008 applied. `lock_shared_db --check` **failed as designed**: the new `audits_auditround` table had the API roles locked out (default privileges work) but **RLS off**. `lock_shared_db` → 20/20 tables locked; re-check passes.
+  - **Live OvrC capture** (job 172, `I-VBE-0011` / FX1219, read-only scrape): status succeeded; fields written: `EDT`, raw `Tue, Oct 27, 2026 05:19 PM EDT`, `ovrc_captured_at` 21:19:48 UTC, **`drift_seconds = -48`** (minute truncation; the device is correct).
+- **Carry into Phase 5:** set the review page's drift flag threshold above the ±60 s resolution (suggest |drift| ≥ 120 s), and show `ovrc_zone` next to the time so a wrong-zone label like ADT stands out.
+
+### Phase 3 — Publish to shared DB (gated) — ACCEPTED 2026-10-27
+- **Work (done):**
+  1. `audits/publish.py`: `publish_runs()` (core), `start_publish_job()` (background thread tracked as a new `AuditJob.DeviceType.PUBLISH` job; one publish at a time), `check_shared_reachable()` (fails with "turn the camera VPN off" guidance), `publishable_runs()` (only `DST_AUDIT` parents whose parent and children are all finished), and `clean_round_name()`.
+  2. **Order per run:** images first, each its own commit, skipped when the stored `sha256` matches; then **every row of the run in one transaction**. Rows upsert by `public_id`, `created_at` is restored after the upsert (`auto_now_add` would overwrite it), users are matched by username (otherwise null), and the run is tagged with the round in both databases.
+  3. `StoredFile` model (`name` unique = the local storage name, `content_type`, `size`, `sha256`, `data`, a `thumb` JPEG of at most 480 px, timestamps). Migration `audits/0009_stored_file_publish_type`.
+  4. `manage.py publish_dst_round --round NAME (--runs ID… | --latest N)`.
+  5. A DST Audit page panel **"Publish to shared DB"** (`templates/audits/dst_audit.html`), shown only when `technician+`, `DST_ROLE=capture` and the `shared` alias is set. It lists finished runs with checkboxes and each run's round badge, has a round input with a datalist of existing rounds, a Publish button, and live status by polling `/audits/<job>/status/`. Endpoint `POST /audits/dst/publish/` (`views.publish_dst`).
+  6. Tests: under `manage.py test`, `shared` is a second SQLite DB (`config/settings.py`), so CI never touches Supabase.
+- **Acceptance evidence (VPN off):**
+  - `manage.py test audits`: **32 passed** (9 new in `audits/test_publish.py`: copy, idempotent republish, changed image re-uploaded, unfinished/non-DST runs refused, empty round refused, missing file reported, unreachable DB message, user mapping).
+  - Migration 0009 applied locally and on `shared`. `lock_shared_db` re-locked the new `audits_storedfile` table (RLS off → on; 21/21).
+  - **A real audit day, mirrored:** LTI run **#159** + DE run **#77** published into one round "Acceptance test 2026-10-27" over 6543: 5 jobs, 8 screenshots, 8 images in **20.9 s**. `tmp/verify_publish.py`: every field, parent link and round matches, and **8/8 images byte-identical** (sha256 local = stored = recomputed). Thumbnails are 10–33 KB against originals up to 2.5 MB.
+  - **Republish:** 0 uploaded, 8 unchanged, no duplicate rows.
+  - **Killed mid-publish** (run #74, SIGKILL after 9 s): 3/6 images uploaded and **no #74 rows in shared**, so reviewers never see a half run. Re-run: 3 uploaded, 3 unchanged; verification PASS.
+  - **UI/endpoint** (Django test client against the real DBs, an existing technician user): the panel renders and lists run #70 with the round in the datalist; an empty round gives 400 "Round name is required."; publishing #70 → job 173 **succeeded** (3 jobs, 6 screenshots, 6 images); after a reload, run #70 shows the round badge. Verification PASS.
+  - **Blocked port (simulates the camera VPN; `DB_PORT=6544`):** fails in **23 s** with "Can't reach the shared DB … If the camera VPN is on, turn it off and publish again." This matches the 23 s measured on the real VPN in Phase 1.
+- **Test data left in place:** the shared DB now holds round **"Acceptance test 2026-10-27"** with runs #159 (LTI), #77, #74 and #70 (DE): 11 jobs, 20 screenshots, 20 images. Locally those runs carry the same round tag, plus publish job #173 and OvrC job #172. These are kept as fixtures for Phases 4–5. **Delete that round from both DBs before the first real round** (checklist item).
+
+### Phase 4 — Review instance on the IMS Linode :8443 (gated) — ACCEPTED 2026-10-28
+- **Work:**
+  1. `DatabaseStorage` plus a signed-in `media/<name>` view that serves `StoredFile` bytes and thumbnails with `ETag`/`Cache-Control`.
+  2. The review role **hides and rejects (403)** every capture, relay, OvrC, cancel, confirm, VBE, rejection-run and publish endpoint, and the capture explorer (it reads local disk).
+  3. Production settings: `CSRF_TRUSTED_ORIGINS`, `SECURE_*` cookies, `ALLOWED_HOSTS`, whitenoise, and `IMS_CA_FILE` to trust IMS's self-signed certificate (instead of `IMS_TLS_VERIFY=false`).
+  4. Dockerfile plus a compose project at `/opt/dst_camera_audit`, as described under Hosting.
+  5. `sync_installations` on the Linode against IMS.
+  6. User steps: IMS SSO redirect URI `https://45.79.220.29:8443/accounts/ims/callback/`; open 8443 in ufw / Linode Cloud Firewall.
+- **Accepted when:**
+  - `https://45.79.220.29:8443/` signs in through IMS SSO and shows published jobs with their images.
+  - Capture POSTs return 403.
+  - IMS on 443 is unaffected (healthcheck green, memory the same before and after), and DST stays under its 512 MB limit.
+  - **A reviewer opens :8443 from their normal network** (I3).
+
+#### Phase 4 progress (2026-10-27) — local half implemented and verified; deploy pending (not accepted)
+- **Built:**
+  - `audits/storage.py` `DatabaseStorage`: read-only over `StoredFile`. `url()` → `/media-db/<name>`, so every existing `shot.image.url` works unchanged.
+  - `audits/media_views.py` `stored_media`: signed-in only, `?thumb=1`, ETag = sha256, `Cache-Control: private, max-age=86400`; falls back to the original when there's no thumbnail.
+  - Review-only guard:
+    1. `cameras/roles.py`: in `DST_ROLE=review`, `role_at_least()` is False for anything above `readonly`. This hides **and** rejects all 33 technician-gated capture controls in one place.
+    2. `config/middleware.py` `ReviewOnlyMiddleware`: 403 for `/explorer/`, `/sync/`, `/dragoneye/`, `/admin/` and every non-GET request outside `/accounts/`. **Phase 6 must add its Complete/Notes endpoint prefix to `REVIEW_WRITE_PREFIXES`.**
+  - Settings: `STORAGES` per role; WhiteNoise (manifest storage in review); `DJANGO_CSRF_TRUSTED_ORIGINS`; secure cookies, nosniff and referrer policy when `DEBUG` is off (no HSTS: bare IP + self-signed). `IMS_CA_FILE` → `services/ims_client._tls_verify()` **pins IMS's self-signed certificate**. The chain is verified, but the hostname check is off because the cert is for a bare IP with no SAN, which Python can never match.
+  - `requirements-review.txt` (slim), `Dockerfile` (python:3.12-slim, collectstatic at build, non-root uid 10001, gunicorn TLS on 8443 with 2 workers × 4 threads), `.dockerignore`, `deploy/docker-compose.yml` (512 MB limit, file secrets, IMS cert/key mounted read-only, healthcheck), and the `deploy/README.md` runbook. `.gitignore`: `certs/*` + `!certs/supabase_ca.crt` (the public CA must ship in the `git archive`).
+- **Verified locally:**
+  - `manage.py test`: **62 passed** (whole project; 9 new in `audits/test_review_mode.py`). `check` is clean in both roles.
+  - **Review mode against the real Supabase data, with selenium/pyvnc/pyautogui/pygetwindow/webdriver-manager import-blocked** (`tmp/review_mode_check.py`, `DJANGO_DEBUG=false`):
+    - published job #5 detail renders with its image from the DB (sha256 match); thumbnail 32 KB JPEG; ETag → 304; unknown → 404; signed out → login redirect;
+    - start button and publish panel hidden; 8 capture/admin/explorer/sync paths → **403 even for an `admin`-role user**.
+  - Dependency probe: the review instance needs `folium`, `numpy`, `requests` and `httpx`; `pandas`, `openpyxl` and `cryptography` are not needed.
+  - **IMS pinning live:** IMS's public cert fetched over TLS matches the server file (SHA-256 `98:DB:…:05:E9`). Pinned → `GET https://45.79.220.29/healthz` **200 `{"status":"ok"}`**; wrong CA → refused (`CERTIFICATE_VERIFY_FAILED`).
+- **Not done yet (production — ask before each step):**
+  1. Commit the work (the deploy ships a `git archive` of a commit).
+  2. Operator steps: IMS SSO redirect URI, open 8443, key-file readability (`deploy/README.md`).
+  3. On the Linode: create `/opt/dst_camera_audit` + secrets, build, `up -d`, `sync_installations`.
+  4. Then run this phase's acceptance list (SSO sign-in on :8443, IMS unaffected, < 512 MB, capture POSTs 403, and a reviewer reaching :8443 from their own network for I3).
+- The image can't be built on the laptop (no Docker), so the first real build happens on the Linode in step 3.
+
+#### Phase 4 deploy (2026-10-27) — provisioned and running; external access + SSO pending (not accepted)
+Directed by the user ("provision the linode instance"), using the `access-replacement-prod-ssh` skill (`deploy@45.79.220.29`, SSH check OK).
+- **Location changed to `/home/deploy/dst_camera_audit`:** `/opt` is root-owned and `deploy` has no passwordless sudo. Created with `umask 077`: `secrets/` (`db_user` and `db_password` from the laptop `.env`, CRs stripped to 29 and 15 bytes; a fresh 64-char `django_secret_key`; `ims_api_token` and `ims_sso_client_secret` = **placeholder `pending-ims-prod-credentials`**) and `.env` (`IMS_SSO_CLIENT_ID` placeholder).
+- **Production IMS credentials are not on the laptop:** its `.env` targets dev IMS (`127.0.0.1:8051`). `IMS/cmd/mint-dst-integration` was **not** run against production, because its `ON CONFLICT` upsert overwrites an existing `dst_camera_audit` SSO client's secret and redirect URIs, and the production DB password is deliberately not on the laptop. They must come from IMS Admin → External Integrations.
+- **Code:** `git archive` of `2defb37`; the compose file at `815bbd3`. Image `dst_camera_audit:review` 419 MB, built on the Linode in ~32 s. IMS stayed `healthy` and `/healthz` 200 throughout (load 0.57).
+- **Two fixes** found by the first real build/run: `DB_SSLROOTCERT` defaults to the baked CA (`2defb37`: collectstatic imports settings, which correctly refuses `verify-full` without a CA); the healthcheck sends `Host: 45.79.220.29` (`815bbd3`: 127.0.0.1 is deliberately not an allowed host).
+- **Running:** `dst_camera_audit-dst-1` healthy, **157 MiB / 512 MiB**. IMS `healthy` at 52–61 MiB (unchanged); host 1.3 GB available.
+- **Verified on the box** (`https://127.0.0.1:8443` with the public Host header):
+  - login 200; signed-out `/` and `/media-db/…` → 302 to login;
+  - POST start/publish/turn-relays → **403**; `/explorer/` → **403**;
+  - WhiteNoise `/static/app.css` 200; `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin`;
+  - :8443 presents IMS's cert (SHA-256 `98:DB:…:05:E9`).
+- **Container → Supabase:** pooler 6543 `verify-full`, user and secret key loaded from the secret files, 11 published jobs and 20 stored files visible, `DatabaseStorage` active, `lock_shared_db --check` 0/0/0 of 21.
+- **External access FAILS (I6):** from the laptop (VPN off), `https://45.79.220.29:8443` times out after 15 s, while the host listens on `0.0.0.0:8443`. A firewall is dropping it: `ufw` (status needs root) or a Linode Cloud Firewall.
+- **Still pending for acceptance:** I6 firewall; production IMS SSO client + API token; I4 before `sync_installations`; then SSO sign-in on :8443, and a reviewer reaching :8443 from their own network (I3).
+
+#### Phase 4 — production IMS credentials + first sync (2026-10-28)
+- **Credentials:** the user's IMS account has TOTP 2FA, so a scripted login can't finish (one attempt failed on a trailing space in the user env var `IMS_PASSWORD`; the corrected attempt reached `/login/mfa`, which cleared the rate-limit counter). Instead, `tmp/provision_ims_via_browser.py` opened a **visible Chrome** (Selenium) at IMS `/login` after checking the server's cert against the pin `98:DB:…:05:E9`. **The user signed in (incl. 2FA)**; the script reused that session over the pinned client to `POST /admin/external-integrations/tokens/create` and `/sso/create`. Result: **API token "DST Camera Audit review (Linode :8443)"** (`ase_installations:read`) and **SSO client `dst_camera_audit_review`** (new id; IMS's create refuses duplicates, so no existing client was touched), redirect `https://45.79.220.29:8443/accounts/ims/callback/`. Both were piped over SSH straight into `~/dst_camera_audit/secrets/` (69 bytes each) and `.env`; nothing printed or stored on the laptop. Logged out, Chrome closed.
+- **Container recreated:** settings report client id `dst_camera_audit_review`, secret and token loaded, redirect as above.
+- **Bug found by the first Postgres sync, fixed (`d185cc4`):** `InstallationDevice.host` was `varchar(64)`, but 10 IMS devices have ControlByWeb cloud URLs up to **146** chars (e.g. `I-ASE-700002`). SQLite never enforced `max_length`, so only Postgres caught it (`DataError: value too long for type character varying(64)`). Widened to 255 (`cameras/0007_widen_device_host`), migrated locally + `shared`, `lock_shared_db` 21/21. Note: those URLs appear to embed a ControlByWeb cloud key; they were already stored in IMS and local DST, and in Supabase they sit behind the lockdown.
+- **First production sync PASS:** `sync_installations` in the container → IMS API via the pinned cert (container → host's public IP): **847 rows fetched, 806 created + 41 updated, 3,441 devices**, longest host 146. 846/847 have `street`, 697 `site_type` (`county` is empty in IMS's payload today). Spot checks: `233038` → I-LTI-233038 Bainbridge GA; `I-VBE-0011` → New Kent Co VA; `266134` → I-DE-266134 Knoxville TN. Peak container memory 302 MiB during the sync (< 512); IMS healthy throughout.
+- **Operational note:** a full sync takes ~6 min over the pooler (row-by-row device/sensor writes). Run it detached (`docker compose exec -d dst sh -c "python manage.py sync_installations > /tmp/sync.log 2>&1"`): an SSH drop mid-sync (the laptop's wired link went down) reset the session, though that run did complete.
+- **Remaining Phase 4 acceptance:** (1) **the user signs in at https://45.79.220.29:8443 through "Sign in with IMS"** (2FA), and lands on the dashboard showing the published acceptance round; (2) I3, a reviewer opens :8443 from their own network.
+
+#### Phase 4 — "loading extremely slowly" (user report 2026-10-28): measured and fixed
+- **User report:** SSO sign-in on :8443 **works** (acceptance step 1 ✅ for the user `ployd`), but pages load extremely slowly.
+- **Measured** (Linode → Supabase ca-central-1): each query is a **32 ms** round trip; a new pooler connection **~330 ms** (once 4.8 s); the review runs everything over that link, where the laptop has local SQLite.
+- **Causes and fixes:**
+  1. **N+1:** `Installation.fx_numbers` reads `self.devices` per row, and `_active_dst_installations` (DST Audit page, Confirm Captures, runner) iterated all 847 active installations without prefetching, at ~28 s per pass. Fix: `prefetch_related("devices")` (`80853ff`), plus a regression test (`audits/test_query_counts.py`, ≤3 queries for 12 installations). **`/audits/dst/`: minutes → 0.9–1.3 s (11 queries).**
+  2. **Reconnect per request:** `CONN_MAX_AGE=0` paid ~330 ms per request. Fix: `DB_CONN_MAX_AGE` (default 300 s) with health checks (`80853ff`); safe with transaction pooling since prepared statements are off.
+  3. **Live IMS probe on every dashboard view:** `check_ims_connection()` made two HTTPS calls to IMS (~1.5 s). Fix: cached 60 s per process (`d6563b4`). **`/`: 1.6–2.2 s → ~380 ms warm.**
+  4. **Full-size images as previews:** preview `<img>` tags pulled ~2.5 MB PNGs from Supabase (server 190–460 ms each, then the transfer). Fix: the `thumb_src` filter serves the ~21 KB stored thumbnail (~100 ms), and a click still opens the full image (`196523c`).
+- **After (through gunicorn from a cold restart):** `/audits/` 0.18 s, `/audits/5/` 0.25 s, `/cameras/` 1.1 s (27 queries; still latency-bound), `/audits/dst/` 0.9–1.3 s, `/map/` 1.3 s (folium CPU on 1 vCPU, 3 queries). Container ≤ 180 MiB; IMS healthy throughout.
+- **Unexplained one-off:** a single `GET /cameras/` took **81.4 s** server-side right after a redeploy. It did not reproduce in later cold runs (1.1 s). Probably a slow pooler connect (cf. the 4.8 s connect), but unconfirmed: watch the `[HTTP] … ms=` log lines.
+- **Operator note (my error):** cleaning up a test session, my filter deleted every `ployd` ModelBackend session, which **signed the user's browser out** of :8443; re-sign-in is needed. Later timing runs deleted only their own session key. Five undecodable sessions in the shared DB (signed with the laptop's key during earlier local test runs) are harmless leftovers.
+- **Possible follow-ups if it is still slow in the browser:** move the Supabase project closer to the Linode (32 ms RTT dominates `/cameras/`), or batch `/cameras/`' 27 queries.
+
+#### Phase 4 acceptance (2026-10-28) — PASS
+- SSO sign-in on :8443 through production IMS (2FA): **works** (user `ployd`, confirmed by the user).
+- IMS on 443 unaffected: `healthy`, `/healthz` 200, memory ~50–61 MiB before and after every deploy.
+- DST under its limit: ≤ 302 MiB peak (during the 847-row sync), ~130–180 MiB steady, of 512 MiB.
+- Capture POSTs → 403 (start, publish, turn-relays, cancel, capture-pole), plus `/explorer/`, `/sync/`, `/admin/` → 403, externally and in tests.
+- **I3:** teammates reach it from their own networks (user report).
+- Performance: user confirms it "is better" after the fixes above.
+
+### Phase 5 — One-page review per round (gated) — ACCEPTED 2026-10-28
+- **Work:** `/audits/review/<round>/`: one row per camera in the round (newest `DST_SITE` capture per installation), showing:
+  - identifier, pole, agency, LTI/DE
+  - each device (CBW, VNC L1/L2, or DE lanes) with inline thumbnails and capture timestamps
+  - OvrC time vs Finished, with drift highlighted
+  - failures inline
+
+  Clicking a thumbnail opens it full size in place. Filters: not complete, drift over a threshold, failed. A round picker defaults to the latest round.
+- **Accepted when:**
+  - A real published round shows every camera from both its LTI and DE runs, with correct devices, timestamps and drift (spot-checked against 3 job detail pages).
+  - Only thumbnails load (checked in the network tab).
+  - A re-run site shows its newest capture.
+
+#### Phase 5 progress (2026-10-28) — implemented, content acceptance PASS; blocked on I7 (intermittent stalls)
+- **Built (`6e1b83e`):**
+  - `audits/review.py`: `build_round_rows` (newest `DST_SITE` per camera in the round, ordered `finished_at DESC NULLS LAST`; installations in one query by pole/identifier; captures ordered CBW → VNC L1/L2 → DE lanes → OvrC), `summarize`, `filter_rows`, `DRIFT_FLAG_SECONDS = 120`.
+  - `audits/review_views.py` and `templates/audits/review.html`: `/audits/review/` (newest round) and `/audits/review/<id>/`. Any signed-in user. Stats (cameras/LTI/DE/drift/failed), filters (all/failed/drift/LTI/DE), round picker, the thumbnail strip with the existing click-to-enlarge dialog, OvrC device time + FX beside the Eastern wall clock at the read, drift ±min (flag ≥ 2), "newest of N runs", errors inline. A "Review" nav link. The "not complete" filter arrives with Phase 6.
+  - Tests: `audits/test_review.py` (6): newest wins across re-runs, other rounds excluded, capture order, drift/failure flags, the EST label after fall back, filters, **constant query count (2 vs 12 cameras)**, the page renders for `readonly`, 404 for an unknown round, sign-in required. Suite: **70 passed**.
+- **Limitation (inherited design):** drift is measured against **America/New_York**, as the existing DST audit compares to EST. A site legitimately on Central time would show about −60 min; the device's zone label is shown beside the time so a reviewer can tell.
+- **Acceptance on the real round "Acceptance test 2026-10-27"** (through gunicorn as `ployd`):
+  - **3 cameras** from 7 site jobs (1 LTI + 2 DE; DE poles merged across 3 runs);
+  - **8/8 previews are thumbnails** (0 full-size);
+  - summary cameras 3 / LTI 1 / DE 2 / drift 1 / failed 0;
+  - 3/3 rows cross-checked against their job records (newest job link, status, capture count, device time or "Read the CBW capture", drift, "newest of 3 runs") → **PASS**. `266006` shows **ADT +58.9 min, flagged**; `266007` EDT −0.1 min.
+- **I7 — open, blocks Phase 5 acceptance:** intermittent request stalls on the review instance. The review page took **12.7 s cold** and **132.4 s once** server-side (`?show=drift`); `/cameras/` took 81.4 s once earlier. Not reproduced under steady load (32 requests from 4 threads: median 251 ms, max 1.2 s, connects ~208 ms). Postgres is healthy (16/90 backends, no idle-in-transaction, no long queries), so the stall sits between the container and Supavisor. **Hypothesis:** persistent connections (`CONN_MAX_AGE=300`) silently dropped while idle, so the next query hangs until TCP retransmission gives up (~2 min) and Django's health check reconnects. Being tested: idle 60/180/360 s, with and without libpq TCP keepalives.
+- Side finding: Postgres shows **PostgREST running** (`authenticator`), so the Supabase Data API is still enabled. The tables stay locked by `lock_shared_db` (0/21 exposed), but turning the Data API off in the dashboard is still recommended.
+
+#### I7 investigation log (2026-10-28) — still open
+User report: "DST audit page is taking a long time to load".
+- **Reproduced once:** of three `/audits/dst/` requests through gunicorn, #1 and #3 took ~1.3 s and **#2 hung past the 60 s client timeout and was never logged** (still in flight server-side). The same thread-blocking pattern explains 12.7 s / 132 s / 81 s earlier: each stall holds one of the 8 gunicorn threads (2 workers × 4).
+- **Ruled out, with evidence:**
+  - *Postgres:* 16/90 backends, no idle-in-transaction, no long queries.
+  - *Idle-dropped pooler connections:* a first query after 60/180/360 s idle took 32–35 ms with or without TCP keepalives.
+  - *DNS:* `getaddrinfo` A+AAAA 2–32 ms in the container (Docker 127.0.0.11 → Linode resolvers).
+  - *gunicorn TLS handshake blocked by idle sockets:* two idle TCP connections to :8443 did not slow requests (13–23 ms).
+  - *Synthetic load:* 25 sequential mixed requests (no hang) and 32 requests from 4 threads (median 251 ms, max 1.2 s).
+- **Observation:** while #2 hung, the container had **no** TCP connection to the pooler, so the stuck thread was not waiting on a DB socket.
+- **Cold start (separate, smaller):** the first `/audits/dst/` after a restart takes ~11 s through gunicorn (in-process test client cold: ~0.8 s). Not yet explained.
+- **Instrumentation deployed (`a3503a1`, `d398352`):** with `DST_DUMP_STACKS=1` (on in `deploy/docker-compose.yml`), `config/wsgi.py` (a) registers faulthandler on `SIGRTMIN+1` and (b) runs a watchdog that dumps every thread's stack once when a request runs > `DST_STUCK_SECONDS` (20). Find it with `docker compose logs dst | grep -A80 "\[STUCK\]"`. Next: let real browser use hit a hang, then read the dump.
+
+#### I7 investigation log, part 2 (2026-10-28) — mechanism found; trigger not yet; still open
+- **Watchdog evidence:** two real browser stalls on the review page were **thumbnail requests** (`/media-db/…?thumb=1`) blocked in `psycopg … execute` for the `StoredFile` lookup (`audits/media_views.py:21`); they never completed. Their sockets to Supavisor were `ESTABLISHED`, `tx=0 rx=0` (query sent and ACKed, no reply). **Postgres had no active query**; `pg_stat_statements` max for that select is **236 ms**. The queries were waiting inside Supavisor, not in Postgres.
+- **Correction:** the earlier "no pooler connection while hung" observation was **my bug**: I filtered `/proc/net/tcp` on port hex `1983` (= 6531); 6543 is `0x198F`. Mapping worker fds → sockets shows 4 established pooler connections per worker (one per thread).
+- **Mechanism: Supavisor pool saturation.** 20 concurrent `pg_sleep(4)` in transaction mode finish in waves of **16 at 4 s, then 4 at 8 s**, so the effective server pool is **~16**. Once it's full, new queries queue at the pooler.
+- **A wrong fix, reverted:** switching the review instance to **session mode** (`0a87263`) made it worse. Each kept-alive gunicorn thread pinned a server connection: bursts hit 60 s timeouts, 7 watchdog dumps, and 15 held clients → 0 served, 8 refused. Reverted to transaction mode (`baeb6ee`).
+- **Not yet explained:** in transaction mode the review instance runs at most 8 queries at once (8 threads) < 16. What filled the pool during the user's stalls at 10:12 and 10:32 is unknown (my held test connections and the session-mode switch did not overlap those times). Something else holds server connections (another client of this project, or long transactions); next is sampling `pg_stat_activity` + Supavisor client counts when the watchdog fires.
+- **Recommended mitigation (operator):** raise the Supavisor **Pool Size** for this project (Supabase → Database → Settings → Connection pooling; `max_connections` is 90, so e.g. 40 leaves headroom).
+
+#### I7 resolution (2026-10-28) — root cause: Supavisor (ca-central-1) strands connections; fixed by connecting directly
+- **User direction:** "use IMS's tricks for loading and concurrency" (the Supabase pooler settings aren't visible to the user).
+- **IMS tricks applied (`a7cb46b`):** `cached_db` sessions (IMS's in-memory session cache), a byte-bounded per-process cache of published images (48 MB, 10 min), and dashboard KPI counts cached 60 s on the review instance (IMS's `dashStatsCache`). A repeat thumbnail goes from 3 queries to 1. Tests: `PoolFriendlyCachingTests`.
+- **Caching alone didn't fix it:** bursts still stalled about 1 request in 16, including a cached thumbnail whose only query was the user lookup.
+- **Isolating spikes from the Linode:**
+  1. *Django ORM, no HTTP:* one of 8 threads crawled 17–37 s per request, then hung, so it's **one bad connection**, bad from its first query.
+  2. *Raw psycopg per Supavisor node × binding style:* stalls/hangs on **both nodes** (`3.97.240.24`, `3.98.197.182`), with both extended-protocol and client-side binding.
+  3. *Reply size* (`select repeat('x', N)`, 100 B–200 KB): hangs at 2 KB and 40 KB, none at 8 KB, so **not size-dependent; random per connection**.
+  4. The stuck sockets were `tx=0 rx=0`, retransmits 0 (delivered and ACKed), and Postgres showed nothing active: **Supavisor stopped relaying replies**.
+  5. *Direct Postgres* (`db.<ref>.supabase.co`, IPv6, from host networking): **240/240, max 67 ms, 0 hung**.
+- **Fix (`5dc4d8c`):** the review instance uses the **direct connection** with `network_mode: host` (Docker's bridge lacks IPv6; enabling it needs root). `DB_HOST` is in `~/dst_camera_audit/.env`; the `db_user` secret is `postgres` (`db_user.pooler` kept for rollback). The laptop still publishes through the pooler.
+- **Incident during the switch:** my remote step ran `tar -x` under `umask 077`, so the image's `/app` was unreadable to uid 1000 and the container **crash-looped for a few minutes** (`No module named 'config.wsgi'`). Fixed by re-extracting with `umask 022`; documented in `deploy/README.md`. IMS was unaffected.
+- **Verification after the fix:** ORM replay **200/200 in 4 s, max 432 ms, 0 stalls/hung**; HTTP bursts (16 thumbs, 16 full images, 16 pages, 2× 24 mixed) **0 errors, max 3.7 s, 0 watchdog dumps**; external login 200 in 0.10 s; IMS healthy. Container memory 339 MiB / 512 (the image cache filling up); watch it.
+- **Wrong turns, kept for the record:** session mode (`0a87263`, reverted in `baeb6ee`); the "idle drop", DNS, and TLS-handshake hypotheses (each refuted by a test above).
+- **Closing I7 needs:** the user browsing normally with no stall, and the watchdog still at 0 `[STUCK]` dumps.
+
+#### Phase 5 acceptance (2026-10-28) — PASS
+- Content on the real round: 3 cameras from 7 site jobs (LTI + DE merged across re-runs), 8/8 previews are thumbnails, 3/3 rows match their job records, `266006` ADT +58.9 min flagged.
+- Performance (I7 resolved): after the direct-connection fix, the user reports "working much better". Since the container restart: **0 `[STUCK]` dumps**; the user's real browser requests median **68 ms**, max **245 ms**; IMS healthy; container 339 MiB / 512.
+
+### Phase 6 — Reviewer assignment + shared Complete checkbox + Notes (gated)
+**Amended 2026-10-28 (user):** the review work is divided among technicians, currently **`carthur`, `jgreene`, `ployd`**. Each camera is assigned to one tech with an `x % number of techs` distribution, and the review page filters by assigned tech.
+
+- **Assignment design:**
+  - **x = the camera's arrival order in the round**, not its position in a sorted list. Positions shift when more cameras are published later (the DE run after the LTI run, re-runs), which would silently move cameras between techs mid-review. Each camera is assigned **once, when it first enters the round**, to `reviewers[seq % n]`, and the result is **stored**. Counts stay equal within ±1, and an assignment never changes by itself.
+  - **Balanced per site type (confirmed):** a separate sequence per type (LTI, DE). The k-th camera of a type goes to `reviewers[(start_type + k) % n]`, where `start_type` = the round's total assigned count when that type first appears, so the overall total also stays balanced instead of every type starting at tech 0.
+  - **Reviewers list:** `DST_REVIEWERS=carthur,jgreene,ployd` (laptop `.env`; publish assigns). The list is **snapshotted on the round** (`AuditRound.reviewers`) at its first publish, so changing the team later does not reshuffle an existing round. A new round uses the then-current list.
+  - **Where:** in `publish_runs` (the single writer; inside the run's shared-DB transaction). Publish **only creates** review rows for cameras new to the round and never updates existing ones, so re-publishing keeps assignments, checkmarks and notes.
+  - **Laptop mirror (2026-10-29):** the laptop's own `/audits/review/` reads local SQLite, which publish never assigned in, so it showed every camera unassigned (reported as "review no longer auto-assigns" after the live-publish change; the shared DB was fully assigned the whole time). Each `publish_runs` now ends by copying the round's reviewer list and every review row from `shared` to local (`_mirror_reviews`), overwriting local state with the shared truth. Edits made on the laptop's review page still stay local — review on the Linode instance.
+  - **Backfill:** `manage.py assign_reviewers --round NAME` for rounds published before this change (the acceptance round).
+  - **Manual reassign (confirmed):** a per-row dropdown, usable by any signed-in user and recorded (who/when), for when a tech is out. It doesn't change the sequence.
+  - Assignee stored as a **username string**, so a tech who hasn't signed in to the review site yet can still be assigned.
+- **Review page:**
+  - An "Assigned to" column.
+  - Filters: **Mine** (the signed-in user), **each tech** (`?tech=<username>`), **Unassigned**, combinable with the existing all/failed/drift/LTI/DE/not-complete.
+  - Per-tech progress in the header (e.g. `jgreene 3/7 complete`).
+- **Work (Complete + Notes, unchanged from before):**
+  - An `InstallationAuditReview` model (`round` FK, `camera_key` (the site/pole key; also an optional `installation` FK), **`assigned_to` (username), `assignment_seq`, `assigned_by`/`assigned_at` (for manual reassigns)**, `completed`, `completed_by`, `completed_at`, `notes`, `notes_updated_by`, `notes_updated_at`, `version`; unique on (round, camera_key)). Created by publish; it lives only in the shared DB and existing rows are never published over.
+  - An inline Complete checkbox per row, with a "Complete x/y" counter.
+  - Saves carry `version`, so concurrent edits produce a warning instead of an overwrite.
+  - **Any signed-in user can tick Complete and edit Notes** (`readonly+`; user decisions 2026-10-27). Each change records who and when, so open access stays accountable.
+  - **Notes UI = a port of IMS's "RA modal"** (the Resolving Actions editor). Source:
+    - `IMS/js/index.js:3027–3166`: `ensureRAEditModal`, `openRAEditModal`, `saveAndCloseRAEditModal`, `closeRAEditModal`, and the delegated click handler at `:3169`.
+    - `IMS/css/index.css:4370–4460`: `.wo-ra-modal-*` and `#wo-ra-edit-text`; plus `.highlight-success` / `.highlight-error` at `:4328`.
+
+    Copy it into DST (`static/app.css` + a small `static/notes-modal.js`) under DST class names (`dst-notes-modal-*`), keeping IMS's look and behavior:
+    - **Markup:** injected into `<body>` once, on first open.
+      - Overlay: `position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 9100`, centred, shown by `.is-open`.
+      - Dialog: `#0f172a`, 1px `rgba(148,163,184,.2)` border, 12px radius, `max-width: 560px`, `width: 95%`, 24px padding.
+      - Header: title "Notes — <identifier / pole>" plus a ✕ button (`#94a3b8`).
+      - Body: a `rows="6"` textarea (`#1e293b`, 6px radius, `#e2e8f0` text, vertical resize).
+      - Footer: right-aligned **Cancel** and **Save**.
+    - **Trigger:** each review row has a notes cell showing the first 120 characters with `…`, or a dim "Click to add notes…" when empty. The full text is kept in `data-notes-value`. Clicking the cell opens the modal.
+    - **Open:** load `data-notes-value` into the textarea and focus it with the cursor at the end (the 50 ms `setTimeout`, as in IMS).
+    - **Close semantics (same as IMS):** **Save**, **✕** and **clicking the backdrop** all *save and close*. **Cancel** discards. Escape was not bound to this modal in IMS, so Escape = Cancel is a DST addition — confirm or drop it during review.
+    - **After save:** update the cell's snippet and `data-notes-value`, then flash `highlight-success` for 1 s; on error, flash `highlight-error` for 2 s. A `version` conflict response shows the warning and keeps the modal text, so nothing typed is lost.
+    - DST is already dark-themed (`color-scheme: dark`; `--ice-*` palette in `static/app.css`), so IMS's slate colors fit without re-theming.
+- **Accepted when:**
+  - **Assignment:** a publish into a new round assigns every camera; per-tech counts differ by at most 1 (per site type if balanced by type). Publishing another run into the round assigns only the new cameras and leaves existing assignments untouched. Re-publishing changes nothing. Unit tests cover the sequence math, the snapshot, idempotency and the backfill.
+  - **Filter:** "Mine" and `?tech=` show exactly that tech's cameras; counts match the header.
+  - A check or note made in one browser shows in a second browser (a different user) after refresh.
+  - A `readonly` user can tick Complete and edit notes. The modal's look and behavior match IMS's RA modal: side-by-side screenshot, plus ✕ and backdrop click save while Cancel discards.
+  - Concurrent note edits produce the conflict warning.
+  - The "not complete" filter respects the checkbox.
+  - Re-publishing a round does not reset reviews.
+
+#### Phase 6 implementation (2026-10-28) — built and deployed; not accepted
+- **Code (`f19542a`):** `audits/assignment.py` (sequence math, round snapshot, backfill); publish assigns inside the run's shared transaction (`PublishReport.assigned`); `manage.py assign_reviewers`; `InstallationAuditReview` + `AuditRound.reviewers`/`assignment_offsets` (`audits/0010`); `POST /audits/review/<round>/item/` (`completed` / `notes` / `assigned_to`, any signed-in user, added to `REVIEW_WRITE_PREFIXES`); the page's tech filters (Everyone / Mine / each tech / Unassigned) combined with all / not complete / failed / drift / LTI / DE, per-tech progress, a reassign dropdown, the Complete checkbox + "x/y complete", and the Notes cell + `static/review.js` (RA-modal port, `dst-notes-modal-*` CSS).
+- **Concurrency refinement:** Complete and assignee are explicit sets (last write wins; the response returns current state). **Notes are compare-and-set against the text the editor opened with**, rather than the row `version`, so a teammate ticking Complete doesn't make your note save fail. A real note conflict returns 409 with the other text; the modal stays open with yours, showing theirs. Save again replaces theirs, Cancel keeps theirs. `version` is still bumped on every change.
+- **A row is created on first edit** for a camera in the round that has none (published before assignment existed), and stays unassigned.
+- **Tests:** `audits/test_assignment.py` (15) + one publish test. They cover x % n, per-type balance with offsets, never moving existing rows, the snapshot, duplicate/blank keys, backfill, the command, filters/progress, page tech filters, constant page query count, complete/uncomplete, notes save + 409 + CRLF + 4000-char limit, reassign validation, 404/400/sign-in, row-on-first-edit, and the review role allowing edits. **Suite: 91 passed.**
+- **Shared DB:** `migrate --database shared` (0010) and `lock_shared_db` → **22/22 locked**. Backfill: `assign_reviewers --round "Acceptance test 2026-10-27"` → 266006 carthur, 266007 jgreene (DE published first), 266059 ployd (LTI offset 2).
+- **Laptop `.env`:** `DST_REVIEWERS=carthur,jgreene,ployd`. The review container doesn't need it (it never publishes).
+- **Deployed `f19542a`** (user: "deploy"): extracted with `umask 022`, compose unchanged, rebuilt; `healthy`, 127 MiB / 512; IMS healthy (54 MiB). Smoke test as `ployd`: `/audits/review/` 200 (0.9 s cold, ~0.2 s warm), 3 rows; `?tech=mine` / `?tech=carthur` / `?show=incomplete&tech=jgreene` 1 row each; progress shows 0/1 per tech; hashed `review.js` 200; signed-out POST → 403; 0 `[STUCK]`. The test session was deleted by its exact key.
+- **Filter redesign (user 2026-10-28: "it will let me select the tech to filter, but not unselect them. Use IMS to draw inspiration"):** the two pill rows (`?show=` / `?tech=`) are replaced with IMS's `table-controls` panel (`IMS/views/assets_list.html`, `js/auto_filter.js`). It has independent dropdowns, each with an **All** option: Assigned to (All techs / Mine / each tech / Unassigned), Site type (All / LTI / DE), Review status (All / Not complete / Complete). It also has **Drift flagged only** and **Failed only** checkboxes, applies on change (Apply stays in the markup for no-JS), a **Clear** link, and "Showing X of Y cameras". The per-tech progress chips **toggle** that tech on and off, keeping the other filters. `audits.review.Filters` replaces `FILTERS`/`show` (`d201e32`, layout fix `HEAD`). Live check with headless Chrome on :8443 (a temp `ployd` session, deleted by key afterwards): select carthur → 1 of 3; All techs → 3 of 3; chip on → jgreene 1 of 3, chip off → 3 of 3; drift → 1 of 3; Clear → 3 of 3. Suite **92 passed**.
+- **User's first hands-on use:** they added and later cleared a note on 266006 (`notes_updated_by=ployd`, version 4), and reassignment/notes rendered correctly in their screenshot.
+- **Live updates (user 2026-10-28: "I want the notes and the marked complete to be SSE so others can see those values live"), `3111d62`:**
+  - **Server:** `audits/live.py` is a port of IMS's `SSEBroker` (`IMS/sse.go`): per-client queues of 64 that drop when full, a client cap (`DST_SSE_MAX_CLIENTS` 12), a `connected` event, `: ping` every 20 s, `retry: 3000`. Streams end after `DST_SSE_MAX_SECONDS` (600), so EventSource reconnects and re-checks the session (IMS re-validates every 30 min). The stream thread closes its DB connection, so open streams hold none.
+  - **Endpoint and payload:** `GET /audits/review/<round>/events/`. Every successful save broadcasts `{state, field, by, client, progress}` to that round's pages, where `progress` = the round's complete count, per-tech totals and unassigned.
+  - **Client (`static/review.js`):**
+    - applies teammates' changes in place (checkbox, completed-by, assignee, notes snippet) and flashes them, and updates the header count and tech chips;
+    - ignores the echo of its own saves (a per-tab id in `X-Review-Client`);
+    - **never swaps the text under an open notes editor:** it shows "X just changed these notes…", and the compare-and-set conflict still guards the save;
+    - after a reconnect, it re-syncs the visible rows from a fresh fetch of the page;
+    - a "Live updates: on / reconnecting…" badge sits next to the count.
+  - **Deploy change:** **gunicorn 1 worker × 24 threads** (was 2 × 4), because the broker is in-process, like IMS's single process. On 1 vCPU, the second worker gained little. Memory dropped to 91 MiB.
+  - **Tests:** `audits/test_live.py` (7): round scoping, cap, full-queue drop, stream frames/heartbeat/unsubscribe, broadcast payload incl. progress, no broadcast on a failed save, the stream view + 503 at cap, sign-in required. **Suite 99 passed.**
+  - **Live two-browser check on :8443** (two temp `ployd` sessions, headless Chrome, camera 266007):
+    - A ticks Complete → B updates in **0.31 s** with no reload (header and jgreene chip too);
+    - A saves a note → B shows it in **0.27 s**;
+    - B has the editor open while A changes the note → B gets the notice in 0.34 s with its typed text kept, and B's Save → the 409 conflict;
+    - Cancel → B shows A's text.
+
+    266007 was restored to its prior state, both sessions were deleted by key, the streams were released at the next heartbeat (22 s), and 0 `[STUCK]`.
+- **Remaining:** Phase 6 acceptance: two browsers/users, the side-by-side screenshot against IMS's RA modal, a concurrent-note 409, and confirming or dropping Escape = Cancel.
+
+### Final acceptance — a real audit day end to end
+LTI-only DST run on the camera VPN → VPN off → DE-only DST run → publish both into one round → reviewers on :8443 see one list, tick Complete and add Notes.
+
+## Hosting — IMS Linode :8443 (evidence 2026-10-27)
+- **Box** (read-only check, `deploy@45.79.220.29`):
+  - 1 vCPU, 1.9 GiB RAM (463 MiB used, 1.5 GiB available), load 0.37.
+  - Disk: 19 GB free of 49 GB.
+  - One container, `access_replacement-app-1` (58 MiB), bound to host ports 80 and 443.
+  - IMS deploys from `/opt/access_replacement`, using compose file secrets (`./secrets/*` → `/run/secrets/*`).
+  - IMS's TLS certificate is **self-signed, `CN=45.79.220.29`**, expiring 2027-04-28.
+- **Shape:**
+  - A separate compose project at `/opt/dst_camera_audit`.
+  - gunicorn serves TLS itself on **8443** with IMS's certificate and key, mounted read-only.
+  - `mem_limit: 512m`.
+  - File secrets in `/opt/dst_camera_audit/secrets/`.
+  - `DST_ROLE=review`.
+  - IMS's compose project is not touched.
+
+## Issue digest
+- **I1 — resolved 2026-10-27:** Supabase rejected the stored password (a commented `DB_PASSWORD_PRODUCTION` value with an inline comment after it). The user replaced it; auth passes on 6543 and 5432.
+- **I2 — resolved by design 2026-10-27:** the camera VPN (OpenVPN, full tunnel) blocks outbound 5432/6543, and IMS IT won't open ports. Resolution: data flow C′ (capture locally, publish with the VPN off). Rejected alternatives: host-route bypass (fragile, may breach VPN policy), Tailscale relay (an extra dependency), HTTPS ingest via the Linode (needs 443, which IMS holds).
+- **I3 — resolved 2026-10-28:** the user reports their teammates can reach and use https://45.79.220.29:8443 from their own networks. Previously **open, checked in Phase 4:** the camera VPN only allowed 443 among the ports tested. Reviewers must be able to reach `:8443` from their own networks. If they can't, review moves to 443 behind a reverse proxy shared with IMS.
+
+- **I4 — resolved 2026-10-28:** the user approved committing the CBW plan's schema/sync files on their own (`dbe111e`: `cameras/models.py`, `cameras/migrations/0006_…`, `services/ims_sync.py`; the rest of that plan stays uncommitted). Redeployed: in the container, `Installation` model fields = Supabase columns (**38 = 38**, none missing either way); container healthy at 128 MiB, IMS healthy. Previously **open, blocked the Phase 4 deploy:** the shared DB has `cameras.0006_installation_county_installation_created_at_and_more` applied. It belongs to the **CBW firmware plan** (`in-progress-plans/CBW_FIRMWARE_INVENTORY_REPORT.md`) and was sitting uncommitted in the working tree when Phase 1 ran `migrate --database shared`. It adds 13 NOT NULL `Installation` columns with no DB default (`county`, `street`, `site_type`, `created_at`, …). The committed code (`8b20479`) has no such fields (`cameras/models.py`, the migration and `services/ims_sync.py` are uncommitted), so an image built from a commit would fail every `sync_installations` insert. **Resolution:** commit the CBW plan's schema/sync changes before deploying (the user's call: it's that plan's work), or deploy from a tree that includes them.
+- **I5 — open (IMS, outside this plan):** `/opt/access_replacement/certs/key.pem` (IMS's TLS private key) is mode **0666**, world-readable *and* writable. Recommend `chmod 600`; the DST container runs as uid 1000 (`deploy`, the owner), so DST is unaffected by that change.
+
+- **I6 — resolved 2026-10-28:** the user opened 8443 in the Linode Cloud Firewall. From the laptop: `/accounts/login/` **200 in 0.18 s** ("Login — DST Camera Audit", "Sign in with IMS"); the cert is IMS's (`98:DB:…:05:E9`); signed-out `/` and `/media-db/…` → 302 to login; POST start/publish → 403; `/explorer/` → 403; IMS :443 `/healthz` 200. Previously **open, blocked Phase 4 acceptance:** inbound TCP 8443 to `45.79.220.29` is dropped (timeout from outside; the service is healthy on the box). **Resolution (operator):** `sudo ufw allow 8443/tcp` and/or allow 8443 in the Linode Cloud Firewall.
+
+## Open questions
+- ~~Q2~~ — **resolved 2026-10-28 (user):** (1) the username is **`carthur`** ("caruthur" was a typo); (2) **balance by site type: yes**; (3) **manual reassign: yes**.
+None. (Q1 resolved 2026-10-27: anyone signed in can tick Complete and edit Notes.)
+
+## Checklist
+- [x] Phase 0 — network reach spike (VPN off PASS; VPN blocks Postgres; DE needs no VPN)
+- [x] I1 — Supabase password fixed
+- [x] I2 — VPN blocks Postgres → resolved by the capture-then-publish design
+- [x] Phase 1 — roles + shared schema + API roles locked out + reaper off in review (accepted 2026-10-27)
+- [x] Phase 2 — stable IDs, audit rounds, structured OvrC time, `lock_shared_db` (accepted 2026-10-27)
+- [x] Phase 3 — publish to shared DB (command + panel, can be resumed and re-run) (accepted 2026-10-27)
+- [x] Phase 4 — review instance on the IMS Linode :8443 (incl. I3 reviewer reachability) (accepted 2026-10-28)
+- [x] Phase 5 — one-page review per round (accepted 2026-10-28)
+- [x] I7 — review-instance stalls: Supavisor stranded connections; fixed with a direct DB connection (`5dc4d8c`); confirmed by the user + 0 watchdog dumps
+- [ ] Phase 6 — reviewer assignment (x % n by arrival order, stored) + tech filter + shared Complete checkbox + Notes (IMS RA-modal style)
+- [ ] Remove the "Acceptance test 2026-10-27" round (shared + local tags) before the first real round
+- [x] I4 — CBW plan's cameras.0006 schema committed (`dbe111e`) and redeployed; model = Supabase (38/38 columns)
+- [x] I6 — inbound 8443 opened (Linode Cloud Firewall); reachable from the laptop
+- [x] Production IMS SSO client `dst_camera_audit_review` + API token installed (2026-10-28); first sync 847 installations
+- [ ] Final acceptance — real audit day end to end
+- [x] Q1 resolved — anyone signed in can tick Complete and edit Notes
+
+## Status
+in progress — 13/16. Phases 0–5 accepted. Phase 6 is built and deployed (assignment, filters, Complete/Notes, live SSE) and awaits the user's acceptance. I1–I4, I6, I7 resolved; I5 (IMS key 0666) open outside this plan. Next: Phase 6 acceptance, then the final real-audit-day acceptance.
+
+`Superseded by:` —

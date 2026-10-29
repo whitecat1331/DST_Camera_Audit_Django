@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Captures — DST Camera Audit{% endblock %}
+{% block container_class %}wide{% endblock %}
+{% block content %}
+<div class="browse-head">
+  <div>
+    <h1>Captures</h1>
+    <p class="lede">
+      Browse audit screenshots and VBE Daily Checks exports
+      {% if root_abspath %}<span class="cell-muted">· {{ root_abspath }}</span>{% endif %}
+    </p>
+  </div>
+</div>
+
+{% if not roots %}
+<p class="panel">No capture folders available.</p>
+{% else %}
+<nav class="explorer-roots" aria-label="Capture sources">
+  {% for r in roots %}
+  <a class="explorer-root {% if r.key == root_key %}active{% endif %}"
+     href="{% url 'capture_explorer' %}?root={{ r.key }}">{{ r.label }}</a>
+  {% endfor %}
+</nav>
+
+<nav class="explorer-crumb" aria-label="Path">
+  <a href="{% url 'capture_explorer' %}?root={{ root_key }}">{{ root_label }}</a>
+  {% for label, path in crumbs %}
+    {% if label %}
+    <span class="crumb-sep">/</span>
+    <a href="{% url 'capture_explorer' %}?root={{ root_key }}&path={{ path|urlencode }}">{{ label }}</a>
+    {% endif %}
+  {% endfor %}
+</nav>
+
+{% if error %}
+<p class="panel explorer-error">{{ error }}</p>
+{% endif %}
+
+<div class="explorer-layout {% if preview_url %}has-preview{% endif %}">
+  <section class="explorer-main panel">
+    <div class="explorer-toolbar">
+      {% if rel_path %}
+      <a class="btn-secondary" href="{% url 'capture_explorer' %}?root={{ root_key }}&path={{ parent_path|urlencode }}">↑ Up</a>
+      {% else %}
+      <span class="btn-secondary btn-disabled">↑ Up</span>
+      {% endif %}
+      <span class="cell-muted">
+        {{ folder_count }} folder{{ folder_count|pluralize }}
+        · {{ image_count }} image{{ image_count|pluralize }}
+      </span>
+    </div>
+
+    {% if entries %}
+    <div class="explorer-grid">
+      {% for e in entries %}
+        {% if e.is_dir %}
+        <a class="explorer-tile folder"
+           href="{% url 'capture_explorer' %}?root={{ root_key }}&path={{ e.rel_path|urlencode }}">
+          <span class="tile-icon folder-icon" aria-hidden="true"></span>
+          <span class="tile-name">{{ e.name }}</span>
+          {% if e.meta %}<span class="tile-meta">{{ e.meta }}</span>{% endif %}
+          {% if e.modified %}<span class="tile-date">{{ e.modified|date:"M j, Y g:i A" }}</span>{% endif %}
+        </a>
+        {% elif e.is_image %}
+        <a class="explorer-tile image {% if preview == e.rel_path %}active{% endif %}"
+           href="{% url 'capture_explorer' %}?root={{ root_key }}&path={{ rel_path|urlencode }}&preview={{ e.rel_path|urlencode }}">
+          <span class="tile-thumb">
+            {% if e.media_url %}
+            <img src="{{ e.media_url }}" alt="{{ e.name }}" loading="lazy">
+            {% else %}
+            <img src="{% url 'capture_explorer_file' %}?root={{ root_key }}&path={{ e.rel_path|urlencode }}"
+                 alt="{{ e.name }}" loading="lazy">
+            {% endif %}
+          </span>
+          <span class="tile-name">{{ e.name }}</span>
+          {% if e.modified %}<span class="tile-date">{{ e.modified|date:"M j, Y g:i A" }}</span>{% endif %}
+        </a>
+        {% else %}
+        <div class="explorer-tile file">
+          <span class="tile-icon file-icon" aria-hidden="true"></span>
+          <span class="tile-name">{{ e.name }}</span>
+          {% if e.modified %}<span class="tile-date">{{ e.modified|date:"M j, Y g:i A" }}</span>{% endif %}
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="cell-muted">This folder is empty.</p>
+    {% endif %}
+  </section>
+
+  {% if preview_url %}
+  <aside class="explorer-preview panel">
+    <div class="explorer-preview-head">
+      <strong>{{ preview|default:"Preview" }}</strong>
+      <a class="btn-secondary" href="{% url 'capture_explorer' %}?root={{ root_key }}&path={{ rel_path|urlencode }}">Close</a>
+    </div>
+    <a class="explorer-preview-frame" href="{{ preview_url }}" target="_blank" rel="noopener">
+      <img src="{{ preview_url }}" alt="{{ preview }}">
+    </a>
+    <p class="cell-muted"><a href="{{ preview_url }}" target="_blank" rel="noopener">Open full size</a></p>
+  </aside>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

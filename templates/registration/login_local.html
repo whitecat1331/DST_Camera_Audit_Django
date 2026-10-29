@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Local admin — DST Camera Audit{% endblock %}
+{% block content %}
+<section class="auth-panel">
+  <h1>Local admin</h1>
+  <p class="lede">Break-glass Django password login (DST_LOCAL_ADMIN=1).</p>
+  <form method="post" action="{% url 'admin:login' %}" class="stack">
+    <p>Use Django admin at <a href="/admin/login/">/admin/login/</a> for local break-glass access.</p>
+  </form>
+  <p><a href="{% url 'login' %}">Back to IMS login</a></p>
+</section>
+{% endblock %}

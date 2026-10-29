@@ -1,0 +1,26 @@
+<table class="data">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Pole</th>
+      <th>Device</th>
+      <th>Host</th>
+      <th>Status</th>
+      <th>Created</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for job in jobs %}
+    <tr>
+      <td><a href="{% url 'audit_detail' job.pk %}">#{{ job.pk }}</a></td>
+      <td>{{ job.pole_number }}</td>
+      <td>{{ job.get_device_type_display }}</td>
+      <td><code>{{ job.target_host }}</code></td>
+      <td><span class="badge status-{{ job.status }}">{{ job.get_status_display }}</span></td>
+      <td>{{ job.created_at }}</td>
+    </tr>
+    {% empty %}
+    <tr><td colspan="6">No audit jobs yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
