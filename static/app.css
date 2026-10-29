@@ -1064,6 +1064,9 @@ a.icon-btn {
 .dst-filters { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; margin-bottom: 1rem; }
 .dst-filters label { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.85rem; color: var(--muted); }
 .dst-filter-search { flex: 1 1 16rem; min-width: 14rem; }
+.dst-filter-search textarea { resize: vertical; font: inherit; }
+.dst-unmatched { margin: 0.5rem 0 0; color: var(--warn); font-size: 0.9rem; }
+.dst-filter-search textarea,
 .dst-filter-search input[type="search"] {
   width: 100%;
   min-width: 12rem;

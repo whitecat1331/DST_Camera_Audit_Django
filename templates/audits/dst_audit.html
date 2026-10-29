@@ -20,10 +20,10 @@
   <h2>Run configuration</h2>
   <form method="get" class="filters dst-filters" id="dst-filters">
     {% if request.GET.job %}<input type="hidden" name="job" value="{{ request.GET.job }}">{% endif %}
-    <label class="dst-filter-search">Search
-      <input type="search" name="q" value="{{ q }}"
-        placeholder="Pole, identifier, serial, FX, agency…"
-        autofocus>
+    <label class="dst-filter-search">Search <span class="muted">(one per line, or comma-separated)</span>
+      <textarea name="q" rows="{% if search_terms > 1 %}3{% else %}1{% endif %}" id="dst-search"
+        placeholder="Pole, identifier, serial, FX, agency… paste a list: 233201, 255037, FX1168"
+        autofocus>{{ q }}</textarea>
     </label>
     <label>Scope
       <select name="scope" onchange="this.form.submit()">
@@ -55,6 +55,12 @@
       {% endif %}
     </div>
   </form>
+  {% if unmatched_terms %}
+  <p class="dst-unmatched">
+    <strong>No eligible site for:</strong> {{ unmatched_terms|join:", " }}
+    <span class="muted">(within the scope, state and agency above)</span>
+  </p>
+  {% endif %}
 
   <div class="dst-stats">
     <div class="dst-stat">
@@ -378,6 +384,16 @@
   const scheduleBtn = document.getElementById("dst-schedule-btn");
   const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const canAudit = {{ can_audit|yesno:"true,false" }};
+  const searchBox = document.getElementById("dst-search");
+  searchBox?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      searchBox.form.requestSubmit();
+    }
+  });
+  searchBox?.addEventListener("input", () => {
+    if (searchBox.value.includes("\n")) searchBox.rows = 3;
+  });
   const FILTERS = {
     scope: "{{ scope|escapejs }}",
     state: "{{ state|escapejs }}",

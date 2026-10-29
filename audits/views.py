@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any
 
 from django.conf import settings
@@ -859,12 +860,13 @@ def dst_audit_page(request):
     preview = []
     lti_count = 0
     de_count = 0
-    q_lower = q.lower()
+    terms = [t.lower() for t in parse_search_terms(q)]
+    matched_terms: set[str] = set()
     for inst in sites:
         kind = _dst_site_kind(inst) or "?"
         serials = _dst_serials_for_inst(inst)
         serials_text = " · ".join(serials) if serials else ""
-        if q_lower:
+        if terms:
             hay = " ".join(
                 [
                     (inst.pole_number or ""),
@@ -882,8 +884,10 @@ def dst_audit_page(request):
                     " ".join(inst.fx_numbers or []),
                 ]
             ).lower()
-            if q_lower not in hay:
+            hits = site_term_hits(terms, inst.pole_number, hay)
+            if not hits:
                 continue
+            matched_terms.update(hits)
         if kind == "lti":
             lti_count += 1
         elif kind == "de":
@@ -954,6 +958,8 @@ def dst_audit_page(request):
             "state": state,
             "agency": agency,
             "q": q,
+            "search_terms": len(terms),
+            "unmatched_terms": [t for t in parse_search_terms(q) if t.lower() not in matched_terms],
             "states": states,
             "agencies": agencies,
             "sites": preview,
@@ -974,6 +980,27 @@ def dst_audit_page(request):
             "has_filters": bool(q or state or agency or (scope and scope != "all")),
         },
     )
+
+
+def parse_search_terms(raw: str) -> list[str]:
+    """Search terms, IMS Installation Multi-Search style: one per line or split on , and ;.
+
+    Blank and repeated (case-insensitive) terms are dropped; order and casing kept.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[\r\n,;]+", raw or ""):
+        term = part.strip()
+        if term and term.lower() not in seen:
+            seen.add(term.lower())
+            out.append(term)
+    return out
+
+
+def site_term_hits(terms: list[str], pole: str | None, hay: str) -> list[str]:
+    """The (lowercased) terms a site matches: its exact pole number, or a substring of hay."""
+    pole = (pole or "").strip().lower()
+    return [t for t in terms if t == pole or t in hay]
 
 
 def _dst_serials_for_inst(inst) -> list[str]:
