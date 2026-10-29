@@ -13,7 +13,6 @@ from pathlib import Path
 
 from PIL import Image
 
-from services.password_hints import HintStore, first_then_rest
 
 logger = logging.getLogger(__name__)
 
@@ -724,25 +723,6 @@ def _close_session_notes(
         time.sleep(0.5)
 
 
-# TeamViewer ID -> {"connect": n, "camera": n}: password numbers that last worked.
-TV_HINTS = HintStore("tv_password_hints.json", "TV_PASSWORD_HINTS_PATH")
-
-
-def _hint(tv_id: str, field: str) -> int | None:
-    value = TV_HINTS.get(tv_id)
-    number = value.get(field) if isinstance(value, dict) else None
-    return number if isinstance(number, int) else None
-
-
-def _remember(tv_id: str, field: str, number: int) -> None:
-    if _hint(tv_id, field) == number:
-        return
-    value = TV_HINTS.get(tv_id)
-    value = dict(value) if isinstance(value, dict) else {}
-    value[field] = number
-    TV_HINTS.set(tv_id, value)
-
-
 def _connect(
     gw,
     teamviewer_id: str,
@@ -854,13 +834,13 @@ def capture_dragoneye_via_teamviewer(
             tv_id,
             teamviewer_path,
             teamviewer_passwords,
-            first_then_rest(len(teamviewer_passwords), _hint(tv_id, "connect")),
+            list(range(1, len(teamviewer_passwords) + 1)),  # .env order: TV_PASSWORD #1, then #2
             stale,
             wait_for_connection_sec,
             progress,
             _cancelled,
         )
-        _remember(tv_id, "connect", connect_no)
+        logger.info("[TV] connected with TeamViewer password #%s", connect_no)
 
         session_title_hint = win.title
         session_hwnd = win._hWnd
@@ -875,16 +855,15 @@ def capture_dragoneye_via_teamviewer(
 
         if camera_passwords:
             progress(f"OS login ({len(camera_passwords)} password(s))")
-            unlocked = _login(
+            _login(
                 pyautogui,
                 session_hwnd,
                 camera_passwords,
-                first_then_rest(len(camera_passwords), _hint(tv_id, "camera")),
+                # TV_CAMERA_PASSWORDS is already ordered TV_PASSWORD #2, then #1.
+                list(range(1, len(camera_passwords) + 1)),
                 should_cancel,
                 progress,
             )
-            if unlocked:
-                _remember(tv_id, "camera", unlocked)
 
         # Do NOT send Escape or type TV_USERNAME — both break the session / desktop.
         progress("Waiting after OS login…")
