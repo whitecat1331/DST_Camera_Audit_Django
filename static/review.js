@@ -48,10 +48,13 @@
     });
   }
 
-  function rowOf(el) { return el.closest("tr[data-key]"); }
+  // A camera is one <tbody class="review-site" data-key> with a line per capture.
+  var SITE = ".review-site[data-key]";
+
+  function rowOf(el) { return el.closest(SITE); }
 
   function rowFor(key) {
-    var rows = table.querySelectorAll("tr[data-key]");
+    var rows = table.querySelectorAll(SITE);
     for (var i = 0; i < rows.length; i++) if (rows[i].getAttribute("data-key") === key) return rows[i];
     return null;
   }
@@ -301,7 +304,7 @@
       .then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); })
       .then(function (html) {
         var doc = new DOMParser().parseFromString(html, "text/html");
-        doc.querySelectorAll("tr[data-key]").forEach(function (fresh) {
+        doc.querySelectorAll(SITE).forEach(function (fresh) {
           var row = rowFor(fresh.getAttribute("data-key"));
           if (!row) return;
           var box = fresh.querySelector(".review-complete-box");

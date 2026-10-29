@@ -18,7 +18,9 @@ Django web app for **ASE installation camera audits** at Blue Line Solutions. Op
 3. **Capture** — per site: LTI CBW + VNC, or DE TeamViewer lanes
 4. **OvrC times** — one OvrC pass for all FX local times (keeps the portal’s ADT/EDT zone label)
 
-Compare **OvrC device time** on each site job to **Finished** (EST). Progress bars (4 phases) and cancel are on the DST Audit page; terminal logs use `[DST]` / `[AUDIT]`.
+Progress bars (4 phases) and cancel are on the DST Audit page; terminal logs use `[DST]` / `[AUDIT]`.
+
+**Per-device time check.** Captures run concurrently and out of order, so each one stores when it was grabbed and the clock the device showed: CBW from the Date/Time page text, VNC and DragonCam (Ubuntu top-bar clock) read off the image with Windows' built-in OCR (`DEVICE_CLOCK_OCR=0` turns OCR off), OvrC from its dashboard. Each site job stores its own timezone (`site_tz`: the agency list for split states like FL/TN, else GPS when valid for the state, else the state). The review page (`/audits/review/`) shows one line per capture: captured (Eastern), device time, what it should be in the site's zone, drift, and Pass (within 2 min) / Fail / Unread.
 
 Chrome is required for CBW and OvrC captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
 

@@ -102,6 +102,9 @@ class AuditJob(models.Model):
     ovrc_device_time = models.DateTimeField(null=True, blank=True)
     ovrc_captured_at = models.DateTimeField(null=True, blank=True)
     drift_seconds = models.IntegerField(null=True, blank=True)
+    # The site's own IANA zone (audits/site_timezone.py), set at capture: what
+    # each device's clock should follow. Blank on runs before it existed.
+    site_tz = models.CharField(max_length=64, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -124,6 +127,14 @@ class AuditScreenshot(models.Model):
     image = models.ImageField(upload_to=audit_upload_to)
     created_at = models.DateTimeField(auto_now_add=True)
     public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    # When the image was grabbed (created_at is when the row was saved, seconds later).
+    captured_at = models.DateTimeField(null=True, blank=True)
+    # The device's own clock as shown in this capture (services/device_clock.py):
+    # the text read, the wall clock as ISO "YYYY-MM-DDTHH:MM:SS" (no zone: it's
+    # what the device displays), and where it came from (page / ocr / ovrc).
+    device_time_raw = models.CharField(max_length=128, blank=True)
+    device_time = models.CharField(max_length=19, blank=True)
+    device_time_source = models.CharField(max_length=16, blank=True)
 
     class Meta:
         ordering = ["created_at"]

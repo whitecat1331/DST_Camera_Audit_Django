@@ -315,6 +315,8 @@ DST_PUBLISH_WAIT_SECONDS = int(os.getenv("DST_PUBLISH_WAIT_SECONDS", str(12 * 36
 DST_LIVE_PUBLISH = os.getenv("DST_LIVE_PUBLISH", "1").strip().lower() not in {"0", "false", "no", "off"}
 # Images uploaded at once while publishing (measured: 4 = 2.5x serial, 8 no better).
 DST_PUBLISH_UPLOAD_CONCURRENT = int(os.getenv("DST_PUBLISH_UPLOAD_CONCURRENT", "4"))
+# Read device clocks off VNC/DragonCam captures with Windows OCR (services/device_clock.py).
+DEVICE_CLOCK_OCR = os.getenv("DEVICE_CLOCK_OCR", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 from config.logging import build_logging_config  # noqa: E402
 

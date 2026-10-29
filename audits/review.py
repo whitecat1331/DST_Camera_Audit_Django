@@ -1,34 +1,122 @@
 """One-page review of a published DST audit round.
 
-One row per camera (site key) in the round, built from the **newest** DST_SITE
+One entry per camera (site key) in the round, built from the **newest** DST_SITE
 job for that camera — the LTI run, the DE run and any re-runs merge into one
-list. Query count is constant in the number of cameras (each query is ~32 ms
-from the review Linode to Supabase).
+list. Each camera shows one line per capture: when it was grabbed (Eastern),
+the clock the device showed, what that clock should have shown in the site's
+own zone, the drift and a pass/fail. Query count is constant in the number of
+cameras (each query is ~32 ms from the review Linode to Supabase).
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from urllib.parse import urlencode
 
 from django.db.models import F, Q
 
+from audits import device_drift
 from audits.models import AuditJob, AuditRound, AuditScreenshot, InstallationAuditReview
-from audits.ovrc_time import EASTERN
+from audits.ovrc_time import EASTERN, parse_ovrc_local
+from audits.site_timezone import site_timezone
 from audits.thumbs import normalize_thumb_label
 
-# OvrC shows minutes only (±60 s), so flag only clear drift.
-DRIFT_FLAG_SECONDS = 120
+DRIFT_FLAG_SECONDS = device_drift.PASS_SECONDS
 _LAYER_ORDER = ("cbw", "vnc_l1", "vnc_l2", "de_l1", "de_l2", "de_l3")
+# Captures that show a device clock (services/device_clock.py, OvrC).
+_CLOCK_PREFIXES = ("cbw", "vnc_", "de_l", "ovrc_")
 KINDS = ("lti", "de")
 STATUSES = ("incomplete", "complete")
+
+_SOURCE_LABELS = {"page": "CBW page", "ocr": "read from image", "ocr-min": "read from image", "ovrc": "OvrC"}
+# Sources that show minutes only: a correct clock reads up to 59 s behind.
+_MINUTE_SOURCES = {"ovrc", "ocr-min"}
+_ZONE_NAMES = {
+    "America/New_York": "Eastern",
+    "America/Chicago": "Central",
+    "America/Denver": "Mountain",
+    "America/Los_Angeles": "Pacific",
+}
+_STAMP = "%b %d, %I:%M:%S %p %Z"
+
+
+def format_drift(seconds: int) -> str:
+    """Signed and compact: "+5s", "-2m 03s", "+1h 00m 02s"."""
+    sign = "-" if seconds < 0 else "+"
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{sign}{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{sign}{minutes}m {secs:02d}s"
+    return f"{sign}{secs}s"
 
 
 @dataclass
 class Capture:
+    """One capture and the time check for the device it shows."""
+
     key: str
     shot: AuditScreenshot
+    site_tz: str = ""
+    # When the image was grabbed; older runs only have the row's save time.
+    captured_at: datetime | None = None
+    captured_estimated: bool = False
+    device_time: str = ""  # naive ISO wall clock
+    device_time_raw: str = ""
+    device_time_source: str = ""
+
+    @property
+    def checkable(self) -> bool:
+        return self.key.startswith(_CLOCK_PREFIXES)
+
+    @property
+    def drift(self) -> int | None:
+        return device_drift.drift_seconds(self.device_time, self.captured_at, self.site_tz)
+
+    @property
+    def verdict(self) -> str:
+        """"pass" / "fail" / "unread", or "" for captures that show no clock."""
+        return device_drift.verdict(self.drift) if self.checkable else ""
+
+    @property
+    def drift_display(self) -> str:
+        d = self.drift
+        return "" if d is None else format_drift(d)
+
+    @property
+    def captured_eastern(self) -> str:
+        return self.captured_at.astimezone(EASTERN).strftime(_STAMP) if self.captured_at else ""
+
+    @property
+    def expected_local(self) -> str:
+        """What a correct clock at the site showed at the moment of capture."""
+        if not self.captured_at:
+            return ""
+        return self.captured_at.astimezone(device_drift.zone(self.site_tz)).strftime(_STAMP)
+
+    @property
+    def device_display(self) -> str:
+        try:
+            wall = datetime.fromisoformat(self.device_time) if self.device_time else None
+        except ValueError:
+            wall = None
+        if wall is None:
+            return ""
+        # Minute-only clocks: don't invent seconds.
+        minutes_only = self.device_time_source in _MINUTE_SOURCES
+        return wall.strftime("%b %d, %I:%M %p" if minutes_only else "%b %d, %I:%M:%S %p")
+
+    @property
+    def device_note(self) -> str:
+        note = _SOURCE_LABELS.get(self.device_time_source, self.device_time_source)
+        if self.device_time_source == "ovrc":
+            _wall, claimed_zone = parse_ovrc_local(self.device_time_raw)
+            if claimed_zone:
+                note += f", says {claimed_zone}"
+        return note
 
 
 @dataclass
@@ -40,6 +128,7 @@ class ReviewRow:
     attempts: int
     captures: list[Capture] = field(default_factory=list)
     review: InstallationAuditReview | None = None
+    site_tz: str = ""  # what this camera's device clocks are checked against
 
     @property
     def assigned_to(self) -> str:
@@ -62,20 +151,25 @@ class ReviewRow:
         )
 
     @property
+    def site_tz_name(self) -> str:
+        return _ZONE_NAMES.get(self.site_tz, self.site_tz)
+
+    @property
+    def lines(self) -> list[Capture | None]:
+        """One table line per capture; a camera with none still gets one."""
+        return list(self.captures) or [None]
+
+    @property
+    def devices_failing(self) -> int:
+        return sum(c.verdict == "fail" for c in self.captures)
+
+    @property
+    def devices_unread(self) -> int:
+        return sum(c.verdict == "unread" for c in self.captures)
+
+    @property
     def drift_flagged(self) -> bool:
-        d = self.job.drift_seconds
-        return d is not None and abs(d) >= DRIFT_FLAG_SECONDS
-
-    @property
-    def drift_minutes(self) -> float | None:
-        d = self.job.drift_seconds
-        return None if d is None else round(d / 60, 1)
-
-    @property
-    def eastern_at_read(self) -> str:
-        """Eastern wall clock when OvrC was read — what the device should show."""
-        at = self.job.ovrc_captured_at
-        return at.astimezone(EASTERN).strftime("%b %d, %Y %I:%M %p %Z") if at else ""
+        return self.devices_failing > 0
 
 
 def _capture_sort(c: Capture) -> tuple[int, str]:
@@ -86,6 +180,44 @@ def _capture_sort(c: Capture) -> tuple[int, str]:
     if c.key.startswith("ovrc_"):
         return (len(_LAYER_ORDER) + 1, c.key)
     return (len(_LAYER_ORDER) + 2, c.key)
+
+
+def _capture(key: str, shot: AuditScreenshot, job: AuditJob, site_tz: str) -> Capture:
+    capture = Capture(
+        key,
+        shot,
+        site_tz=site_tz,
+        captured_at=shot.captured_at or shot.created_at,
+        captured_estimated=shot.captured_at is None,
+        device_time=shot.device_time,
+        device_time_raw=shot.device_time_raw,
+        device_time_source=shot.device_time_source,
+    )
+    # Runs before per-capture times kept the OvrC reading on the job only.
+    if (
+        not capture.device_time
+        and job.ovrc_fx
+        and job.ovrc_local_time_raw
+        and key == f"ovrc_{job.ovrc_fx.lower()}"
+    ):
+        wall, _zone = parse_ovrc_local(job.ovrc_local_time_raw)
+        if wall is not None:
+            capture.device_time = wall.isoformat()
+            capture.device_time_raw = job.ovrc_local_time_raw
+            capture.device_time_source = "ovrc"
+            if job.ovrc_captured_at:
+                capture.captured_at = job.ovrc_captured_at
+                capture.captured_estimated = False
+    return capture
+
+
+def _site_tz(job: AuditJob, installation) -> str:
+    """The zone stored at capture; older runs fall back to the agency/state list."""
+    if job.site_tz:
+        return job.site_tz
+    if installation is None:
+        return ""
+    return site_timezone(installation, use_gps=False)[0]
 
 
 def _installations_by_key(keys: list[str]) -> dict[str, object]:
@@ -124,17 +256,20 @@ def build_round_rows(round_: AuditRound) -> list[ReviewRow]:
     rows: list[ReviewRow] = []
     for key, job in newest.items():
         kind = (job.target_host or "").strip().lower()
+        installation = installations.get(key)
         row = ReviewRow(
             key=key,
             job=job,
-            installation=installations.get(key),
+            installation=installation,
             kind=kind if kind in {"lti", "de"} else "",
             attempts=attempts[key],
             review=reviews.get(key),
+            site_tz=_site_tz(job, installation),
         )
         for shot in job.screenshots.all():
             if shot.image:
-                row.captures.append(Capture(normalize_thumb_label(shot) or shot.label, shot))
+                label = normalize_thumb_label(shot) or shot.label
+                row.captures.append(_capture(label, shot, job, row.site_tz))
         row.captures.sort(key=_capture_sort)
         rows.append(row)
     rows.sort(key=lambda r: (r.kind != "lti", getattr(r.installation, "identifier", "") or r.key))
@@ -149,6 +284,8 @@ def summarize(rows: list[ReviewRow]) -> dict[str, int]:
         "failed": sum(r.failed for r in rows),
         "skipped": sum(r.skipped for r in rows),
         "drift": sum(r.drift_flagged for r in rows),
+        "devices_failing": sum(r.devices_failing for r in rows),
+        "devices_unread": sum(r.devices_unread for r in rows),
         "complete": sum(r.completed for r in rows),
         "unassigned": sum(not r.assigned_to for r in rows),
     }

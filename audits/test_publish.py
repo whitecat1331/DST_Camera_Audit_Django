@@ -196,6 +196,21 @@ class PublishRunsTests(TestCase):
         self.assertEqual((kept.completed, kept.notes), (True, "checked"))
         self.assertEqual(AuditRound.objects.using(SHARED).get().reviewers, ["carthur", "jgreene", "ployd"])
 
+    def test_capture_and_device_times_are_published(self):
+        at = timezone.now() - timedelta(minutes=5)
+        AuditScreenshot.objects.filter(pk=self.shot.pk).update(
+            captured_at=at, device_time_raw="Time: 10:15:02", device_time="2026-10-29T10:15:02",
+            device_time_source="ocr",
+        )
+        AuditJob.objects.filter(pk=self.site.pk).update(site_tz="America/Chicago")
+        self.publish()
+        shared = AuditScreenshot.objects.using(SHARED).get(public_id=self.shot.public_id)
+        self.assertEqual(
+            (shared.captured_at, shared.device_time, shared.device_time_source, shared.device_time_raw),
+            (at, "2026-10-29T10:15:02", "ocr", "Time: 10:15:02"),
+        )
+        self.assertEqual(AuditJob.objects.using(SHARED).get(public_id=self.site.public_id).site_tz, "America/Chicago")
+
     # ── Live publish: sites go out as they finish; the final publish sends only changes ──
 
     def live(self, *sites):

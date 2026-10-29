@@ -1319,10 +1319,15 @@ a.icon-btn {
 .dst-stat.is-warn .dst-stat-n { color: var(--warn); }
 .dst-stat.is-danger .dst-stat-n { color: var(--danger); }
 .review-table td { vertical-align: top; }
-.review-table tr.is-failed td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
-.review-table tr.is-drift:not(.is-failed) td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+.review-site.is-failed td.review-camera { box-shadow: inset 3px 0 0 var(--danger); }
+.review-site.is-drift:not(.is-failed) td.review-camera { box-shadow: inset 3px 0 0 var(--warn); }
+/* One camera = one tbody; separate cameras, keep a camera's capture lines light. */
+.review-table tbody.review-site { border-top: 2px solid var(--line); }
+.review-table tbody.review-site tr.review-line + tr.review-line td { border-top-color: rgba(127, 127, 127, 0.15); }
+.review-table tbody.review-site td { vertical-align: middle; }
+.review-table tbody.review-site td[rowspan] { vertical-align: top; }
 .review-camera .badge { margin-top: 0.35rem; }
-.review-captures { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.review-site-tz { font-size: 0.75rem; margin-top: 0.3rem; }
 .review-capture { margin: 0; width: 132px; }
 .review-capture img { width: 132px; height: 88px; object-fit: cover; display: block; border: 1px solid var(--line); }
 .review-capture figcaption { font-size: 0.75rem; margin-top: 0.2rem; }
@@ -1330,6 +1335,11 @@ a.icon-btn {
 .review-drift { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .drift-flag { color: var(--warn); font-weight: 700; }
 .drift-ok { color: var(--ok); }
+.review-check { text-align: center; }
+.check-badge { display: inline-block; min-width: 3.6rem; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 700; border: 1px solid var(--line); }
+.check-pass { color: var(--ok); border-color: var(--ok); }
+.check-fail { color: var(--danger); border-color: var(--danger); }
+.check-unread { color: var(--muted); font-weight: 400; }
 .review-error { color: var(--danger); font-size: 0.8rem; margin-top: 0.3rem; max-width: 22rem; }
 
 /* Review: assignment, Complete, Notes (Phase 6) */
@@ -1359,7 +1369,7 @@ a.icon-btn {
 .review-meta { font-size: 0.72rem; margin-top: 0.2rem; }
 .review-complete { text-align: center; }
 .review-complete-box { width: 1.15rem; height: 1.15rem; cursor: pointer; accent-color: var(--ice-bright); }
-.review-table tr.is-complete td { background: rgba(78, 184, 255, 0.05); }
+.review-site.is-complete td { background: rgba(78, 184, 255, 0.05); }
 .review-notes { min-width: 14rem; max-width: 22rem; cursor: pointer; font-size: 0.85rem; white-space: pre-wrap; word-break: break-word; }
 .review-notes:hover, .review-notes:focus { outline: 1px dashed var(--line); outline-offset: -3px; }
 .text-dim { color: #475569; }

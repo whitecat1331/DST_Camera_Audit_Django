@@ -64,6 +64,22 @@ def _find_date_time_elements(driver: webdriver.Chrome):
     )
 
 
+def _save_current_time(driver, filepath: Path) -> None:
+    """Keep the page's "Current:" clock next to the image (services/device_clock.py reads it).
+
+    Best effort: a page that doesn't show it leaves the device time unread.
+    """
+    from services.device_clock import write_clock_sidecar
+
+    try:
+        text = driver.find_element(By.ID, "mainContent").text
+    except Exception:  # noqa: BLE001
+        return
+    _, found, rest = text.partition("Current")
+    rest = rest.lstrip(": \n")
+    write_clock_sidecar(filepath, rest.splitlines()[0] if found and rest else "")
+
+
 def screenshot_date_time(
     url: str,
     username: str,
@@ -145,6 +161,7 @@ def screenshot_date_time(
                     wait.until(EC.visibility_of_element_located((By.ID, "mainContent")))
                     time.sleep(2)
                     driver.save_screenshot(str(filepath))
+                    _save_current_time(driver, filepath)
                     logger.info(
                         "[CBW] Saved screenshot (top-level Date/Time) path=%s elapsed=%.1fs",
                         filepath,
@@ -174,6 +191,7 @@ def screenshot_date_time(
         wait.until(EC.visibility_of_element_located((By.ID, "mainContent")))
         time.sleep(2)
         driver.save_screenshot(str(filepath))
+        _save_current_time(driver, filepath)
         logger.info(
             "[CBW] Saved screenshot path=%s elapsed=%.1fs",
             filepath,

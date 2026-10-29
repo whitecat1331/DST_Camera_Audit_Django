@@ -16,3 +16,13 @@ requests>=2.31
 pyautogui>=0.9.54
 PyGetWindow>=0.0.9
 pyvnc @ git+https://github.com/regulad/pyvnc.git@f68af932dba45e35c0bab52bc87e6e1a918bbc15
+# Site timezone from GPS (audits/site_timezone.py), capture laptop only.
+timezonefinder>=9.2
+# Device clocks read off VNC/DragonCam captures with Windows' built-in OCR (services/device_clock.py).
+winrt-runtime>=4.0; sys_platform == "win32"
+winrt-Windows.Media.Ocr>=3.0; sys_platform == "win32"
+winrt-Windows.Graphics.Imaging>=3.0; sys_platform == "win32"
+winrt-Windows.Storage.Streams>=3.0; sys_platform == "win32"
+winrt-Windows.Foundation>=3.0; sys_platform == "win32"
+winrt-Windows.Foundation.Collections>=3.0; sys_platform == "win32"
+winrt-Windows.Globalization>=3.0; sys_platform == "win32"

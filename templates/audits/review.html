@@ -7,9 +7,11 @@
   <div>
     <h1>DST Audit Review</h1>
     <p class="lede">
-      One row per camera in the round, using its newest capture. Device time is the
-      FX clock read from OvrC; it should match Eastern time at the moment it was read.
-      Drift of {{ drift_flag_minutes }}+ minutes is flagged.
+      One block per camera in the round, using its newest run, with a line per capture.
+      <strong>Captured</strong> is when the image was grabbed (Eastern). <strong>Device</strong> is the clock
+      the device showed; <strong>Should be</strong> is the correct time in the site's own timezone at that
+      moment. A device passes within {{ drift_flag_minutes }} minutes; a clock that couldn't be read
+      shows <em>Unread</em>: check the image.
     </p>
   </div>
   {% if rounds %}
@@ -32,6 +34,8 @@
   <div class="dst-stat"><span class="dst-stat-n">{{ summary.lti }}</span><span class="dst-stat-l">LTI</span></div>
   <div class="dst-stat"><span class="dst-stat-n">{{ summary.de }}</span><span class="dst-stat-l">DE</span></div>
   <div class="dst-stat {% if summary.drift %}is-warn{% endif %}"><span class="dst-stat-n">{{ summary.drift }}</span><span class="dst-stat-l">drift flagged</span></div>
+  <div class="dst-stat {% if summary.devices_failing %}is-danger{% endif %}"><span class="dst-stat-n">{{ summary.devices_failing }}</span><span class="dst-stat-l">device{{ summary.devices_failing|pluralize }} failing</span></div>
+  {% if summary.devices_unread %}<div class="dst-stat"><span class="dst-stat-n">{{ summary.devices_unread }}</span><span class="dst-stat-l">unread</span></div>{% endif %}
   <div class="dst-stat {% if summary.failed %}is-danger{% endif %}"><span class="dst-stat-n">{{ summary.failed }}</span><span class="dst-stat-l">failed</span></div>
   {% if summary.skipped %}<div class="dst-stat"><span class="dst-stat-n">{{ summary.skipped }}</span><span class="dst-stat-l">skipped offline</span></div>{% endif %}
   <div class="dst-stat"><span class="dst-stat-n" id="review-complete-n">{{ summary.complete }}/{{ summary.cameras }}</span><span class="dst-stat-l">complete</span></div>
@@ -76,7 +80,7 @@
   <div class="filter-group">
     <label for="review-filter-drift" class="filter-check-label">
       <input id="review-filter-drift" name="drift" type="checkbox" value="1" {% if f.drift %}checked{% endif %}>
-      Drift flagged only
+      Failing a time check only
     </label>
     <label for="review-filter-failed" class="filter-check-label filter-check-label-tight">
       <input id="review-filter-failed" name="failed" type="checkbox" value="1" {% if f.failed %}checked{% endif %}>
@@ -98,19 +102,24 @@
       <tr>
         <th>Camera</th>
         <th>Status</th>
-        <th>Captures</th>
-        <th>Device time (OvrC)</th>
-        <th>Eastern at read</th>
+        <th>Capture</th>
+        <th>Captured (Eastern)</th>
+        <th>Device</th>
+        <th>Should be (site time)</th>
         <th>Drift</th>
+        <th>Check</th>
         <th>Assigned to</th>
         <th>Complete</th>
         <th>Notes</th>
       </tr>
     </thead>
-    <tbody>
-      {% for row in rows %}
-      <tr class="{% if row.failed %}is-failed{% endif %} {% if row.drift_flagged %}is-drift{% endif %} {% if row.completed %}is-complete{% endif %}" data-key="{{ row.key }}" data-label="{{ row.installation.identifier|default:row.key }}{% if row.installation.pole_number %} / {{ row.installation.pole_number }}{% endif %}">
-        <td class="review-camera">
+    {% for row in rows %}
+    <tbody class="review-site {% if row.failed %}is-failed{% endif %} {% if row.drift_flagged %}is-drift{% endif %} {% if row.completed %}is-complete{% endif %}" data-key="{{ row.key }}" data-label="{{ row.installation.identifier|default:row.key }}{% if row.installation.pole_number %} / {{ row.installation.pole_number }}{% endif %}">
+      {% with span=row.lines|length %}
+      {% for c in row.lines %}
+      <tr class="review-line">
+        {% if forloop.first %}
+        <td class="review-camera" rowspan="{{ span }}">
           {% if row.installation %}
           <a href="{% url 'camera_detail' pk=row.installation.pk %}"><strong>{{ row.installation.identifier|default:row.key }}</strong></a>
           <div class="muted">Pole {{ row.installation.pole_number|default:"—" }} · {{ row.installation.agency|default:"—" }}{% if row.installation.state %}, {{ row.installation.state }}{% endif %}</div>
@@ -119,43 +128,46 @@
           <div class="muted">No matching installation</div>
           {% endif %}
           {% if row.kind %}<span class="badge kind-{{ row.kind }}">{{ row.kind|upper }}</span>{% endif %}
+          {% if row.site_tz %}<div class="muted review-site-tz" title="{{ row.site_tz }}">Site time: {{ row.site_tz_name }}</div>{% endif %}
         </td>
-        <td>
+        <td rowspan="{{ span }}">
           <a href="{% url 'audit_detail' pk=row.job.pk %}" class="badge status-{{ row.job.status }}">{{ row.job.get_status_display }}</a>
           {% if row.attempts > 1 %}<div class="muted">newest of {{ row.attempts }} runs</div>{% endif %}
           {% if row.job.error_message %}<div class="review-error">{{ row.job.error_message|truncatechars:160 }}</div>{% endif %}
         </td>
-        <td>
-          <div class="review-captures">
-            {% for c in row.captures %}
-            <figure class="review-capture">
-              <button type="button" class="thumb-btn" data-full="{{ c.shot.image.url }}" title="{{ row.key }} — {{ c.key }}">
-                <img src="{{ c.shot.image|thumb_src }}" alt="{{ c.key }} capture" loading="lazy">
-              </button>
-              <figcaption>{{ c.key }} <span class="muted">{{ c.shot.created_at|date:"H:i T" }}</span></figcaption>
-            </figure>
-            {% empty %}
-            <span class="muted">No captures</span>
-            {% endfor %}
-          </div>
+        {% endif %}
+        {% if c %}
+        <td class="review-capture-cell">
+          <figure class="review-capture">
+            <button type="button" class="thumb-btn" data-full="{{ c.shot.image.url }}" title="{{ row.key }} — {{ c.key }}">
+              <img src="{{ c.shot.image|thumb_src }}" alt="{{ c.key }} capture" loading="lazy">
+            </button>
+            <figcaption>{{ c.key }}</figcaption>
+          </figure>
         </td>
         <td class="review-time">
-          {% if row.job.ovrc_local_time_raw %}
-          {{ row.job.ovrc_local_time_raw }}
-          {% if row.job.ovrc_fx %}<div class="muted">{{ row.job.ovrc_fx }}</div>{% endif %}
-          {% elif row.kind == "lti" %}
-          <span class="muted">Read the CBW capture</span>
-          {% else %}
-          <span class="muted">—</span>
-          {% endif %}
+          {{ c.captured_eastern|default:"—" }}
+          {% if c.captured_estimated %}<div class="muted review-meta" title="Older run: this is when the capture was saved, a few seconds after the grab">saved time</div>{% endif %}
         </td>
-        <td class="review-time">{{ row.eastern_at_read|default:"—" }}</td>
+        {% if c.checkable %}
+        <td class="review-time" {% if c.device_time_raw %}title="{{ c.device_time_raw }}"{% endif %}>
+          {% if c.device_display %}{{ c.device_display }}<div class="muted review-meta">{{ c.device_note }}</div>
+          {% else %}<span class="muted">Unread — check the image</span>{% endif %}
+        </td>
+        <td class="review-time">{{ c.expected_local|default:"—" }}</td>
         <td class="review-drift">
-          {% if row.drift_minutes is not None %}
-          <span class="{% if row.drift_flagged %}drift-flag{% else %}drift-ok{% endif %}">{% if row.drift_minutes > 0 %}+{% endif %}{{ row.drift_minutes }} min</span>
+          {% if c.drift_display %}<span class="{% if c.verdict == 'fail' %}drift-flag{% else %}drift-ok{% endif %}">{{ c.drift_display }}</span>
           {% else %}<span class="muted">—</span>{% endif %}
         </td>
-        <td class="review-assignee">
+        <td class="review-check"><span class="check-badge check-{{ c.verdict }}">{% if c.verdict == "pass" %}Pass{% elif c.verdict == "fail" %}Fail{% else %}Unread{% endif %}</span></td>
+        {% else %}
+        <td colspan="4" class="muted">No device clock in this capture</td>
+        {% endif %}
+        {% else %}
+        <td colspan="6" class="muted">No captures</td>
+        {% endif %}
+        {% if forloop.first %}
+        <td class="review-assignee" rowspan="{{ span }}">
           <select class="review-assign" aria-label="Assigned to" data-prev-value="{{ row.assigned_to }}">
             <option value="" {% if not row.assigned_to %}selected{% endif %}>Unassigned</option>
             {% for t in reviewers %}<option value="{{ t }}" {% if t == row.assigned_to %}selected{% endif %}>{{ t }}</option>{% endfor %}
@@ -163,18 +175,21 @@
           </select>
           {% if row.review.assigned_by %}<div class="muted review-meta">set by {{ row.review.assigned_by }}</div>{% endif %}
         </td>
-        <td class="review-complete">
+        <td class="review-complete" rowspan="{{ span }}">
           <label><input type="checkbox" class="review-complete-box" {% if row.completed %}checked{% endif %} aria-label="Complete"></label>
           <div class="muted review-meta review-complete-by">{% if row.completed %}{{ row.review.completed_by }}{% endif %}</div>
         </td>
-        <td class="review-notes" data-notes-value="{{ row.review.notes|default:'' }}" tabindex="0" role="button" aria-label="Edit notes">
+        <td class="review-notes" rowspan="{{ span }}" data-notes-value="{{ row.review.notes|default:'' }}" tabindex="0" role="button" aria-label="Edit notes">
           {% if row.review.notes %}<span class="review-notes-text">{{ row.review.notes|truncatechars:120 }}</span>{% else %}<span class="text-dim">Click to add notes…</span>{% endif %}
         </td>
+        {% endif %}
       </tr>
-      {% empty %}
-      <tr><td colspan="9" class="muted">No cameras match this filter.</td></tr>
       {% endfor %}
+      {% endwith %}
     </tbody>
+    {% empty %}
+    <tbody><tr><td colspan="11" class="muted">No cameras match this filter.</td></tr></tbody>
+    {% endfor %}
   </table>
 </div>
 {% endif %}
@@ -186,7 +201,7 @@
 {% endblock %}
 
 {% block extra_js %}
-<script src="{% static 'review.js' %}?v=2"></script>
+<script src="{% static 'review.js' %}?v=3"></script>
 <script>
 // Filters apply as soon as they change (IMS auto_filter); empty fields are
 // dropped so the URL only carries active filters.

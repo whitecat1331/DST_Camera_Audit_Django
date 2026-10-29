@@ -174,7 +174,7 @@ class ReviewPageAssignmentTests(TestCase):
         self.assertIn('<strong>carthur</strong> <span class="review-progress-n">0/2</span>', body)
         # Unknown tech falls back to everyone.
         body = self.client.get(f"/audits/review/{self.round.pk}/?tech=nobody").content.decode()
-        self.assertEqual(body.count("<tr class="), 6)
+        self.assertEqual(body.count('<tbody class="review-site'), 6)
 
     def test_page_query_count_constant(self):
         with CaptureQueriesContext(connection) as small:

@@ -194,22 +194,68 @@ def _set_progress(job_id: int, message: str, *, mirror_parent: bool = True) -> N
                 AuditJob.objects.filter(pk=parent_id).update(progress_message=text)
 
 
-def _save_shot(job_id: int, filepath: Path, label: str) -> None:
+def _save_shot(job_id: int, filepath: Path, label: str, *, captured_at=None, reading=None) -> None:
+    """Store a capture with when it was grabbed and the device clock it shows.
+
+    captured_at defaults to the image file's write time (the grab; the row is
+    saved seconds later). reading (services.device_clock.Reading) defaults to
+    reading the image itself; OvrC passes the reading it already has.
+    """
     from audits.models import AuditJob, AuditScreenshot
 
     close_old_connections()
+    filepath = Path(filepath)
     job = AuditJob.objects.get(pk=job_id)
+    if captured_at is None:
+        captured_at = _file_written_at(filepath)
+    if reading is None:
+        reading = _read_device_clock(label, filepath, captured_at, job.site_tz)
     with filepath.open("rb") as fh:
-        shot = AuditScreenshot(job=job, label=label)
+        shot = AuditScreenshot(
+            job=job,
+            label=label,
+            captured_at=captured_at,
+            device_time_raw=reading.raw if reading else "",
+            device_time=reading.iso if reading else "",
+            device_time_source=reading.source if reading else "",
+        )
         shot.image.save(filepath.name, File(fh), save=True)
-    captured_at = timezone.localtime(shot.created_at)
     logger.info(
-        "[AUDIT] Job %s saved screenshot label=%s path=%s captured_at=%s",
+        "[AUDIT] Job %s saved screenshot label=%s path=%s captured_at=%s device=%s",
         job_id,
         label,
         filepath.name,
-        captured_at.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        timezone.localtime(captured_at or shot.created_at).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        f"{reading.iso} ({reading.source})" if reading else "unread",
     )
+
+
+def _ovrc_reading(raw: str):
+    """OvrC's "Sun, Aug 02, 2026 01:11 AM EDT" as a device reading (None if unparsed)."""
+    from audits.ovrc_time import parse_ovrc_local
+    from services.device_clock import Reading
+
+    wall, _zone = parse_ovrc_local(raw)
+    return Reading(" ".join((raw or "").split())[:128], wall, "ovrc") if wall else None
+
+
+def _file_written_at(path: Path):
+    from datetime import datetime, timezone as dt_timezone
+
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=dt_timezone.utc)
+    except OSError:
+        return timezone.now()
+
+
+def _read_device_clock(label: str, path: Path, captured_at, site_tz: str):
+    """The device clock shown in a capture, or None (OCR off, missing or unreadable)."""
+    if not getattr(settings, "DEVICE_CLOCK_OCR", True) and label != "cbw":
+        return None
+    from audits.device_drift import expected_wall
+    from services.device_clock import read_capture
+
+    return read_capture(label, path, expected_wall(captured_at, site_tz))
 
 
 def _lane2_present(pole_number: str) -> bool:
@@ -772,7 +818,9 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
         )
         for r in results:
             label = f"ovrc_{r.fx_number.lower()}"
-            _save_shot(job_id, r.screenshot_path, label)
+            _save_shot(
+                job_id, r.screenshot_path, label, captured_at=r.captured_at, reading=_ovrc_reading(r.local_time)
+            )
             line = _format_ovrc_timestamp_line(r.fx_number, r.local_time)
             _set_progress(job_id, line)
             logger.info(
@@ -893,7 +941,13 @@ def _dst_fleet_ovrc_times(
         owners = fx_owners.get(fx) or []
         for child_pk, site_key, _child_dir in owners:
             try:
-                _save_shot(child_pk, Path(r.screenshot_path), label)
+                _save_shot(
+                    child_pk,
+                    Path(r.screenshot_path),
+                    label,
+                    captured_at=r.captured_at,
+                    reading=_ovrc_reading(r.local_time),
+                )
                 child_times.setdefault(child_pk, []).append(line)
                 child_readings.setdefault(child_pk, []).append(reading)
                 logger.info(
@@ -2406,7 +2460,16 @@ def _de_has_teamviewer(inst) -> bool:
     return any(mappings_for_fx(fx) for fx in (inst.fx_numbers or []))
 
 
-def _dst_skip_site(run: _DstRun, key: str, kind: str, index: int, reason: str) -> None:
+def _dst_site_tz(job_id: int, key: str, inst) -> str:
+    """The zone this site's device clocks are checked against (audits/site_timezone.py)."""
+    from audits.site_timezone import site_timezone
+
+    tz, why = site_timezone(inst)
+    _dst_log(job_id, "site %s timezone %s (%s)", key, tz, why)
+    return tz
+
+
+def _dst_skip_site(run: _DstRun, key: str, kind: str, index: int, reason: str, site_tz: str = "") -> None:
     """Record a site known offline as a SKIPPED child, without trying it."""
     from audits.models import AuditJob
 
@@ -2422,6 +2485,7 @@ def _dst_skip_site(run: _DstRun, key: str, kind: str, index: int, reason: str) -
         finished_at=now,
         progress_message=f"Skipped ({reason})"[:255],
         error_message=f"Not attempted: {reason}",
+        site_tz=site_tz,
     )
     logger.info("[DST] Job %s skipped site=%s (%s)", run.job_id, key, reason)
     _dst_site_done(run, run.record("skipped"), child.pk)
@@ -2522,9 +2586,10 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
         kind,
         time.perf_counter() - t_key,
     )
+    site_tz = _dst_site_tz(job_id, key, inst)
     reason = run.offline.get(key)
     if reason:
-        _dst_skip_site(run, key, kind, index, reason)
+        _dst_skip_site(run, key, kind, index, reason, site_tz)
         return
     _set_progress(job_id, f"{run.half}: capturing {key} ({kind})…")
     _dst_log(job_id, "phase3 creating child AuditJob…")
@@ -2538,6 +2603,7 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
         parent_job_id=job_id,
         started_at=timezone.now(),
         progress_message=f"DST audit {job_id} ({index}/{run.total})",
+        site_tz=site_tz,
     )
     _dst_log(
         job_id,

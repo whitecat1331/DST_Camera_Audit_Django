@@ -25,3 +25,5 @@ These sit in a top-level `in-progress-plans/` instead of `plans/in-progress-plan
 - 2026-10-29: FAST_FLEET_DST_AUDIT promoted to in-progress (user: "start implementation"); Phase 1 accepted for LTI.
 - 2026-10-29: FAST_FLEET_DST_AUDIT Phase 2 accepted.
 - 2026-10-29: FAST_FLEET_DST_AUDIT Phase 3 accepted; Phase 4 not needed on the projection.
+- 2026-10-29: FAST_FLEET_DST_AUDIT Phase 4b (live publish) implemented; its live acceptance waits on the next small LTI + DE test.
+- 2026-10-29: PER_DEVICE_TIME_CHECK planned (per-capture timestamps, site timezone, per-device drift and pass/fail); in progress, Phase 1 next. Phase 3 needs the user's go-ahead (shared DB + review deploy).

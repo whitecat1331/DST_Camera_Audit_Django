@@ -49,6 +49,8 @@ FINISHED = (
 # Copied as-is; identity and foreign keys are remapped per database.
 _REMAPPED = {"id", "parent_job", "created_by", "round"}
 JOB_FIELDS = [f.attname for f in AuditJob._meta.concrete_fields if f.name not in _REMAPPED]
+# Per-capture time fields (see AuditScreenshot), copied with each screenshot row.
+SHOT_TIME_FIELDS = ("captured_at", "device_time_raw", "device_time", "device_time_source")
 
 _publish_lock = threading.Lock()
 
@@ -286,7 +288,12 @@ def _fingerprint(job: AuditJob, shots: list[AuditScreenshot]) -> tuple:
     """Everything publish copies for one job; equal means nothing to re-send."""
     return (
         tuple(getattr(job, name) for name in JOB_FIELDS),
-        tuple(sorted((str(s.public_id), s.label, s.image.name) for s in shots)),
+        tuple(
+            sorted(
+                (str(s.public_id), s.label, s.image.name, *(getattr(s, n) for n in SHOT_TIME_FIELDS))
+                for s in shots
+            )
+        ),
     )
 
 
@@ -337,6 +344,7 @@ def _publish_run(
                     "job_id": shared_ids[shot.job_id],
                     "label": shot.label,
                     "image": shot.image.name,
+                    **{name: getattr(shot, name) for name in SHOT_TIME_FIELDS},
                 },
             )
             AuditScreenshot.objects.using(SHARED).filter(pk=row.pk).update(
