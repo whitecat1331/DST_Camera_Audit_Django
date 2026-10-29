@@ -196,6 +196,25 @@ class PublishRunsTests(TestCase):
         self.assertEqual((kept.completed, kept.notes), (True, "checked"))
         self.assertEqual(AuditRound.objects.using(SHARED).get().reviewers, ["carthur", "jgreene", "ployd"])
 
+    @override_settings(DST_REVIEWERS=["carthur", "jgreene", "ployd"])
+    def test_review_rows_are_mirrored_to_the_laptop(self):
+        from audits.models import InstallationAuditReview
+
+        report = self.publish()
+        self.assertEqual(report.mirrored, 1)
+        local = AuditRound.objects.get(name="2026-11-01 fall back")
+        self.assertEqual(local.reviewers, ["carthur", "jgreene", "ployd"])
+        mine = InstallationAuditReview.objects.get(round=local)
+        self.assertEqual((mine.camera_key, mine.kind, mine.assigned_to), ("233038", "de", "carthur"))
+        # A teammate's edits on the review site reach the laptop on the next publish.
+        InstallationAuditReview.objects.using(SHARED).filter(camera_key="233038").update(
+            assigned_to="ployd", completed=True, notes="checked", version=2
+        )
+        self.publish()
+        mine.refresh_from_db()
+        self.assertEqual((mine.assigned_to, mine.completed, mine.notes, mine.version), ("ployd", True, "checked", 2))
+        self.assertEqual(InstallationAuditReview.objects.filter(round=local).count(), 1)
+
     def test_capture_and_device_times_are_published(self):
         at = timezone.now() - timedelta(minutes=5)
         AuditScreenshot.objects.filter(pk=self.shot.pk).update(

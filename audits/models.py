@@ -163,12 +163,15 @@ class StoredFile(models.Model):
 
 
 class InstallationAuditReview(models.Model):
-    """Shared review state for one camera in one round (shared DB only).
+    """Shared review state for one camera in one round.
 
     Created by publish when a camera first enters a round, with its assigned
-    reviewer; publish never updates existing rows, so assignments, checkmarks
-    and notes survive re-publishing. Usernames are stored as strings because
-    users differ per database (each instance creates them at SSO sign-in).
+    reviewer; publish never updates existing shared rows, so assignments,
+    checkmarks and notes survive re-publishing. The laptop's copy is a mirror
+    of the shared rows, refreshed by each publish (audits/publish.py), so its
+    own review page shows the same state. Usernames are stored as strings
+    because users differ per database (each instance creates them at SSO
+    sign-in).
     """
 
     round = models.ForeignKey(AuditRound, on_delete=models.CASCADE, related_name="reviews")

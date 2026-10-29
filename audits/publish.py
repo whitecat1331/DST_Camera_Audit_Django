@@ -34,7 +34,7 @@ from django.utils import timezone
 from django.conf import settings
 
 from audits.assignment import assign_new_cameras
-from audits.models import AuditJob, AuditRound, AuditScreenshot, StoredFile
+from audits.models import AuditJob, AuditRound, AuditScreenshot, InstallationAuditReview, StoredFile
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,12 @@ _REMAPPED = {"id", "parent_job", "created_by", "round"}
 JOB_FIELDS = [f.attname for f in AuditJob._meta.concrete_fields if f.name not in _REMAPPED]
 # Per-capture time fields (see AuditScreenshot), copied with each screenshot row.
 SHOT_TIME_FIELDS = ("captured_at", "device_time_raw", "device_time", "device_time_source")
+# Review state copied back to the laptop after each publish (see _mirror_reviews).
+REVIEW_FIELDS = (
+    "kind", "assignment_seq", "assigned_to", "assigned_by", "assigned_at",
+    "completed", "completed_by", "completed_at",
+    "notes", "notes_updated_by", "notes_updated_at", "version",
+)
 
 _publish_lock = threading.Lock()
 
@@ -69,6 +75,7 @@ class PublishReport:
     images_unchanged: int = 0
     assigned: int = 0
     sent_live: int = 0  # site jobs already published live and unchanged since
+    mirrored: int = 0  # review rows copied back to the laptop's own DB
     missing_files: list[str] = field(default_factory=list)
     unmatched_poles: list[str] = field(default_factory=list)
 
@@ -80,6 +87,8 @@ class PublishReport:
         ]
         if self.sent_live:
             parts.append(f"{self.sent_live} site(s) already published live")
+        if self.mirrored:
+            parts.append(f"{self.mirrored} review row(s) mirrored locally")
         if self.missing_files:
             parts.append(f"{len(self.missing_files)} image file(s) missing locally")
         if self.unmatched_poles:
@@ -369,6 +378,30 @@ def _publish_run(
     report.screenshots += len(shots)
 
 
+def _mirror_reviews(shared_round: AuditRound, local_round: AuditRound) -> int:
+    """Copy the round's reviewer list and review rows from the shared DB to local.
+
+    The laptop's own review page reads local SQLite, where publish never
+    assigns, so without this it shows every camera unassigned with no techs
+    to pick from. The shared DB stays the source of truth: local rows are
+    overwritten with its state (assignments, checkmarks, notes), never merged.
+    """
+    shared_round.refresh_from_db(using=SHARED)  # assign_new_cameras saved another instance
+    local_round.reviewers = list(shared_round.reviewers)
+    local_round.assignment_offsets = dict(shared_round.assignment_offsets)
+    local_round.save(update_fields=["reviewers", "assignment_offsets"])
+    n = 0
+    with transaction.atomic():
+        for row in InstallationAuditReview.objects.using(SHARED).filter(round=shared_round):
+            InstallationAuditReview.objects.update_or_create(
+                round=local_round,
+                camera_key=row.camera_key,
+                defaults={name: getattr(row, name) for name in REVIEW_FIELDS},
+            )
+            n += 1
+    return n
+
+
 def _unmatched_poles(runs: list[AuditJob]) -> list[str]:
     from cameras.models import Installation
 
@@ -409,6 +442,7 @@ def publish_runs(
         AuditJob.objects.filter(
             Q(pk=run.pk) | Q(parent_job_id=run.pk)
         ).update(round=local_round)
+    report.mirrored = _mirror_reviews(shared_round, local_round)
     report.unmatched_poles = _unmatched_poles(runs)
     logger.info("[PUBLISH] %s", report.summary())
     return report
