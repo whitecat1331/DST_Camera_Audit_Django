@@ -139,3 +139,49 @@ class CbwRecaptureTests(SimpleTestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(path.read_bytes(), b"image 1")
         self.assertEqual(files, ["cbw.png", "cbw.png.clock.txt"])
+
+
+class CbwNetworkProblemsTests(SimpleTestCase):
+    @staticmethod
+    def ev(method, **params):
+        return {"message": json.dumps({"message": {"method": method, "params": params}})}
+
+    def test_reports_failed_unfinished_and_error_requests_only(self):
+        ev = self.ev
+        log = [
+            ev("Network.requestWillBeSent", requestId="1", timestamp=1.0, request={"url": "http://h/setup.html"}),
+            ev("Network.responseReceived", requestId="1", response={"status": 200}),
+            ev("Network.loadingFinished", requestId="1", timestamp=1.5),
+            ev("Network.requestWillBeSent", requestId="2", timestamp=2.0, request={"url": "http://h/datetime.html?x=1"}),
+            ev("Network.requestWillBeSent", requestId="3", timestamp=2.0, request={"url": "http://h/menu.js"}),
+            ev("Network.loadingFailed", requestId="3", errorText="net::ERR_CONNECTION_RESET"),
+            ev("Network.requestWillBeSent", requestId="4", timestamp=2.0, request={"url": "http://h/state.json"}),
+            ev("Network.responseReceived", requestId="4", response={"status": 503}),
+            ev("Network.loadingFinished", requestId="4", timestamp=2.1),
+            {"message": "not json"},
+        ]
+        net = cbw_capture.network_problems(log)
+        self.assertEqual(net["requests"], 4)
+        self.assertEqual(
+            net["problems"],
+            [
+                {"url": "http://h/datetime.html", "state": "pending"},
+                {"url": "http://h/menu.js", "state": "failed", "error": "net::ERR_CONNECTION_RESET"},
+                {"url": "http://h/state.json", "state": "done", "status": 503, "ms": 100},
+            ],
+        )
+        self.assertEqual(net["slowest"][0], {"url": "http://h/setup.html", "ms": 500})
+
+
+class CbwDateTimeFinderTests(SimpleTestCase):
+    def test_the_link_by_address_wins_over_text_matches(self):
+        """233201: a text XPath returned the hidden <li> before its <a>; the <li> ignores clicks."""
+        driver = mock.Mock()
+        link = object()
+        driver.find_elements.side_effect = lambda by, sel: [link] if "date-time" in sel else ["li", "a"]
+        self.assertEqual(cbw_capture._find_date_time_elements(driver), [link])
+
+    def test_text_fallback_prefers_anchors(self):
+        driver = mock.Mock()
+        driver.find_elements.side_effect = lambda by, sel: ["a"] if sel.startswith("//a") else (["li", "a"] if sel.startswith("//*") else [])
+        self.assertEqual(cbw_capture._find_date_time_elements(driver), ["a"])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -55,16 +56,27 @@ def _probe_cbw_auth(host: str, username: str, password: str) -> bool:
 
 
 def _find_date_time_elements(driver: webdriver.Chrome):
+    """The Date/Time menu link; the <a> itself, shown or not.
+
+    Clicking General Settings toggles its submenu, so Date/Time is sometimes
+    hidden. Link-text lookups only see shown links, and the old text XPath
+    then returned the hidden <li class="adminOnly"> before its <a>: a click on
+    the <li> does nothing (233201, 2026-10-29: 3 of 5 captures). A JS click on
+    the hidden <a> loads the page in under a second.
+    """
+    links = driver.find_elements(By.CSS_SELECTOR, "#menu-content a[href*='date-time'], a[href*='date-time']")
+    if links:
+        return links
     links = driver.find_elements(By.LINK_TEXT, "Date/Time")
     if links:
         return links
     links = driver.find_elements(By.PARTIAL_LINK_TEXT, "Date/Time")
     if links:
         return links
-    return driver.find_elements(
-        By.XPATH,
-        "//a[normalize-space(.)='Date/Time'] | //*[normalize-space(.)='Date/Time']",
-    )
+    links = driver.find_elements(By.XPATH, "//a[normalize-space(.)='Date/Time']")
+    if links:
+        return links
+    return driver.find_elements(By.XPATH, "//*[normalize-space(.)='Date/Time']")
 
 
 def _save_current_time(driver, filepath: Path) -> None:
@@ -125,6 +137,82 @@ def _open_date_time(driver, find_links, target: str) -> bool:
     return False
 
 
+# What Chrome saw when Date/Time didn't load (no credentials: URLs only).
+DATE_TIME_DEBUG_DIR = Path(__file__).resolve().parents[1] / "logs" / "cbw_debug"
+
+
+def network_problems(perf_log: list[dict]) -> dict:
+    """Requests in Chrome's performance log that failed, errored, or never finished.
+
+    233201 (2026-10-29) loaded a short menu slowly and then never showed the
+    Date/Time page, twice; the log alone couldn't say which request stalled.
+    """
+    reqs: dict[str, dict] = {}
+    for entry in perf_log:
+        try:
+            msg = json.loads(entry["message"])["message"]
+        except (KeyError, TypeError, ValueError):
+            continue
+        method, params = msg.get("method", ""), msg.get("params", {})
+        rid = params.get("requestId")
+        if not rid:
+            continue
+        if method == "Network.requestWillBeSent":
+            reqs[rid] = {"url": params["request"]["url"].split("?")[0], "t": params.get("timestamp"), "state": "pending"}
+        elif rid in reqs:
+            r = reqs[rid]
+            if method == "Network.responseReceived":
+                r["status"] = params["response"].get("status")
+            elif method == "Network.loadingFinished":
+                r["state"] = "done"
+                r["ms"] = round((params.get("timestamp", 0) - (r["t"] or 0)) * 1000)
+            elif method == "Network.loadingFailed":
+                r["state"] = "failed"
+                r["error"] = params.get("errorText", "")
+    problems = [
+        {k: v for k, v in r.items() if k != "t"}
+        for r in reqs.values()
+        if r["state"] != "done" or (r.get("status") or 0) >= 400
+    ]
+    slow = sorted((r for r in reqs.values() if r["state"] == "done"), key=lambda r: -r.get("ms", 0))[:5]
+    return {
+        "requests": len(reqs),
+        "problems": problems,
+        "slowest": [{"url": r["url"], "ms": r.get("ms")} for r in slow],
+    }
+
+
+def _save_date_time_debug(driver, target: str) -> None:
+    """Keep what the browser saw when Date/Time never loaded; never fails the capture."""
+    try:
+        try:
+            net = network_problems(driver.get_log("performance"))
+        except Exception as exc:  # noqa: BLE001 — logging not enabled on this driver
+            net = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+        main = driver.find_elements(By.ID, "mainContent")
+        info = {
+            "target": target,
+            "url": driver.current_url.split("@")[-1],
+            "menu_links": [m.text.strip() for m in driver.find_elements(By.CSS_SELECTOR, "#menu-content a")],
+            "main_content": (main[0].text if main else "")[:2000],
+            "network": net,
+        }
+        DATE_TIME_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        path = DATE_TIME_DEBUG_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{target.replace(':', '_')}.json"
+        path.write_text(json.dumps(info, indent=2), encoding="utf-8")
+        problems = net.get("problems", [])
+        logger.warning(
+            "[CBW] Date/Time debug target=%s requests=%s problems=%s %s saved=%s",
+            target,
+            net.get("requests"),
+            len(problems),
+            [(p["url"].rsplit("/", 1)[-1], p.get("error") or p.get("status") or p["state"]) for p in problems[:6]],
+            path.name,
+        )
+    except Exception:  # noqa: BLE001 — diagnostics only
+        logger.warning("[CBW] could not save Date/Time debug target=%s", target, exc_info=True)
+
+
 def _wait_for_date_time_page(wait: WebDriverWait, target: str, warn: bool = True) -> bool:
     """Wait for the Date/Time content ("Current:" clock) to replace the previous page.
 
@@ -162,6 +250,8 @@ def screenshot_date_time(
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--window-size=1280,900")
+    # Network events, read only when Date/Time doesn't load (_save_date_time_debug).
+    chrome_options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     # Never log Basic-auth credentials that may be present in the URL.
     safe_host = url
@@ -217,7 +307,7 @@ def screenshot_date_time(
             for item in menu_items:
                 if item.text.strip() == "Date/Time":
                     progress("CBW opening Date/Time (top-level)")
-                    _open_date_time(
+                    opened = _open_date_time(
                         driver,
                         lambda: [
                             m
@@ -226,6 +316,8 @@ def screenshot_date_time(
                         ],
                         target,
                     )
+                    if not opened:
+                        _save_date_time_debug(driver, target)
                     time.sleep(1)
                     driver.save_screenshot(str(filepath))
                     _save_current_time(driver, filepath)
@@ -254,7 +346,8 @@ def screenshot_date_time(
             raise RuntimeError("Date/Time link not found under General Settings")
 
         progress("CBW opening Date/Time")
-        _open_date_time(driver, lambda: _find_date_time_elements(driver), target)
+        if not _open_date_time(driver, lambda: _find_date_time_elements(driver), target):
+            _save_date_time_debug(driver, target)
         time.sleep(1)
         driver.save_screenshot(str(filepath))
         _save_current_time(driver, filepath)
