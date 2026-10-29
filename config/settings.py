@@ -311,6 +311,10 @@ DST_POWER_SETTLE_SECONDS = int(os.getenv("DST_POWER_SETTLE_SECONDS", "90"))
 DST_VPN_MGMT_PORT = int(os.getenv("DST_VPN_MGMT_PORT", "1337"))
 # How long a held publish waits for the shared DB (VPN off) before giving up.
 DST_PUBLISH_WAIT_SECONDS = int(os.getenv("DST_PUBLISH_WAIT_SECONDS", str(12 * 3600)))
+# Publish each site as it finishes (once the VPN is off), so review fills in during the run.
+DST_LIVE_PUBLISH = os.getenv("DST_LIVE_PUBLISH", "1").strip().lower() not in {"0", "false", "no", "off"}
+# Images uploaded at once while publishing (measured: 4 = 2.5x serial, 8 no better).
+DST_PUBLISH_UPLOAD_CONCURRENT = int(os.getenv("DST_PUBLISH_UPLOAD_CONCURRENT", "4"))
 
 from config.logging import build_logging_config  # noqa: E402
 

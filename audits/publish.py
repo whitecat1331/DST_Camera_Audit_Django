@@ -5,9 +5,14 @@ the VPN off, publish copies whole runs — parent + site jobs + screenshots +
 image bytes — into the shared DB the review instance reads.
 
 Order per run: images first (each its own small commit, skipped when the
-sha256 already matches), then every row of the run in one transaction. Rows
-only appear once their images exist, and an interrupted publish resumes by
-simply publishing again. Rows are upserted by ``public_id``.
+sha256 already matches; several at once, the upload is bandwidth-bound), then
+the run's rows in one transaction. Rows only appear once their images exist,
+and an interrupted publish resumes by simply publishing again. Rows are
+upserted by ``public_id``.
+
+A run with a round also publishes live (LivePublisher): each site as it
+finishes, whenever the shared DB answers. The final publish then re-sends
+only what changed since (SentCache).
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import hashlib
 import io
 import logging
 import mimetypes
+import queue
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -60,6 +66,7 @@ class PublishReport:
     images_uploaded: int = 0
     images_unchanged: int = 0
     assigned: int = 0
+    sent_live: int = 0  # site jobs already published live and unchanged since
     missing_files: list[str] = field(default_factory=list)
     unmatched_poles: list[str] = field(default_factory=list)
 
@@ -69,6 +76,8 @@ class PublishReport:
             f"{self.screenshots} screenshots, {self.images_uploaded} images uploaded, "
             f"{self.images_unchanged} unchanged, {self.assigned} camera(s) newly assigned"
         ]
+        if self.sent_live:
+            parts.append(f"{self.sent_live} site(s) already published live")
         if self.missing_files:
             parts.append(f"{len(self.missing_files)} image file(s) missing locally")
         if self.unmatched_poles:
@@ -139,21 +148,44 @@ def make_thumbnail(data: bytes) -> bytes | None:
         return None
 
 
-def _upload_image(shot: AuditScreenshot, report: PublishReport) -> None:
+@dataclass
+class SentCache:
+    """What this process already published for one run.
+
+    The final publish skips images whose digest it already sent (no query) and
+    site jobs whose fingerprint hasn't changed since their live publish.
+    """
+
+    images: dict[str, str] = field(default_factory=dict)  # image name -> sha256
+    jobs: dict[int, tuple] = field(default_factory=dict)  # local job pk -> fingerprint
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+def _upload_image(shot: AuditScreenshot, cache: SentCache | None = None) -> str:
+    """Upload one image; returns "uploaded", "unchanged" or "missing"."""
     name = shot.image.name
     try:
         with shot.image.open("rb") as fh:
             data = fh.read()
     except (FileNotFoundError, OSError, ValueError):
-        report.missing_files.append(name)
-        return
+        return "missing"
     digest = hashlib.sha256(data).hexdigest()
+    if cache is not None:
+        with cache.lock:
+            if cache.images.get(name) == digest:
+                return "unchanged"
     stored = (
         StoredFile.objects.using(SHARED).filter(name=name).values_list("sha256", flat=True).first()
     )
-    if stored == digest:
-        report.images_unchanged += 1
-        return
+    if stored != digest:
+        _store_image(name, data, digest)
+    if cache is not None:
+        with cache.lock:
+            cache.images[name] = digest
+    return "unchanged" if stored == digest else "uploaded"
+
+
+def _store_image(name: str, data: bytes, digest: str) -> None:
     StoredFile.objects.using(SHARED).update_or_create(
         name=name,
         defaults={
@@ -164,7 +196,60 @@ def _upload_image(shot: AuditScreenshot, report: PublishReport) -> None:
             "thumb": make_thumbnail(data),
         },
     )
-    report.images_uploaded += 1
+
+
+def _upload_images(shots, report: PublishReport, progress, label: str, cache: SentCache | None) -> None:
+    """Upload shots' images a few at a time (measured: 4 → 2.5x, 8 no better).
+
+    Each worker holds its own DB connections and closes them when it's done.
+    The first worker error is raised once all workers have stopped.
+    """
+    if not shots:
+        return
+    work: queue.SimpleQueue = queue.SimpleQueue()
+    for shot in shots:
+        work.put(shot)
+    lock = threading.Lock()
+    done = [0]
+    errors: list[BaseException] = []
+
+    def drain() -> None:
+        while not errors:
+            try:
+                shot = work.get_nowait()
+            except queue.Empty:
+                return
+            outcome = _upload_image(shot, cache)
+            with lock:
+                done[0] += 1
+                if outcome == "uploaded":
+                    report.images_uploaded += 1
+                elif outcome == "unchanged":
+                    report.images_unchanged += 1
+                else:
+                    report.missing_files.append(shot.image.name)
+                progress(f"{label}: image {done[0]}/{len(shots)}")
+
+    def worker() -> None:
+        try:
+            drain()
+        except BaseException as exc:  # noqa: BLE001 — re-raised in the caller
+            with lock:
+                errors.append(exc)
+        finally:
+            connections.close_all()  # this thread's connections only
+
+    workers = max(1, min(int(getattr(settings, "DST_PUBLISH_UPLOAD_CONCURRENT", 4)), len(shots)))
+    if workers == 1:
+        drain()  # on the caller's own connections
+        return
+    threads = [threading.Thread(target=worker, name=f"publish-upload-{i}") for i in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
 
 
 def _shared_user_id(user, cache: dict[str, int | None]) -> int | None:
@@ -197,14 +282,45 @@ def _upsert_job(job: AuditJob, *, parent_id, round_id, users) -> AuditJob:
     return shared
 
 
-def _publish_run(run: AuditJob, shared_round: AuditRound, report, users, progress) -> None:
-    jobs = [run, *run.child_jobs.all()]
-    shots = list(
-        AuditScreenshot.objects.filter(job__in=jobs).exclude(image="").select_related("job")
+def _fingerprint(job: AuditJob, shots: list[AuditScreenshot]) -> tuple:
+    """Everything publish copies for one job; equal means nothing to re-send."""
+    return (
+        tuple(getattr(job, name) for name in JOB_FIELDS),
+        tuple(sorted((str(s.public_id), s.label, s.image.name) for s in shots)),
     )
-    for i, shot in enumerate(shots, 1):
-        progress(f"Run #{run.pk}: image {i}/{len(shots)}")
-        _upload_image(shot, report)
+
+
+def _publish_run(
+    run: AuditJob,
+    shared_round: AuditRound,
+    report,
+    users,
+    progress,
+    *,
+    only: set[int] | None = None,
+    cache: SentCache | None = None,
+) -> None:
+    """Publish the run's parent and its site jobs (just `only`, when given).
+
+    With a cache, site jobs unchanged since this process last sent them are skipped.
+    """
+    children = list(run.child_jobs.all())
+    if only is not None:
+        children = [c for c in children if c.pk in only]
+    shots_by_job: dict[int, list[AuditScreenshot]] = {}
+    for shot in (
+        AuditScreenshot.objects.filter(job__in=[run, *children]).exclude(image="").select_related("job")
+    ):
+        shots_by_job.setdefault(shot.job_id, []).append(shot)
+    prints = {c.pk: _fingerprint(c, shots_by_job.get(c.pk, [])) for c in children}
+    if cache is not None:
+        with cache.lock:
+            fresh = [c for c in children if cache.jobs.get(c.pk) != prints[c.pk]]
+        report.sent_live += len(children) - len(fresh)
+        children = fresh
+    jobs = [run, *children]
+    shots = [s for j in jobs for s in shots_by_job.get(j.pk, [])]
+    _upload_images(shots, report, progress, f"Run #{run.pk}", cache)
 
     progress(f"Run #{run.pk}: saving {len(jobs)} jobs, {len(shots)} screenshots")
     with transaction.atomic(using=SHARED):
@@ -237,6 +353,9 @@ def _publish_run(run: AuditJob, shared_round: AuditRound, report, users, progres
                 shared_round, cameras, reviewers=settings.DST_REVIEWERS, using=SHARED
             )
         )
+    if cache is not None:
+        with cache.lock:
+            cache.jobs.update({c.pk: prints[c.pk] for c in children})
     report.runs += 1
     report.jobs += len(jobs)
     report.screenshots += len(shots)
@@ -259,6 +378,7 @@ def publish_runs(
     *,
     username: str | None = None,
     progress: Callable[[str], None] = lambda msg: None,
+    caches: dict[int, SentCache] | None = None,
 ) -> PublishReport:
     round_name = clean_round_name(round_name)
     runs = publishable_runs(run_ids)
@@ -277,7 +397,7 @@ def publish_runs(
         name=round_name, defaults={"created_by": local_user}
     )
     for run in runs:
-        _publish_run(run, shared_round, report, users, progress)
+        _publish_run(run, shared_round, report, users, progress, cache=(caches or {}).get(run.pk))
         AuditJob.objects.filter(
             Q(pk=run.pk) | Q(parent_job_id=run.pk)
         ).update(round=local_round)
@@ -313,7 +433,9 @@ def start_publish_job(run_ids: list[int], round_name: str, user) -> AuditJob:
     return job
 
 
-def _execute_publish(job: AuditJob, run_ids: list[int], round_name: str, user) -> None:
+def _execute_publish(
+    job: AuditJob, run_ids: list[int], round_name: str, user, caches: dict[int, SentCache] | None = None
+) -> None:
     """Publish and record the outcome on job; releases _publish_lock (caller holds it)."""
     from audits.runner import _set_progress
 
@@ -324,6 +446,7 @@ def _execute_publish(job: AuditJob, run_ids: list[int], round_name: str, user) -
             round_name,
             username=getattr(user, "username", None),
             progress=lambda msg: _set_progress(job.pk, msg),
+            caches=caches,
         )
         status, message, error = AuditJob.Status.SUCCEEDED, report.summary(), ""
         if report.missing_files:
@@ -355,6 +478,7 @@ def publish_after_run(
     wait_seconds: float | None = None,
     poll_seconds: float = 30.0,
     reachable: Callable[[], bool] | None = None,
+    cache: SentCache | None = None,
 ) -> AuditJob:
     """Publish a finished run once the shared DB answers (the VPN is off).
 
@@ -398,6 +522,105 @@ def publish_after_run(
         _set_progress(job.pk, f"Waiting for the VPN to be off to publish ({int(left // 60)} min left)…")
         time.sleep(min(poll_seconds, left))
     _publish_lock.acquire()
-    _execute_publish(job, [run_id], round_name, user)
+    _execute_publish(job, [run_id], round_name, user, {run_id: cache} if cache else None)
     job.refresh_from_db()
     return job
+
+
+class LivePublisher:
+    """Publish a running DST audit's sites as they finish, so review fills in as it goes.
+
+    Sites queue up via site_done(). While the shared DB doesn't answer (the LTI
+    half runs on the camera VPN) the queue just grows; once it answers, each
+    batch goes out on this thread, alongside the capture. A failed batch is
+    logged and left to the final publish (those sites aren't in the cache), so
+    it never touches the capture. close() stops it and hands back the cache.
+    """
+
+    def __init__(
+        self,
+        run_id: int,
+        round_name: str,
+        user,
+        *,
+        reachable: Callable[[], bool] | None = None,
+        poll_seconds: float = 15.0,
+    ) -> None:
+        self.run_id = run_id
+        self.round_name = clean_round_name(round_name)
+        self.user = user
+        self.reachable = reachable
+        self.poll_seconds = poll_seconds
+        self.cache = SentCache()
+        self.pending: list[int] = []
+        self.published = 0
+        self.closed = False
+        self._cond = threading.Condition()
+        self._thread = threading.Thread(target=self._loop, name=f"dst-live-publish-{run_id}", daemon=True)
+
+    def start(self) -> LivePublisher:
+        self._thread.start()
+        return self
+
+    def site_done(self, child_pk: int) -> None:
+        with self._cond:
+            self.pending.append(child_pk)
+            self._cond.notify()
+
+    def close(self, timeout: float | None = 300.0) -> SentCache:
+        """Stop after the batch in flight; the final publish sends whatever is left."""
+        with self._cond:
+            self.closed = True
+            self._cond.notify()
+        if self._thread.is_alive():
+            self._thread.join(timeout)
+        logger.info("[PUBLISH] live run #%s: %s site(s) published live", self.run_id, self.published)
+        return self.cache
+
+    def _is_reachable(self) -> bool:
+        if self.reachable is not None:
+            return self.reachable()
+        from services.netstate import direct_up
+
+        return direct_up()
+
+    def _loop(self) -> None:
+        close_old_connections()
+        try:
+            while True:
+                with self._cond:
+                    while not self.pending and not self.closed:
+                        self._cond.wait()
+                    if self.closed:
+                        return
+                if not self._is_reachable():
+                    with self._cond:  # the VPN is still up: wait (or close)
+                        self._cond.wait(self.poll_seconds)
+                    continue
+                with self._cond:
+                    batch, self.pending = self.pending, []
+                self._publish(batch)
+        finally:
+            connections.close_all()  # this thread's connections only
+
+    def _publish(self, batch: list[int]) -> None:
+        try:
+            run = AuditJob.objects.get(pk=self.run_id)
+            users: dict[str, int | None] = {}
+            shared_round, _ = AuditRound.objects.using(SHARED).get_or_create(
+                name=self.round_name, defaults={"created_by_id": _shared_user_id(self.user, users)}
+            )
+            report = PublishReport(round_name=self.round_name)
+            _publish_run(run, shared_round, report, users, lambda _m: None, only=set(batch), cache=self.cache)
+            self.published += len(batch)
+            logger.info(
+                "[PUBLISH] live run #%s: %s site(s) to %r, %s image(s) uploaded",
+                self.run_id,
+                len(batch),
+                self.round_name,
+                report.images_uploaded,
+            )
+        except Exception:  # noqa: BLE001 — the final publish retries these sites
+            logger.warning("[PUBLISH] live run #%s: batch of %s failed", self.run_id, len(batch), exc_info=True)
+            if SHARED in connections.databases:
+                connections[SHARED].close()  # a broken connection mustn't poison the next batch

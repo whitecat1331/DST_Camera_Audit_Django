@@ -2411,7 +2411,7 @@ def _dst_skip_site(run: _DstRun, key: str, kind: str, index: int, reason: str) -
     from audits.models import AuditJob
 
     now = timezone.now()
-    AuditJob.objects.create(
+    child = AuditJob.objects.create(
         pole_number=key,
         target_host=kind,
         device_type=AuditJob.DeviceType.DST_SITE,
@@ -2424,14 +2424,43 @@ def _dst_skip_site(run: _DstRun, key: str, kind: str, index: int, reason: str) -
         error_message=f"Not attempted: {reason}",
     )
     logger.info("[DST] Job %s skipped site=%s (%s)", run.job_id, key, reason)
-    _dst_site_done(run, run.record("skipped"))
+    _dst_site_done(run, run.record("skipped"), child.pk)
 
 
-def _dst_site_done(run: _DstRun, line: str) -> None:
+def _dst_site_done(run: _DstRun, line: str, child_pk: int | None = None) -> None:
+    """Count a finished site and hand its child to the run's live publisher.
+
+    OvrC-only sites pass no child_pk: they only finish in the OvrC pass, and
+    the final publish sends them.
+    """
     from audits.models import AuditJob
 
     AuditJob.objects.filter(pk=run.job_id).update(target_host=f"capture {run.done}/{run.total}")
     _set_progress(run.job_id, line)
+    publisher = _live_publishers.get(run.job_id)
+    if publisher is not None and child_pk is not None:
+        publisher.site_done(child_pk)
+
+
+# Run id -> its LivePublisher, while the run captures (see _start_live_publish).
+_live_publishers: dict[int, object] = {}
+
+
+def _start_live_publish(job_id: int, bulk) -> None:
+    """Publish sites as they finish when the run has a round (review fills in as it goes)."""
+    round_name = read_dst_publish_round(job_id)
+    if not round_name or not getattr(settings, "DST_LIVE_PUBLISH", True):
+        return
+    from audits.publish import LivePublisher
+
+    _live_publishers[job_id] = LivePublisher(job_id, round_name, bulk.created_by).start()
+    logger.info("[DST] Job %s live publish to %r", job_id, round_name)
+
+
+def _stop_live_publish(job_id: int):
+    """Stop the run's live publisher; returns its SentCache (None when there was none)."""
+    publisher = _live_publishers.pop(job_id, None)
+    return publisher.close() if publisher is not None else None
 
 
 def _dst_queue_ovrc_only(run: _DstRun, child, inst, key: str, child_dir: Path) -> None:
@@ -2639,7 +2668,7 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
     finally:
         _clear_cancel_flag(child.pk)
 
-    _dst_site_done(run, run.record(outcome, site_errors))
+    _dst_site_done(run, run.record(outcome, site_errors), child.pk)
 
 
 def _dst_capture_half(run: _DstRun, sites: list, half: str, *, workers: int = 1) -> None:
@@ -2748,6 +2777,7 @@ def _run_dst_audit(
 
     run = _DstRun(job_id, bulk, len(lti_sites) + len(de_sites), output_dir)
     run.errors.extend(skipped)
+    _start_live_publish(job_id, bulk)  # the caller stops it (_stop_live_publish)
 
     # ── LTI half (camera VPN) ────────────────────────────────────────────
     if lti_sites:
@@ -2813,12 +2843,15 @@ def _start_dst_auto_publish(job) -> threading.Thread | None:
 
     round_name = read_dst_publish_round(job.pk)
     if not round_name:
+        _stop_live_publish(job.pk)
         return None
 
     def _publish() -> None:
         close_old_connections()
         try:
-            pub = publish_after_run(job.pk, round_name, job.created_by)
+            # Sites already sent live and unchanged since are skipped.
+            cache = _stop_live_publish(job.pk)
+            pub = publish_after_run(job.pk, round_name, job.created_by, cache=cache)
             logger.info("[DST] Job %s auto-publish job=%s status=%s", job.pk, pub.pk, pub.status)
         except PublishError as exc:
             logger.warning("[DST] Job %s auto-publish refused: %s", job.pk, exc)
@@ -3217,12 +3250,18 @@ def _run_job(job_id: int) -> None:
                 return
 
             if job.device_type == AuditJob.DeviceType.DST_AUDIT:
-                errors, sites_ok = _run_dst_audit(job_id, output_dir)
+                try:
+                    errors, sites_ok = _run_dst_audit(job_id, output_dir)
+                except BaseException:
+                    _stop_live_publish(job_id)  # what it sent stays; a manual publish reconciles
+                    raise
                 job.refresh_from_db()
                 if job.status == AuditJob.Status.CANCELLED or is_job_cancelled(job_id):
+                    _stop_live_publish(job_id)
                     _finalize_cancelled()
                     return
                 if sites_ok == 0:
+                    _stop_live_publish(job_id)
                     raise RuntimeError("; ".join(errors) or "DST Audit failed")
                 job.status = AuditJob.Status.SUCCEEDED
                 if errors:

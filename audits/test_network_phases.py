@@ -150,6 +150,7 @@ class NetworkPhaseOrderTests(TestCase):
         # Mixed order, as the eligible list comes back.
         self.sites = [site(1, "D1", "de"), site(2, "L1", "lti"), site(3, "D2", "de"), site(4, "L2", "lti")]
         self.events: list[str] = []
+        self.live_sent: list[int] = []  # child pks handed to the live publisher
 
     def run_audit(
         self,
@@ -198,7 +199,13 @@ class NetworkPhaseOrderTests(TestCase):
                     AuditJob.objects.filter(pk=child_pk).update(status=AuditJob.Status.SUCCEEDED)
             return []
 
+        def start_live(job_id, bulk):
+            if runner.read_dst_publish_round(job_id):  # a recording stand-in: no thread, no network
+                runner._live_publishers[job_id] = mock.Mock(site_done=self.live_sent.append)
+
+        self.addCleanup(runner._live_publishers.pop, self.parent.pk, None)
         with (
+            mock.patch.object(runner, "_start_live_publish", side_effect=start_live),
             mock.patch.object(runner, "_active_dst_installations", return_value=self.sites),
             mock.patch.object(runner, "_dst_site_kind", side_effect=lambda s: s.kind),
             mock.patch.object(runner, "_dst_site_key", side_effect=lambda s: s.key),
@@ -253,6 +260,23 @@ class NetworkPhaseOrderTests(TestCase):
 
     def children(self):
         return {c.pole_number: c for c in AuditJob.objects.filter(parent_job=self.parent)}
+
+    def test_finished_sites_go_to_the_live_publisher_ovrc_only_ones_wait_for_the_end(self):
+        self.run_audit(publish_round="R1", no_tv={"D1"}, lti_dead={"L2"})
+        kids = self.children()
+        # In finish order; the skipped L2 too. D1 changes in the OvrC pass, so the final publish sends it.
+        self.assertEqual(self.live_sent, [kids["L1"].pk, kids["L2"].pk, kids["D2"].pk])
+
+    def test_no_round_means_no_live_publish(self):
+        self.run_audit()
+        self.assertEqual(self.live_sent, [])
+        self.assertNotIn(self.parent.pk, runner._live_publishers)
+
+    def test_stop_hands_back_the_cache_and_forgets_the_publisher(self):
+        live = mock.Mock()
+        runner._live_publishers[self.parent.pk] = live
+        self.assertIs(runner._stop_live_publish(self.parent.pk), live.close.return_value)
+        self.assertIsNone(runner._stop_live_publish(self.parent.pk))
 
     def test_lti_site_whose_power_on_failed_is_skipped_not_tried(self):
         errors, ok = self.run_audit(lti_dead={"L2"})
@@ -322,7 +346,7 @@ class PublishAfterRunTests(TestCase):
                 7, "R1", self.user, wait_seconds=600, reachable=lambda: next(answers)
             )
         self.assertEqual(sleep.call_count, 2)
-        self.assertEqual(execute.call_args.args[1:], ([7], "R1", self.user))
+        self.assertEqual(execute.call_args.args[1:], ([7], "R1", self.user, None))  # no live cache
         self.assertEqual(job.device_type, AuditJob.DeviceType.PUBLISH)
         self.assertFalse(publish._publish_lock.locked())
 
