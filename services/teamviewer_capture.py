@@ -532,13 +532,12 @@ def _login(
     """Type camera passwords (in `order`) until the lock screen gives way.
 
     Returns the number that unlocked, or None. Stops at the first unlock, so a
-    password is never typed into the desktop. When the click that wakes the lock
-    screen changes nothing and the first password changes nothing, the session
-    was already unlocked: no second password is typed.
+    password is never typed into the desktop. Every password is tried otherwise:
+    "the wake click changed nothing" is not proof of an unlocked session (the
+    prompt may already be up, FX1408 2026-10-29), and a wrong remembered
+    password must still fall through to the other one.
     """
-    before_click = _small_frame(hwnd)
     _focus_remote_desktop(pyautogui, hwnd)
-    woke = frame_diff(_small_frame(hwnd), before_click) >= WAKE_DIFF
     for attempt, number in enumerate(order, start=1):
         if should_cancel and should_cancel():
             raise CaptureCancelled("TeamViewer capture cancelled")
@@ -556,9 +555,6 @@ def _login(
                 logger.info("[TV] unlocked with camera password #%s (try %s)", number, attempt)
                 return number
         logger.info("[TV] camera password #%s did not unlock", number)
-        if not woke and attempt == 1:
-            logger.info("[TV] no lock screen seen; not typing more passwords")
-            return None
     return None
 
 

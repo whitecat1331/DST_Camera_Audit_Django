@@ -97,10 +97,17 @@ class LoginTests(SimpleTestCase):
         self.assertEqual(screen.login([1, 2]), 2)
         self.assertEqual(screen.typed, ["pw-one", "pw-two"])
 
-    def test_already_unlocked_session_gets_one_password_at_most(self):
-        screen = FakeLockScreen(good=None, state="desktop")
+    def test_prompt_already_up_and_wrong_remembered_password_still_tries_the_other(self):
+        # FX1408 2026-10-29: the click woke nothing (prompt already showing) and the
+        # remembered #2 was wrong; #1 was never typed.
+        screen = FakeLockScreen(good="pw-one", state="prompt")
+        self.assertEqual(screen.login([2, 1]), 1)
+        self.assertEqual(screen.typed, ["pw-two", "pw-one"])
+
+    def test_nothing_unlocks_after_every_password(self):
+        screen = FakeLockScreen(good=None)
         self.assertIsNone(screen.login([1, 2]))
-        self.assertEqual(len(screen.typed), 1)
+        self.assertEqual(screen.typed, ["pw-one", "pw-two"])
 
 
 class ConnectTests(SimpleTestCase):
