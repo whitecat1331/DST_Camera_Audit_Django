@@ -203,3 +203,22 @@ class ScheduleViewTests(TestCase):
             res = self.post("/audits/dst/schedule/", {"installation_ids": [4], "fire_at": ""})
         self.assertEqual(res.status_code, 400)
         self.assertEqual(res.json()["error"], "Pick a date and time.")
+
+    def test_status_endpoint_reports_a_fired_schedule_and_its_job(self):
+        job = AuditJob.objects.create(
+            pole_number="DST-ALL", target_host="scope=all", device_type=AuditJob.DeviceType.DST_AUDIT,
+            status=AuditJob.Status.RUNNING,
+        )
+        sched = ScheduledAudit.objects.create(
+            fire_at=datetime.now().astimezone(), installation_ids=[4], status=ScheduledAudit.Status.RUNNING,
+            job=job, publish_round="DST audit 2026-10-28", message=f"Running DST audit #{job.pk} (1 site(s))",
+        )
+        res = self.client.get("/audits/dst/schedule/status/")
+        self.assertEqual(res.status_code, 200)
+        row = res.json()["schedules"][0]
+        self.assertEqual(
+            (row["id"], row["status"], row["job_id"], row["publish_round"]),
+            (sched.pk, "running", job.pk, "DST audit 2026-10-28"),
+        )
+        page = self.client.get("/audits/dst/")
+        self.assertContains(page, "/audits/dst/schedule/status/")

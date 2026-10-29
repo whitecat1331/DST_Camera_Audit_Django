@@ -118,13 +118,13 @@
       <tr data-id="{{ s.pk }}">
         <td>{{ s.local_label }}</td>
         <td>{{ s.site_count }}</td>
-        <td>{{ s.publish_round|default:"DST audit (run date)" }}</td>
-        <td>
+        <td class="dst-schedule-round">{{ s.publish_round|default:"DST audit (run date)" }}</td>
+        <td class="dst-schedule-status">
           <span class="badge status-{% if s.status == 'done' %}succeeded{% elif s.status == 'scheduled' %}pending{% else %}{{ s.status }}{% endif %}">{{ s.get_status_display }}</span>
           {% if s.message %}<span class="muted">{{ s.message }}</span>{% endif %}
           {% if s.job_id %}<a href="{% url 'audit_detail' s.job_id %}">#{{ s.job_id }}</a>{% endif %}
         </td>
-        <td>
+        <td class="dst-schedule-buttons">
           {% if s.status == 'scheduled' %}
           <button type="button" class="btn-secondary dst-schedule-run" data-id="{{ s.pk }}">Run now</button>
           <button type="button" class="btn-danger dst-schedule-cancel" data-id="{{ s.pk }}">Cancel</button>
@@ -372,6 +372,7 @@
   const RECENT_URL = "{% url 'dst_recent_audits' %}";
   const CANCEL_TMPL = "{% url 'audit_cancel' pk=0 %}".replace("/0/", "/{id}/");
   const SCHEDULE_URL = "{% url 'dst_schedule' %}";
+  const SCHEDULE_STATUS_URL = "{% url 'dst_schedule_status' %}";
   const SCHEDULE_ACTION_TMPL = "{% url 'dst_schedule_action' pk=0 action='cancel' %}".replace("/0/cancel/", "/{id}/{action}/");
   const scheduleBtn = document.getElementById("dst-schedule-btn");
   const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || "";
@@ -950,7 +951,7 @@
       if (
         !confirm(
           `Schedule a DST audit of ${ids.length} site(s) at ${when}?\n\n` +
-            (round ? `Publishes to round "${round}" when done.\n` : "Won't publish (no round typed).\n") +
+            (round ? `Publishes to round "${round}" when done.\n` : `Publishes to round "DST audit <run date>" when done.\n`) +
             `\nBefore you leave: connect the VPN, keep the laptop plugged in, signed in, ` +
             `unlocked and awake, with TeamViewer running.`
         )
@@ -1071,6 +1072,56 @@
         cancelBtn.textContent = "Cancel audit";
       }
     });
+  }
+
+  // A scheduled run fires in its own process; follow it here like a Start.
+  const scheduleTable = document.getElementById("dst-schedule-table");
+  function scheduleBadgeClass(status) {
+    return status === "done" ? "succeeded" : status === "scheduled" ? "pending" : status;
+  }
+  function paintSchedule(s) {
+    const row = scheduleTable.querySelector(`tr[data-id="${s.id}"]`);
+    if (!row) return false;
+    const cell = row.querySelector(".dst-schedule-status");
+    const link = s.job_id ? ` <a href="/audits/${s.job_id}/">#${s.job_id}</a>` : "";
+    const msg = s.message ? ` <span class="muted">${escapeHtml(s.message)}</span>` : "";
+    cell.innerHTML = `<span class="badge status-${scheduleBadgeClass(s.status)}">${escapeHtml(s.status_label)}</span>${msg}${link}`;
+    if (s.publish_round) row.querySelector(".dst-schedule-round").textContent = s.publish_round;
+    if (s.status !== "scheduled") row.querySelector(".dst-schedule-buttons").innerHTML = "";
+    return true;
+  }
+  async function watchSchedules() {
+    try {
+      const res = await fetch(SCHEDULE_STATUS_URL, { headers: { Accept: "application/json" } });
+      if (!res.ok) return;
+      const { schedules } = await res.json();
+      let pending = false;
+      for (const s of schedules) {
+        paintSchedule(s);
+        if (s.status === "scheduled" || s.status === "running") pending = true;
+        if (s.status === "running" && s.job_id && !jobId) {
+          jobId = s.job_id;
+          showLive(true);
+          if (startBtn) {
+            startBtn.disabled = true;
+            startBtn.textContent = "DST Audit running…";
+          }
+          if (cancelBtn) cancelBtn.hidden = false;
+          msgEl.textContent = `Scheduled audit started — #${s.job_id}`;
+          startPoll();
+        }
+      }
+      if (!pending) {
+        clearInterval(scheduleTimer);
+        scheduleTimer = null;
+      }
+    } catch (err) {
+      /* the next tick retries */
+    }
+  }
+  let scheduleTimer = null;
+  if (scheduleTable && scheduleTable.querySelector(".dst-schedule-run, .badge.status-running")) {
+    scheduleTimer = setInterval(watchSchedules, 5000);
   }
 
   if (jobId) {

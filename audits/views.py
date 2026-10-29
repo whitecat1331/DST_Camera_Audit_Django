@@ -1941,3 +1941,26 @@ def schedule_action(request, pk, action):
         return JsonResponse({"error": str(exc)}, status=400)
     logger.info("[SCHED] #%s %s by %s", pk, action, request.user.get_username())
     return JsonResponse({"ok": True})
+
+
+@login_required
+@require_GET
+def schedule_status(request):
+    """The Scheduled audits table as JSON, so the DST page follows a fire without a reload."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    return JsonResponse(
+        {
+            "schedules": [
+                {
+                    "id": s.pk,
+                    "status": s.status,
+                    "status_label": s.get_status_display(),
+                    "message": s.message,
+                    "job_id": s.job_id,
+                    "publish_round": s.publish_round,
+                }
+                for s in _dst_schedules()
+            ]
+        }
+    )

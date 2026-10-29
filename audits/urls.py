@@ -9,6 +9,7 @@ urlpatterns = [
     path("dst/recent/", views.dst_recent_audits, name="dst_recent_audits"),
     path("dst/publish/", views.publish_dst, name="dst_publish"),
     path("dst/schedule/", views.schedule_dst_audit, name="dst_schedule"),
+    path("dst/schedule/status/", views.schedule_status, name="dst_schedule_status"),
     path(
         "dst/schedule/<int:pk>/<str:action>/",
         views.schedule_action,
