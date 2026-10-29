@@ -297,6 +297,12 @@ VBE_DAILY_CHECKS_ROOT = os.getenv("VBE_DAILY_CHECKS_ROOT", "")
 AUDIT_MAX_CONCURRENT = int(os.getenv("AUDIT_MAX_CONCURRENT", "2"))
 # Parallel CBW + VNC lane captures within a single pole_bundle job.
 AUDIT_STEP_CONCURRENT = int(os.getenv("AUDIT_STEP_CONCURRENT", "3"))
+# DST fleet run: LTI sites captured at once (each runs its CBW + VNC steps), and
+# CBW relay power-ons at once. DE stays one site at a time (one desktop).
+DST_LTI_SITE_CONCURRENT = int(os.getenv("DST_LTI_SITE_CONCURRENT", "4"))
+DST_POWER_ON_CONCURRENT = int(os.getenv("DST_POWER_ON_CONCURRENT", "10"))
+# Stop starting new CBW password attempts after this many seconds (0 = no limit).
+CBW_CAPTURE_BUDGET_SECONDS = int(os.getenv("CBW_CAPTURE_BUDGET_SECONDS", "150"))
 # Max seconds a queued job will wait for a free worker slot.
 AUDIT_SLOT_WAIT_SECONDS = int(os.getenv("AUDIT_SLOT_WAIT_SECONDS", "300"))
 # After DST Audit turns cameras on, wait before starting captures (boot settle).

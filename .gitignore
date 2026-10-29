@@ -74,3 +74,7 @@ desktop.ini
 .idea/
 .vscode/*
 !.vscode/settings.json
+
+# Runtime: which CBW password number worked per host (no passwords)
+cbw_password_hints.json
+cbw_password_hints.tmp

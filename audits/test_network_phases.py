@@ -132,7 +132,8 @@ def site(pk, key, kind):
     return SimpleNamespace(pk=pk, key=key, kind=kind, fx_numbers=["FX1"] if kind == "de" else [])
 
 
-@override_settings(MEDIA_ROOT=MEDIA, DST_POWER_SETTLE_SECONDS=0)
+# One site at a time here: the in-memory test DB can't be shared across pool threads.
+@override_settings(MEDIA_ROOT=MEDIA, DST_POWER_SETTLE_SECONDS=0, DST_LTI_SITE_CONCURRENT=1)
 class NetworkPhaseOrderTests(TestCase):
     """_run_dst_audit with every device step stubbed; records what ran in which order."""
 
@@ -446,3 +447,58 @@ class EnsureDcamContinueOnErrorTests(SimpleTestCase):
     def test_default_still_raises_for_other_callers(self):
         with self.assertRaises(TimeoutError):
             self.run_fleet()
+
+
+class LtiSitePoolTests(SimpleTestCase):
+    """_dst_capture_half with a pool: every site once, counts add up, cancel stops the rest."""
+
+    def make_run(self):
+        return runner._DstRun(0, None, 8, runner.Path(MEDIA))
+
+    def test_every_site_captured_once_with_overlap(self):
+        run = self.make_run()
+        seen, active, peak = [], [0], [0]
+        lock = threading.Lock()
+
+        def capture(run_, inst, index):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            threading.Event().wait(0.05)
+            with lock:
+                active[0] -= 1
+                seen.append((inst, index))
+            run_.record("ok" if inst % 2 else "skipped")
+
+        with (
+            mock.patch.object(runner, "_dst_capture_site", side_effect=capture),
+            mock.patch.object(runner, "_dst_log"),
+            mock.patch("audits.models.AuditJob.objects"),
+        ):
+            runner._dst_capture_half(run, list(range(8)), "LTI", workers=4)
+        self.assertEqual(sorted(seen), [(i, i + 1) for i in range(8)])
+        self.assertGreater(peak[0], 1)
+        self.assertLessEqual(peak[0], 4)
+        self.assertEqual((run.done, run.sites_ok, run.skipped), (8, 4, 4))
+        self.assertEqual(run.record("failed"), "LTI: 9/8 · 4 ok · 1 failed · 4 skipped")
+
+    def test_cancel_in_one_site_stops_sites_not_yet_started(self):
+        from services.teamviewer_capture import CaptureCancelled
+
+        run = self.make_run()
+        started = []
+
+        def capture(run_, inst, index):
+            started.append(inst)
+            if inst == 0:
+                raise CaptureCancelled("Audit cancelled by user")
+            threading.Event().wait(0.05)
+
+        with (
+            mock.patch.object(runner, "_dst_capture_site", side_effect=capture),
+            mock.patch.object(runner, "_dst_log"),
+            mock.patch("audits.models.AuditJob.objects"),
+        ):
+            with self.assertRaises(CaptureCancelled):
+                runner._dst_capture_half(run, list(range(40)), "LTI", workers=2)
+        self.assertLess(len(started), 40)

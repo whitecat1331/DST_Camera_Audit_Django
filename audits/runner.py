@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -938,9 +939,7 @@ def _dst_fleet_ovrc_times(
                 child.progress_message = f"Done with warnings ({warns})"
             else:
                 child.progress_message = "Done"
-            # Fleet OvrC runs after the per-site TV pass — bump finished_at so
-            # audit Finished is not earlier than the OvrC capture wall time.
-            child.finished_at = timezone.now()
+            # finished_at stays the capture finish; the OvrC read has ovrc_captured_at.
         child.save(
             update_fields=[
                 "error_message",
@@ -2265,6 +2264,33 @@ class _DstRun:
         self.skipped = 0
         # DE children with no TeamViewer ID: OvrC time only, settled after the OvrC pass.
         self.ovrc_only: list[int] = []
+        # LTI sites run in a pool: every counter change goes through record().
+        self.lock = threading.Lock()
+        self.done = 0
+        self.half_total = 0
+        self.half_counts: Counter[str] = Counter()
+
+    def start_half(self, half: str, total: int) -> None:
+        with self.lock:
+            self.half = half
+            self.half_total = total
+            self.half_counts = Counter()
+
+    def record(self, outcome: str, errors: list[str] | tuple = ()) -> str:
+        """Count one finished site (ok / failed / skipped / ovrc); returns the progress line."""
+        with self.lock:
+            self.done += 1
+            self.half_counts[outcome] += 1
+            if outcome == "ok":
+                self.sites_ok += 1
+            elif outcome == "skipped":
+                self.skipped += 1
+            self.errors.extend(errors)
+            c = self.half_counts
+            parts = [f"{c['ok']} ok", f"{c['failed']} failed", f"{c['skipped']} skipped"]
+            if c["ovrc"]:
+                parts.append(f"{c['ovrc']} OvrC-only")
+            return f"{self.half}: {sum(c.values())}/{self.half_total} · " + " · ".join(parts)
 
 
 def _dst_power_on_lti(run: _DstRun, lti_sites: list) -> bool:
@@ -2299,7 +2325,7 @@ def _dst_power_on_pass(run: _DstRun, sites: list, label: str) -> tuple[bool, lis
     job_id = run.job_id
     max_workers = min(
         len(sites),
-        max(1, int(getattr(settings, "AUDIT_STEP_CONCURRENT", 3))),
+        max(1, int(getattr(settings, "DST_POWER_ON_CONCURRENT", 10))),
     )
     logger.info("[DST] Job %s phase1 LTI relays %s sites=%s workers=%s", job_id, label, len(sites), max_workers)
     turned_on = False
@@ -2400,13 +2426,15 @@ def _dst_skip_site(run: _DstRun, key: str, kind: str, index: int, reason: str) -
         progress_message=f"Skipped ({reason})"[:255],
         error_message=f"Not attempted: {reason}",
     )
-    run.skipped += 1
     logger.info("[DST] Job %s skipped site=%s (%s)", run.job_id, key, reason)
-    _set_progress(
-        run.job_id,
-        f"{run.half}: {index}/{run.total} skipped {key} ({reason}) — "
-        f"{run.sites_ok} ok, {run.skipped} skipped…",
-    )
+    _dst_site_done(run, run.record("skipped"))
+
+
+def _dst_site_done(run: _DstRun, line: str) -> None:
+    from audits.models import AuditJob
+
+    AuditJob.objects.filter(pk=run.job_id).update(target_host=f"capture {run.done}/{run.total}")
+    _set_progress(run.job_id, line)
 
 
 def _dst_queue_ovrc_only(run: _DstRun, child, inst, key: str, child_dir: Path) -> None:
@@ -2414,9 +2442,11 @@ def _dst_queue_ovrc_only(run: _DstRun, child, inst, key: str, child_dir: Path) -
     fx_list = list(dict.fromkeys((fx or "").strip().upper() for fx in (inst.fx_numbers or []) if (fx or "").strip()))
     child.progress_message = "OvrC only (no TeamViewer ID)"
     child.save(update_fields=["progress_message"])
-    run.de_ovrc.append((child.pk, key, fx_list, child_dir))
-    run.ovrc_only.append(child.pk)
+    with run.lock:
+        run.de_ovrc.append((child.pk, key, fx_list, child_dir))
+        run.ovrc_only.append(child.pk)
     logger.info("[DST] Job %s OvrC-only site=%s fx=%s", run.job_id, key, ",".join(fx_list))
+    _dst_site_done(run, run.record("ovrc"))
 
 
 def _dst_settle_ovrc_only(run: _DstRun) -> None:
@@ -2427,13 +2457,15 @@ def _dst_settle_ovrc_only(run: _DstRun) -> None:
         if child.status == AuditJob.Status.CANCELLED:
             continue
         if child.screenshots.exists():
-            run.sites_ok += 1
+            with run.lock:
+                run.sites_ok += 1
             child.status = AuditJob.Status.SUCCEEDED
         else:
             child.status = AuditJob.Status.FAILED
             child.progress_message = "Failed"
             child.error_message = (child.error_message or "OvrC time not captured")[:2000]
-            run.errors.append(f"{child.pole_number}: OvrC time not captured")
+            with run.lock:
+                run.errors.append(f"{child.pole_number}: OvrC time not captured")
         child.finished_at = child.finished_at or timezone.now()
         child.save(update_fields=["status", "progress_message", "error_message", "finished_at"])
         _clear_cancel_flag(child.pk)
@@ -2468,7 +2500,7 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
     if reason:
         _dst_skip_site(run, key, kind, index, reason)
         return
-    _set_progress(job_id, f"{run.half}: {index}/{run.total} capturing {key} ({kind})…")
+    _set_progress(job_id, f"{run.half}: capturing {key} ({kind})…")
     _dst_log(job_id, "phase3 creating child AuditJob…")
     t_child = time.perf_counter()
     child = AuditJob.objects.create(
@@ -2503,6 +2535,8 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
         # Stays registered (and running) until the OvrC pass, so a cancel still reaches it.
         _dst_queue_ovrc_only(run, child, inst, key, child_dir)
         return
+    outcome = "failed"
+    site_errors: list[str] = []
     try:
         close_old_connections()
         _dst_log(
@@ -2530,7 +2564,7 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
             raise CaptureCancelled("Audit cancelled by user")
         has_shots = child.screenshots.exists()
         if has_shots:
-            run.sites_ok += 1
+            outcome = "ok"
             child.status = AuditJob.Status.SUCCEEDED
             child.progress_message = (
                 f"Done with warnings ({len(errors)})" if errors else "Done"
@@ -2540,10 +2574,9 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
             child.progress_message = "Failed"
         if errors:
             child.error_message = "; ".join(errors)[:2000]
-            for err in errors:
-                run.errors.append(f"{key}: {err}")
+            site_errors.extend(f"{key}: {err}" for err in errors)
         elif not has_shots:
-            run.errors.append(f"{key}: no screenshots")
+            site_errors.append(f"{key}: no screenshots")
             child.error_message = "No screenshots captured"
         child.target_host = kind
         child.finished_at = timezone.now()
@@ -2564,7 +2597,8 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
             ]
             fx_list = list(dict.fromkeys(fx_list))
             if fx_list:
-                run.de_ovrc.append((child.pk, key, fx_list, child_dir))
+                with run.lock:
+                    run.de_ovrc.append((child.pk, key, fx_list, child_dir))
         logger.info(
             "[DST] Job %s child %s site=%s status=%s shots=%s",
             job_id,
@@ -2604,29 +2638,47 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
                 "finished_at",
             ]
         )
-        run.errors.append(f"{key}: {exc}")
+        site_errors.append(f"{key}: {exc}")
     finally:
         _clear_cancel_flag(child.pk)
 
-    AuditJob.objects.filter(pk=job_id).update(
-        target_host=f"capture {run.sites_ok}/{run.total}"
-    )
-    _set_progress(
-        job_id,
-        f"{run.half}: {index}/{run.total} done — {run.sites_ok} ok, "
-        f"{run.skipped} skipped, {len(run.errors)} warning(s)…",
-    )
+    _dst_site_done(run, run.record(outcome, site_errors))
 
 
-def _dst_capture_half(run: _DstRun, sites: list, half: str) -> None:
+def _dst_capture_half(run: _DstRun, sites: list, half: str, *, workers: int = 1) -> None:
+    """Capture a half's sites; LTI runs `workers` sites at once (DE stays 1: one desktop)."""
     from audits.models import AuditJob
 
-    run.half = half
-    _dst_log(run.job_id, "%s capture begin sites=%s", half, len(sites))
-    AuditJob.objects.filter(pk=run.job_id).update(target_host=f"capture {run.sites_ok}/{run.total}")
+    run.start_half(half, len(sites))
+    workers = max(1, min(workers, len(sites)))
+    _dst_log(run.job_id, "%s capture begin sites=%s workers=%s", half, len(sites), workers)
+    AuditJob.objects.filter(pk=run.job_id).update(target_host=f"capture {run.done}/{run.total}")
+    numbered = []
     for inst in sites:
         run.index += 1
-        _dst_capture_site(run, inst, run.index)
+        numbered.append((inst, run.index))
+    if workers == 1:
+        for inst, index in numbered:
+            _dst_capture_site(run, inst, index)
+        return
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"dst-site-{run.job_id}") as pool:
+        futures = [pool.submit(_dst_capture_site_in_thread, run, inst, index) for inst, index in numbered]
+        try:
+            for fut in as_completed(futures):
+                fut.result()  # re-raises CaptureCancelled
+        except BaseException:
+            for fut in futures:
+                fut.cancel()
+            raise
+
+
+def _dst_capture_site_in_thread(run: _DstRun, inst, index: int) -> None:
+    from django.db import connection
+
+    try:
+        _dst_capture_site(run, inst, index)
+    finally:
+        connection.close()  # pool threads each hold their own DB connection
 
 
 def _run_dst_audit(
@@ -2704,7 +2756,12 @@ def _run_dst_audit(
     if lti_sites:
         turned_on = _dst_power_on_lti(run, lti_sites)
         _dst_settle(job_id, turned_on, "[VPN] LTI 2/3")
-        _dst_capture_half(run, lti_sites, "[VPN] LTI 3/3")
+        _dst_capture_half(
+            run,
+            lti_sites,
+            "[VPN] LTI 3/3",
+            workers=int(getattr(settings, "DST_LTI_SITE_CONCURRENT", 4)),
+        )
 
     # ── Release: the order never goes back to the VPN ───────────────────
     if de_sites or read_dst_publish_round(job_id):

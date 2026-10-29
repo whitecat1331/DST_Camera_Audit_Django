@@ -65,7 +65,7 @@ See `.env.example` for the full list. Required for production use:
 - **DragonEye:** `TV_USERNAME`, `TV_PASSWORD` (connect tries each comma-separated value; camera login uses the last)
 - **OvrC (FX local time):** `OVRC_USERNAME`, `OVRC_PASSWORD` (optional `OVRC_BASE_URL`)
 
-Optional: `IMS_SSO_REDIRECT_URI`, `IMS_TLS_VERIFY=false` (dev only), `DST_LOCAL_ADMIN=1` (break-glass Django admin), `AUDIT_MAX_CONCURRENT`, `AUDIT_STEP_CONCURRENT`, `DST_POWER_SETTLE_SECONDS`, `LOG_LEVEL`, `LOG_FILE`, `LOG_TO_FILE`, `TEAMVIEWER_PATH`.
+Optional: `IMS_SSO_REDIRECT_URI`, `IMS_TLS_VERIFY=false` (dev only), `DST_LOCAL_ADMIN=1` (break-glass Django admin), `AUDIT_MAX_CONCURRENT`, `AUDIT_STEP_CONCURRENT`, `DST_LTI_SITE_CONCURRENT`, `DST_POWER_ON_CONCURRENT`, `CBW_CAPTURE_BUDGET_SECONDS`, `DST_POWER_SETTLE_SECONDS`, `LOG_LEVEL`, `LOG_FILE`, `LOG_TO_FILE`, `TEAMVIEWER_PATH`.
 
 ### Logging
 
