@@ -1,0 +1,291 @@
+{% extends "base.html" %}
+{% block title %}Rejection Report — DST Camera Audit{% endblock %}
+{% block container_class %}wide{% endblock %}
+{% block content %}
+<div class="browse-head">
+  <div>
+    <h1>Rejection Report</h1>
+    <p class="lede">
+      Upload the rejection-service CSV (Row Label / Count of Reason / Rejection Reason).
+      Each serial is matched to a DST installation, powered on, then captured —
+      FX via TeamViewer, DS via VNC. The result is a single <strong>.xlsx</strong> with the
+      original three columns plus a <strong>Result</strong> column and an embedded
+      <strong>Screenshot</strong> per row.
+    </p>
+  </div>
+  <div class="browse-head-actions">
+    <a class="btn-secondary" href="{% url 'dst_audit' %}">DST Audit</a>
+    <a class="btn-secondary" href="{% url 'audit_list' %}">All audit jobs</a>
+  </div>
+</div>
+
+<section class="panel dst-panel">
+  <h2>CSV upload</h2>
+  {% if can_audit %}
+  <div class="confirm-upload" id="rejection-upload">
+    <label class="confirm-file-label">
+      <input type="file" id="rejection-file" accept=".csv,text/csv">
+      <span>Choose rejection .csv…</span>
+    </label>
+    <button type="button" class="btn-secondary" id="rejection-preview-btn" disabled>Match list</button>
+    <span class="muted" id="rejection-file-name"></span>
+  </div>
+  <div class="confirm-match-summary" id="rejection-match-summary" hidden>
+    <div class="dst-stats">
+      <div class="dst-stat">
+        <span class="dst-stat-n" id="rejection-matched-n">0</span>
+        <span class="dst-stat-l">matched</span>
+      </div>
+      <div class="dst-stat">
+        <span class="dst-stat-n" id="rejection-unmatched-n">0</span>
+        <span class="dst-stat-l">unmatched</span>
+      </div>
+      <div class="dst-stat">
+        <span class="dst-stat-n" id="rejection-ineligible-n">0</span>
+        <span class="dst-stat-l">ineligible</span>
+      </div>
+      <div class="dst-stat">
+        <span class="dst-stat-n" id="rejection-duplicate-n">0</span>
+        <span class="dst-stat-l">duplicate</span>
+      </div>
+    </div>
+    <div class="table-scroll confirm-match-scroll">
+      <table class="data-table" id="rejection-match-table">
+        <thead>
+          <tr>
+            <th>Serial</th>
+            <th>Status</th>
+            <th>Kind</th>
+            <th>Identifier</th>
+            <th>Pole</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="rejection-match-body"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="dst-actions">
+    <button type="button" class="btn-fire" id="rejection-start-btn" disabled>Run Rejection Report</button>
+    <button type="button" class="btn-danger" id="rejection-cancel-btn" hidden>Cancel</button>
+  </div>
+  {% else %}
+  <p class="lede">Technician role required to run a rejection report.</p>
+  {% endif %}
+</section>
+
+<section class="panel dst-panel" id="rejection-live" {% if not active_job %}hidden{% endif %}>
+  <div class="dst-live-head">
+    <h2>Live progress</h2>
+    <span class="badge" id="rejection-status-badge">—</span>
+    <span class="muted" id="rejection-elapsed"></span>
+  </div>
+  <p class="dst-message" id="rejection-message">Starting…</p>
+  <div class="dst-progress-wrap">
+    <div class="dst-progress-meta">
+      <span id="rejection-phase-label">Queued</span>
+      <span id="rejection-percent-label">0%</span>
+    </div>
+    <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="progress-bar-fill" id="rejection-progress-fill"></div>
+    </div>
+  </div>
+  <div class="dst-actions">
+    <a class="btn-primary" id="rejection-detail-link" href="#" hidden>Open job detail</a>
+    <a class="btn-primary" id="rejection-download-link" href="#" hidden>Download .xlsx</a>
+  </div>
+</section>
+
+{% if recent_jobs %}
+<section class="panel dst-panel">
+  <h2>Recent rejection reports</h2>
+  <ul class="dst-recent">
+    {% for j in recent_jobs %}
+    <li>
+      <a class="dst-recent-link" href="{{ j.detail_url }}">{{ j.label }}</a>
+      <span class="badge">{{ j.status_display }}</span>
+      <span class="muted">{{ j.when_display }} · {{ j.site_count }} camera(s) · {{ j.message }}</span>
+      {% if j.status == "succeeded" %}
+      <a class="btn-secondary" href="{{ j.download_url }}">Download .xlsx</a>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  const canAudit = {{ can_audit|yesno:"true,false" }};
+  const csrf = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  const fileInput = document.getElementById("rejection-file");
+  const previewBtn = document.getElementById("rejection-preview-btn");
+  const fileNameEl = document.getElementById("rejection-file-name");
+  const startBtn = document.getElementById("rejection-start-btn");
+  const cancelBtn = document.getElementById("rejection-cancel-btn");
+  const live = document.getElementById("rejection-live");
+  const statusBadge = document.getElementById("rejection-status-badge");
+  const messageEl = document.getElementById("rejection-message");
+  const elapsedEl = document.getElementById("rejection-elapsed");
+  const phaseLabel = document.getElementById("rejection-phase-label");
+  const percentLabel = document.getElementById("rejection-percent-label");
+  const progressFill = document.getElementById("rejection-progress-fill");
+  const detailLink = document.getElementById("rejection-detail-link");
+  const downloadLink = document.getElementById("rejection-download-link");
+
+  let activeJobId = {% if active_job %}{{ active_job.pk }}{% else %}null{% endif %};
+  let downloadUrl = "";
+  let pollTimer = null;
+
+  function esc(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  function file() { return fileInput?.files?.[0]; }
+
+  fileInput?.addEventListener("change", () => {
+    fileNameEl.textContent = file() ? file().name : "";
+    if (previewBtn) previewBtn.disabled = !file();
+    if (startBtn) startBtn.disabled = !file();
+  });
+
+  async function postFile(url) {
+    const f = file();
+    const fd = new FormData();
+    fd.append("file", f);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "X-CSRFToken": csrf },
+      body: fd,
+    });
+    let data = {};
+    try { data = await res.json(); } catch (_) { /* non-JSON */ }
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    return data;
+  }
+
+  previewBtn?.addEventListener("click", async () => {
+    if (!file()) return;
+    previewBtn.disabled = true;
+    previewBtn.textContent = "Matching…";
+    try {
+      const data = await postFile("{% url 'rejection_report_preview' %}");
+      document.getElementById("rejection-matched-n").textContent = String(data.matched_count || 0);
+      document.getElementById("rejection-unmatched-n").textContent = String(data.unmatched_count || 0);
+      document.getElementById("rejection-ineligible-n").textContent = String(data.ineligible_count || 0);
+      document.getElementById("rejection-duplicate-n").textContent = String(data.duplicate_count || 0);
+      const body = document.getElementById("rejection-match-body");
+      body.innerHTML = (data.rows || []).map((r) => `
+        <tr class="confirm-row-${esc(r.status)}">
+          <td>${esc(r.serial)}</td>
+          <td><span class="badge">${esc(r.status)}</span></td>
+          <td>${esc(r.kind || "—")}</td>
+          <td>${esc(r.identifier || "—")}</td>
+          <td>${esc(r.pole || "—")}</td>
+          <td>${esc(r.reason_note || "")}</td>
+        </tr>`).join("") || `<tr><td colspan="6" class="muted">No rows found</td></tr>`;
+      document.getElementById("rejection-match-summary").hidden = false;
+      if (startBtn) startBtn.disabled = false;
+    } catch (err) {
+      alert(err.message || String(err));
+    } finally {
+      previewBtn.disabled = !file();
+      previewBtn.textContent = "Match list";
+    }
+  });
+
+  function setBusy(on) {
+    if (startBtn) startBtn.disabled = on;
+    if (cancelBtn) cancelBtn.hidden = !on;
+  }
+
+  function fmtElapsed(s) {
+    if (s == null) return "";
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return m ? `${m}m ${r}s` : `${r}s`;
+  }
+
+  async function pollStatus() {
+    if (!activeJobId) return;
+    try {
+      const res = await fetch(`/audits/${activeJobId}/status/`);
+      const data = await res.json();
+      statusBadge.textContent = data.status || "—";
+      messageEl.textContent = data.message || data.progress || "…";
+      elapsedEl.textContent = data.elapsed_s != null ? fmtElapsed(data.elapsed_s) : "";
+
+      let current = 0, total = 0;
+      const host = (data.target_host || "").trim();
+      if (host && host.includes("/")) {
+        const [a, b] = host.split("/");
+        current = parseInt(a, 10) || 0;
+        total = parseInt(b, 10) || 0;
+      }
+      const terminal = ["succeeded", "failed", "cancelled"].includes(data.status);
+      const pct = terminal ? 100 : (total ? Math.round(100 * current / total) : 5);
+      phaseLabel.textContent = total ? `${current}/${total} cameras` : data.status || "Queued";
+      percentLabel.textContent = `${pct}%`;
+      progressFill.style.width = `${pct}%`;
+
+      if (data.status === "succeeded" && downloadUrl) {
+        downloadLink.href = downloadUrl;
+        downloadLink.hidden = false;
+      }
+      if (terminal) {
+        setBusy(false);
+        if (pollTimer) clearTimeout(pollTimer);
+        pollTimer = null;
+        return;
+      }
+      setBusy(true);
+    } catch (_) { /* keep polling */ }
+    pollTimer = setTimeout(pollStatus, 2000);
+  }
+
+  startBtn?.addEventListener("click", async () => {
+    if (!canAudit || !file()) return;
+    setBusy(true);
+    try {
+      const data = await postFile("{% url 'rejection_report_start' %}");
+      activeJobId = data.job_id;
+      downloadUrl = data.download_url || "";
+      if (detailLink) {
+        detailLink.href = data.detail_url;
+        detailLink.hidden = false;
+      }
+      if (live) live.hidden = false;
+      pollStatus();
+    } catch (err) {
+      setBusy(false);
+      alert(err.message || String(err));
+    }
+  });
+
+  cancelBtn?.addEventListener("click", async () => {
+    if (!activeJobId) return;
+    try {
+      await fetch(`/audits/${activeJobId}/cancel/`, {
+        method: "POST",
+        headers: { "X-CSRFToken": csrf },
+      });
+    } catch (_) { /* ignore */ }
+  });
+
+  if (activeJobId) {
+    downloadUrl = "{{ active_download_url }}";
+    if (detailLink) {
+      detailLink.href = `/audits/${activeJobId}/`;
+      detailLink.hidden = false;
+    }
+    if (live) live.hidden = false;
+    setBusy(true);
+    pollStatus();
+  }
+})();
+</script>
+{% endblock %}

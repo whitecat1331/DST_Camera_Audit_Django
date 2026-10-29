@@ -17,6 +17,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from services.password_hints import HintStore, first_then_rest
+
 logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[str], None]
@@ -60,6 +62,22 @@ def _find_date_time_elements(driver: webdriver.Chrome):
         By.XPATH,
         "//a[normalize-space(.)='Date/Time'] | //*[normalize-space(.)='Date/Time']",
     )
+
+
+def _save_current_time(driver, filepath: Path) -> None:
+    """Keep the page's "Current:" clock next to the image (services/device_clock.py reads it).
+
+    Best effort: a page that doesn't show it leaves the device time unread.
+    """
+    from services.device_clock import write_clock_sidecar
+
+    try:
+        text = driver.find_element(By.ID, "mainContent").text
+    except Exception:  # noqa: BLE001
+        return
+    _, found, rest = text.partition("Current")
+    rest = rest.lstrip(": \n")
+    write_clock_sidecar(filepath, rest.splitlines()[0] if found and rest else "")
 
 
 def screenshot_date_time(
@@ -143,6 +161,7 @@ def screenshot_date_time(
                     wait.until(EC.visibility_of_element_located((By.ID, "mainContent")))
                     time.sleep(2)
                     driver.save_screenshot(str(filepath))
+                    _save_current_time(driver, filepath)
                     logger.info(
                         "[CBW] Saved screenshot (top-level Date/Time) path=%s elapsed=%.1fs",
                         filepath,
@@ -172,6 +191,7 @@ def screenshot_date_time(
         wait.until(EC.visibility_of_element_located((By.ID, "mainContent")))
         time.sleep(2)
         driver.save_screenshot(str(filepath))
+        _save_current_time(driver, filepath)
         logger.info(
             "[CBW] Saved screenshot path=%s elapsed=%.1fs",
             filepath,
@@ -195,21 +215,31 @@ def capture_cbw_with_passwords(
     output_dir: str | Path,
     filename: str = "cbw.png",
     on_progress: ProgressFn | None = None,
+    budget_seconds: float | None = None,
 ) -> Path:
     """Try CBW passwords until capture succeeds.
 
-    HTTP-probes auth first so a flaky Selenium menu wait does not burn past the
-    correct password. TimeoutException retries the same password a few times.
+    Order: the password number that last worked on this host (a hint file holds
+    the number only, never the password), then those that pass the HTTP auth
+    probe, then the rest. Each password gets one try per round before any is
+    retried: on some firmware a wrong password isn't a 401, it shows up as a menu
+    timeout (220054: passwords 1 and 2 timed out 3× each; 3 worked in 18 s).
+    budget_seconds stops starting new attempts once spent (default
+    CBW_CAPTURE_BUDGET_SECONDS).
     """
     progress = on_progress or _noop_progress
     if not username:
         raise RuntimeError("CBW_USERNAME is not configured")
     if not passwords:
         raise RuntimeError("CBW_PASSWORDS is not configured")
+    if budget_seconds is None:
+        budget_seconds = _setting("CBW_CAPTURE_BUDGET_SECONDS", 150)
+    deadline = time.monotonic() + float(budget_seconds) if budget_seconds else None
 
     logger.info("[CBW] trying passwords host=%s count=%s", host, len(passwords))
     progress(f"CBW probing auth @ {host}")
-    ordered: list[str] = []
+    hint = _read_password_hint(host)
+    probed: list[int] = []
     for idx, password in enumerate(passwords, start=1):
         ok = _probe_cbw_auth(host, username, password)
         logger.info(
@@ -220,70 +250,94 @@ def capture_cbw_with_passwords(
             ok,
         )
         if ok:
-            ordered.append(password)
-    if not ordered:
+            probed.append(idx)
+    if not probed:
         logger.warning(
             "[CBW] no password passed HTTP auth probe host=%s — falling back to full list",
             host,
         )
-        ordered = list(passwords)
-    else:
-        for password in passwords:
-            if password not in ordered:
-                ordered.append(password)
+    order = first_then_rest(len(passwords), hint, *probed)
 
     url = f"http://{host}/setup.html"
     last_error: Exception | None = None
-    for idx, password in enumerate(ordered, start=1):
-        for attempt in range(1, _MENU_TIMEOUT_RETRIES + 2):
-            progress(f"CBW password {idx}/{len(ordered)} try {attempt} @ {host}")
+    for attempt in range(1, _MENU_TIMEOUT_RETRIES + 2):
+        for idx in list(order):
+            if deadline is not None and time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"CBW capture failed for {host}: gave up after {budget_seconds:.0f}s ({last_error})"
+                )
+            progress(f"CBW password {idx}/{len(passwords)} try {attempt} @ {host}")
             logger.info(
                 "[CBW] selenium attempt password=%s/%s try=%s host=%s",
                 idx,
-                len(ordered),
+                len(passwords),
                 attempt,
                 host,
             )
             try:
-                return screenshot_date_time(
+                path = screenshot_date_time(
                     url,
                     username,
-                    password,
+                    passwords[idx - 1],
                     output_dir,
                     filename=filename,
                     on_progress=on_progress,
                 )
+                if idx != hint:
+                    _write_password_hint(host, idx)
+                return path
             except TimeoutException as exc:
                 last_error = exc
                 logger.warning(
                     "[CBW] menu/timeout host=%s password=%s/%s try=%s: %s",
                     host,
                     idx,
-                    len(ordered),
+                    len(passwords),
                     attempt,
                     type(exc).__name__,
                 )
-                progress(f"CBW timeout password {idx}/{len(ordered)} try {attempt}")
-                if attempt <= _MENU_TIMEOUT_RETRIES:
-                    continue
-                break
-            except Exception as exc:  # noqa: BLE001 — try next password
+                progress(f"CBW timeout password {idx}/{len(passwords)} try {attempt}")
+            except Exception as exc:  # noqa: BLE001 — not a timeout: this password is out
                 last_error = exc
+                order.remove(idx)
                 logger.warning(
                     "[CBW] Auth/capture failed for %s password=%s/%s: %s: %s",
                     host,
                     idx,
-                    len(ordered),
+                    len(passwords),
                     type(exc).__name__,
                     str(exc)[:200],
                 )
-                progress(f"CBW attempt {idx}/{len(ordered)} failed: {type(exc).__name__}")
-                break
-
-        for leftover in Path(output_dir).glob(filename):
-            try:
-                leftover.unlink()
-            except OSError:
-                pass
+                progress(f"CBW attempt {idx}/{len(passwords)} failed: {type(exc).__name__}")
+            for leftover in Path(output_dir).glob(filename):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+        if not order:
+            break
 
     raise RuntimeError(f"CBW capture failed for {host}: {last_error}")
+
+
+def _setting(name: str, default):
+    try:
+        from django.conf import settings
+
+        return getattr(settings, name, default)
+    except Exception:  # noqa: BLE001 — usable outside Django too
+        return default
+
+
+# host -> number of the password that last worked (never the password).
+_HINTS = HintStore("cbw_password_hints.json", "CBW_PASSWORD_HINTS_PATH")
+
+
+def _read_password_hint(host: str) -> int | None:
+    value = _HINTS.get(host)
+    return value if isinstance(value, int) else None
+
+
+def _write_password_hint(host: str, index: int) -> None:
+    _HINTS.set(host, index)
+

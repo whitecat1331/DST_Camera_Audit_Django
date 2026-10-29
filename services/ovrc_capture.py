@@ -11,6 +11,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from selenium import webdriver
@@ -51,6 +52,8 @@ class OvrcTimeResult:
     local_time: str
     screenshot_path: Path
     dashboard_url: str
+    # When local_time was read (UTC) — the reference for wall-clock drift.
+    captured_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +205,7 @@ class OvrcClient:
 
         self.progress(f"OvrC reading local time for {fx}")
         local_time = self._read_local_date_and_time()
+        captured_at = datetime.now(timezone.utc)
         self._dismiss_whats_new()
         self.driver.save_screenshot(str(filepath))
         url = self.driver.current_url or ""
@@ -218,6 +222,7 @@ class OvrcClient:
             local_time=local_time,
             screenshot_path=filepath,
             dashboard_url=url,
+            captured_at=captured_at,
         )
 
     def ensure_dcam_system_on(self, fx_number: str) -> OvrcDcamResult:
@@ -883,8 +888,13 @@ def ensure_dcam_on_for_fxes(
     base_url: str = DEFAULT_BASE_URL,
     headless: bool = True,
     on_progress: ProgressFn | None = None,
+    continue_on_error: bool = False,
 ) -> list[OvrcDcamResult]:
-    """Login once and ensure DCAM System is ON for each FX (no-op if already on)."""
+    """Login once and ensure DCAM System is ON for each FX (no-op if already on).
+
+    continue_on_error: one FX failing gives an action="failed" result instead of
+    aborting the rest. The login itself failing still raises.
+    """
     progress = on_progress or _noop_progress
     results: list[OvrcDcamResult] = []
     seen: set[str] = set()
@@ -906,7 +916,16 @@ def ensure_dcam_on_for_fxes(
         on_progress=progress,
     ) as client:
         for fx in ordered:
-            results.append(client.ensure_dcam_system_on(fx))
+            if not continue_on_error:
+                results.append(client.ensure_dcam_system_on(fx))
+                continue
+            try:
+                results.append(client.ensure_dcam_system_on(fx))
+            except Exception as exc:  # noqa: BLE001 — one dead WattBox must not stop the fleet
+                detail = f"{type(exc).__name__}: {exc}".strip()[:200]
+                logger.warning("[OVRC] fx=%s dcam failed: %s", fx, detail)
+                progress(f"OvrC {fx} DCAM: failed")
+                results.append(OvrcDcamResult(fx_number=fx, action="failed", detail=detail))
     return results
 
 

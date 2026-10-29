@@ -80,13 +80,14 @@
   </div>
 
   <ol class="dst-phases-legend">
-    <li><strong>1 · Power on</strong> — All selected sites first (LTI CBW relays in parallel; one OvrC login for every DE DCAM)</li>
-    <li><strong>2 · Settle</strong> — Wait {{ settle_seconds }}s for cameras to boot (skipped if everything was already on)</li>
-    <li><strong>3 · Capture</strong> — Per site: LTI CBW + VNC, or DE TeamViewer lanes</li>
-    <li><strong>4 · OvrC times</strong> — One OvrC pass for all FX local times (keeps ADT/EDT from the portal)</li>
+    <li><strong>1 · LTI, on the camera VPN</strong> — CBW relays on (parallel), wait {{ settle_seconds }}s to boot if any were off, then capture every LTI site (CBW + VNC)</li>
+    <li><strong>2 · Disconnect the VPN</strong> — DST drops your WatchGuard VPN (it never connects it)</li>
+    <li><strong>3 · DE, off the VPN</strong> — one OvrC login turns DCAM on, wait {{ settle_seconds }}s if any were off, then capture every DE site (TeamViewer lanes)</li>
+    <li><strong>4 · OvrC times</strong> — one OvrC pass for all FX local times (keeps ADT/EDT from the portal), then publish if a round is typed</li>
   </ol>
 
   {% if can_audit %}
+  <p class="muted">Connect the camera VPN before you start. DST runs every LTI site on the VPN, then disconnects it and runs every DE site.</p>
   <div class="dst-actions">
     <button type="button" class="btn-fire" id="dst-start-btn" disabled>
       {% if active_job %}DST Audit running…{% else %}Start DST Audit (0){% endif %}
@@ -94,6 +95,47 @@
     <button type="button" class="btn-danger" id="dst-cancel-btn" hidden>Cancel audit</button>
     <a class="btn-secondary" id="dst-detail-link" href="#" hidden>Open job detail</a>
   </div>
+  {% if can_publish %}
+  <div class="dst-actions">
+    <label class="dst-schedule-label" for="dst-start-round">Audit name</label>
+    <input type="text" id="dst-start-round" list="dst-publish-rounds" maxlength="128" size="44"
+      placeholder="DST audit {{ default_round_date }} (start date and time)" aria-label="Audit name: the round the run publishes into when it finishes; empty uses DST audit and the start date and time">
+  </div>
+  {% if can_schedule %}
+  <div class="dst-actions dst-schedule-actions">
+    <label class="dst-schedule-label" for="dst-schedule-at">Or run unattended at</label>
+    <input type="datetime-local" id="dst-schedule-at" aria-label="Scheduled time on this laptop's clock">
+    <button type="button" class="btn-secondary" id="dst-schedule-btn" disabled>Schedule (0)</button>
+    <span class="muted">Laptop clock now: {{ device_now }}</span>
+  </div>
+  {% endif %}
+  {% endif %}
+  {% if can_schedule and schedules %}
+  <h3>Scheduled audits</h3>
+  <table class="data-table" id="dst-schedule-table">
+    <thead><tr><th>When (laptop clock)</th><th>Sites</th><th>Round</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {% for s in schedules %}
+      <tr data-id="{{ s.pk }}">
+        <td>{{ s.local_label }}</td>
+        <td>{{ s.site_count }}</td>
+        <td class="dst-schedule-round">{{ s.publish_round|default:"DST audit (start date and time)" }}</td>
+        <td class="dst-schedule-status">
+          <span class="badge status-{% if s.status == 'done' %}succeeded{% elif s.status == 'scheduled' %}pending{% else %}{{ s.status }}{% endif %}">{{ s.get_status_display }}</span>
+          {% if s.message %}<span class="muted">{{ s.message }}</span>{% endif %}
+          {% if s.job_id %}<a href="{% url 'audit_detail' s.job_id %}">#{{ s.job_id }}</a>{% endif %}
+        </td>
+        <td class="dst-schedule-buttons">
+          {% if s.status == 'scheduled' %}
+          <button type="button" class="btn-secondary dst-schedule-run" data-id="{{ s.pk }}">Run now</button>
+          <button type="button" class="btn-danger dst-schedule-cancel" data-id="{{ s.pk }}">Cancel</button>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
   {% else %}
   <p class="lede">Technician role required to start a DST Audit.</p>
   {% endif %}
@@ -277,6 +319,51 @@
     {% endfor %}
   </ul>
 </section>
+
+{% if can_publish %}
+<section class="panel dst-panel" id="dst-publish-panel">
+  <h2>Publish to shared DB</h2>
+  <p class="lede muted">
+    Sends finished runs (site jobs, screenshots, images, OvrC times) to the shared review
+    database. <strong>Turn the camera VPN off first</strong> — it blocks the database ports.
+    Publish the LTI run and the DE run into the same round. Re-publishing is safe.
+  </p>
+  {% if publish_runs %}
+  <div class="table-scroll">
+    <table class="data-table" id="dst-publish-table">
+      <thead>
+        <tr><th></th><th>Run</th><th>Sites</th><th>Status</th><th>Finished</th><th>Round</th></tr>
+      </thead>
+      <tbody>
+        {% for r in publish_runs %}
+        <tr>
+          <td><input type="checkbox" class="dst-publish-pick" value="{{ r.id }}" aria-label="Publish run {{ r.label }}"></td>
+          <td><a href="{{ r.detail_url }}">{{ r.label }}</a></td>
+          <td>{{ r.sites_summary }} <span class="muted">({{ r.site_count }})</span></td>
+          <td><span class="badge status-{{ r.status }}">{{ r.status_display }}</span></td>
+          <td class="muted">{{ r.when_display }}</td>
+          <td>{% if r.round %}<span class="badge status-succeeded">{{ r.round }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="dst-actions dst-publish-actions">
+    <input type="text" id="dst-publish-round" list="dst-publish-rounds" maxlength="128"
+      placeholder="Round, e.g. 2026-11-01 fall back" aria-label="Audit round name"
+      value="{{ rounds.0|default:'' }}">
+    <datalist id="dst-publish-rounds">
+      {% for name in rounds %}<option value="{{ name }}">{% endfor %}
+    </datalist>
+    <button type="button" class="btn-fire" id="dst-publish-btn" disabled>Publish (0)</button>
+    <a class="btn-secondary" id="dst-publish-job" href="#" hidden>Open publish job</a>
+  </div>
+  <p class="muted" id="dst-publish-status" role="status">{% if active_publish %}{{ active_publish.progress_message }}{% endif %}</p>
+  {% else %}
+  <p class="lede muted">No finished DST runs to publish yet.</p>
+  {% endif %}
+</section>
+{% endif %}
 {% endblock %}
 
 {% block extra_js %}
@@ -285,6 +372,10 @@
   const START_URL = "{% url 'dst_audit_start' %}";
   const RECENT_URL = "{% url 'dst_recent_audits' %}";
   const CANCEL_TMPL = "{% url 'audit_cancel' pk=0 %}".replace("/0/", "/{id}/");
+  const SCHEDULE_URL = "{% url 'dst_schedule' %}";
+  const SCHEDULE_STATUS_URL = "{% url 'dst_schedule_status' %}";
+  const SCHEDULE_ACTION_TMPL = "{% url 'dst_schedule_action' pk=0 action='cancel' %}".replace("/0/cancel/", "/{id}/{action}/");
+  const scheduleBtn = document.getElementById("dst-schedule-btn");
   const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const canAudit = {{ can_audit|yesno:"true,false" }};
   const FILTERS = {
@@ -526,6 +617,10 @@
       startBtn.disabled = n === 0;
       startBtn.textContent = n === 0 ? "Start DST Audit (0)" : `Start DST Audit (${n})`;
     }
+    if (scheduleBtn) {
+      scheduleBtn.disabled = n === 0;
+      scheduleBtn.textContent = `Schedule (${n})`;
+    }
     renderSelectedCart();
   }
 
@@ -626,12 +721,15 @@
     });
   }
 
-  function renderSites(sites) {
+  function renderSites(sites, total) {
     if (!sites || !sites.length) {
       sitesBody.innerHTML = '<tr><td colspan="6" class="muted">Waiting for site jobs…</td></tr>';
       return;
     }
-    sitesBody.innerHTML = sites
+    const more = total > sites.length
+      ? `<tr><td colspan="6" class="muted">Showing the latest ${sites.length} of ${total} sites — open the run for all of them.</td></tr>`
+      : "";
+    sitesBody.innerHTML = more + sites
       .map((s) => {
         const err = s.error_message
           ? `<div class="error small">${escapeHtml(s.error_message)}</div>`
@@ -816,7 +914,7 @@
       phaseLabel.textContent =
         phaseTitle(dst.phase) + ` · ${dst.current || 0}/${dst.total}`;
     }
-    renderSites(dst.sites || []);
+    renderSites(dst.sites || [], dst.sites_total || 0);
   }
 
   function startPoll() {
@@ -832,6 +930,67 @@
     }
   }
 
+  async function postJson(url, body) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRFToken": CSRF, Accept: "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `request failed (${res.status})`);
+    return data;
+  }
+
+  if (scheduleBtn) {
+    scheduleBtn.addEventListener("click", async () => {
+      const ids = selectedIds();
+      const at = document.getElementById("dst-schedule-at").value;
+      const round = (document.getElementById("dst-start-round")?.value || "").trim();
+      if (!ids.length) return;
+      if (!at) {
+        alert("Pick the date and time to run (this laptop's clock).");
+        return;
+      }
+      const when = new Date(at).toLocaleString();
+      if (
+        !confirm(
+          `Schedule a DST audit of ${ids.length} site(s) at ${when}?\n\n` +
+            (round ? `Audit name: "${round}" (publishes there when done).\n` : `Audit name: "DST audit <start date and time>" (publishes there when done).\n`) +
+            `\nBefore you leave: connect the VPN, keep the laptop plugged in, signed in, ` +
+            `unlocked and awake, with TeamViewer running.`
+        )
+      ) {
+        return;
+      }
+      scheduleBtn.disabled = true;
+      try {
+        await postJson(SCHEDULE_URL, { ...FILTERS, installation_ids: ids, publish_round: round, fire_at: at });
+        window.location.reload();
+      } catch (err) {
+        alert(err.message);
+        syncSelectionUi();
+      }
+    });
+  }
+
+  document.querySelectorAll(".dst-schedule-run, .dst-schedule-cancel").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const run = btn.classList.contains("dst-schedule-run");
+      const msg = run
+        ? "Run this scheduled audit now? It runs exactly as it would at the set time."
+        : "Cancel this scheduled audit?";
+      if (!confirm(msg)) return;
+      btn.disabled = true;
+      try {
+        await postJson(SCHEDULE_ACTION_TMPL.replace("{id}", btn.dataset.id).replace("{action}", run ? "run" : "cancel"));
+        window.location.reload();
+      } catch (err) {
+        alert(err.message);
+        btn.disabled = false;
+      }
+    });
+  });
+
   if (startBtn && canAudit) {
     startBtn.addEventListener("click", async () => {
       if (startBtn.disabled) return;
@@ -842,10 +1001,14 @@
       }
       if (
         !confirm(
-          `Start DST Audit for ${ids.length} selected site(s)?\n\n` +
-            `1) Power on ALL selected (LTI relays + one OvrC DCAM pass)\n` +
-            `2) Wait {{ settle_seconds }}s to boot (skipped if already on)\n` +
-            `3) Capture each site (CBW+VNC or TeamViewer)\n` +
+          `Start DST Audit for ${ids.length} selected site(s)?\n` +
+            (document.getElementById("dst-start-round")
+              ? `Audit name: "${document.getElementById("dst-start-round").value.trim() || "DST audit <start date and time>"}"\n`
+              : "") +
+            `\n` +
+            `1) LTI on the camera VPN: relays on, boot wait, every LTI capture\n` +
+            `2) Disconnect the VPN\n` +
+            `3) DE off the VPN: OvrC DCAM on, boot wait, every TeamViewer capture\n` +
             `4) One OvrC pass for all device local times\n\n` +
             `You can cancel from this page.`
         )
@@ -862,7 +1025,11 @@
             "X-CSRFToken": CSRF,
             Accept: "application/json",
           },
-          body: JSON.stringify({ ...FILTERS, installation_ids: ids }),
+          body: JSON.stringify({
+            ...FILTERS,
+            installation_ids: ids,
+            publish_round: (document.getElementById("dst-start-round")?.value || "").trim(),
+          }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "start failed");
@@ -915,6 +1082,56 @@
     });
   }
 
+  // A scheduled run fires in its own process; follow it here like a Start.
+  const scheduleTable = document.getElementById("dst-schedule-table");
+  function scheduleBadgeClass(status) {
+    return status === "done" ? "succeeded" : status === "scheduled" ? "pending" : status;
+  }
+  function paintSchedule(s) {
+    const row = scheduleTable.querySelector(`tr[data-id="${s.id}"]`);
+    if (!row) return false;
+    const cell = row.querySelector(".dst-schedule-status");
+    const link = s.job_id ? ` <a href="/audits/${s.job_id}/">#${s.job_id}</a>` : "";
+    const msg = s.message ? ` <span class="muted">${escapeHtml(s.message)}</span>` : "";
+    cell.innerHTML = `<span class="badge status-${scheduleBadgeClass(s.status)}">${escapeHtml(s.status_label)}</span>${msg}${link}`;
+    if (s.publish_round) row.querySelector(".dst-schedule-round").textContent = s.publish_round;
+    if (s.status !== "scheduled") row.querySelector(".dst-schedule-buttons").innerHTML = "";
+    return true;
+  }
+  async function watchSchedules() {
+    try {
+      const res = await fetch(SCHEDULE_STATUS_URL, { headers: { Accept: "application/json" } });
+      if (!res.ok) return;
+      const { schedules } = await res.json();
+      let pending = false;
+      for (const s of schedules) {
+        paintSchedule(s);
+        if (s.status === "scheduled" || s.status === "running") pending = true;
+        if (s.status === "running" && s.job_id && !jobId) {
+          jobId = s.job_id;
+          showLive(true);
+          if (startBtn) {
+            startBtn.disabled = true;
+            startBtn.textContent = "DST Audit running…";
+          }
+          if (cancelBtn) cancelBtn.hidden = false;
+          msgEl.textContent = `Scheduled audit started — #${s.job_id}`;
+          startPoll();
+        }
+      }
+      if (!pending) {
+        clearInterval(scheduleTimer);
+        scheduleTimer = null;
+      }
+    } catch (err) {
+      /* the next tick retries */
+    }
+  }
+  let scheduleTimer = null;
+  if (scheduleTable && scheduleTable.querySelector(".dst-schedule-run, .badge.status-running")) {
+    scheduleTimer = setInterval(watchSchedules, 5000);
+  }
+
   if (jobId) {
     // Only show the live panel immediately for a still-active job.
     // A stale ?job= id (terminal status) is checked by poll and kept hidden.
@@ -930,4 +1147,76 @@
   }
 })();
 </script>
+{% if can_publish %}
+<script>
+(function () {
+  const URL_PUBLISH = "{% url 'dst_publish' %}";
+  const CSRF = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  const btn = document.getElementById("dst-publish-btn");
+  const roundInput = document.getElementById("dst-publish-round");
+  const statusEl = document.getElementById("dst-publish-status");
+  const jobLink = document.getElementById("dst-publish-job");
+  if (!btn) return;
+  const picks = () => [...document.querySelectorAll(".dst-publish-pick:checked")].map((c) => Number(c.value));
+  let busy = false;
+
+  function refresh() {
+    const n = picks().length;
+    btn.textContent = busy ? "Publishing…" : `Publish (${n})`;
+    btn.disabled = busy || !n || !roundInput.value.trim();
+  }
+  document.querySelectorAll(".dst-publish-pick").forEach((c) => c.addEventListener("change", refresh));
+  roundInput.addEventListener("input", refresh);
+
+  function poll(jobId) {
+    busy = true;
+    refresh();
+    jobLink.href = `/audits/${jobId}/`;
+    jobLink.hidden = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(`/audits/${jobId}/status/`, { headers: { Accept: "application/json" } });
+        const data = await res.json();
+        if (data.status === "running" || data.status === "pending") {
+          statusEl.textContent = data.progress || "Publishing…";
+          setTimeout(tick, 1500);
+          return;
+        }
+        busy = false;
+        statusEl.textContent = data.status === "succeeded"
+          ? data.progress + (data.error_message ? ` — ${data.error_message}` : "")
+          : `Publish failed: ${data.error_message || data.message}`;
+        if (data.status === "succeeded") setTimeout(() => window.location.reload(), 2500);
+        refresh();
+      } catch (err) {
+        setTimeout(tick, 3000);
+      }
+    };
+    tick();
+  }
+
+  btn.addEventListener("click", async () => {
+    statusEl.textContent = "Starting publish…";
+    busy = true;
+    refresh();
+    try {
+      const res = await fetch(URL_PUBLISH, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": CSRF },
+        body: JSON.stringify({ run_ids: picks(), round: roundInput.value }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      poll(data.job_id);
+    } catch (err) {
+      busy = false;
+      statusEl.textContent = `Publish failed: ${err.message}`;
+      refresh();
+    }
+  });
+
+  {% if active_publish %}poll({{ active_publish.pk }});{% else %}refresh();{% endif %}
+})();
+</script>
+{% endif %}
 {% endblock %}

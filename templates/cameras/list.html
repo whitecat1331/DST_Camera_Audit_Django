@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% load media_tags %}
 {% block title %}Installations — DST Camera Audit{% endblock %}
 {% block container_class %}wide{% endblock %}
 {% block content %}
@@ -233,7 +234,7 @@
           {% if layer.thumb %}
           <button type="button" class="thumb-btn" data-full="{{ layer.thumb.image.url }}"
             title="{{ layer.label }} · {{ layer.thumb.created_at }}">
-            <img src="{{ layer.thumb.image.url }}" alt="{{ layer.label }} capture" loading="lazy">
+            <img src="{{ layer.thumb.image|thumb_src }}" alt="{{ layer.label }} capture" loading="lazy">
           </button>
           {% else %}
           <span class="thumb-empty">Not run</span>

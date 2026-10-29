@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import ssl
 from typing import Any
 from urllib.parse import urljoin
 
@@ -14,6 +15,22 @@ logger = logging.getLogger(__name__)
 
 class IMSClientError(RuntimeError):
     pass
+
+
+def _tls_verify() -> bool | ssl.SSLContext:
+    """httpx ``verify``: a pinned-certificate context when IMS_CA_FILE is set.
+
+    IMS on the Linode serves a self-signed cert for a bare IP with no
+    subjectAltName, so Python's hostname check can never match it. Trust is the
+    pinned certificate itself (only a holder of IMS's private key can present
+    it); the chain is still verified, only the name check is skipped.
+    """
+    ca_file = getattr(settings, "IMS_CA_FILE", "")
+    if not ca_file:
+        return settings.IMS_TLS_VERIFY
+    ctx = ssl.create_default_context(cafile=ca_file)
+    ctx.check_hostname = False
+    return ctx
 
 
 def _base_url() -> str:
@@ -33,7 +50,7 @@ def exchange_sso_code(code: str) -> dict[str, str]:
     if not settings.IMS_SSO_CLIENT_ID or not settings.IMS_SSO_CLIENT_SECRET:
         raise IMSClientError("IMS SSO client credentials are not configured")
     logger.info("[IMS] SSO token exchange request")
-    with httpx.Client(timeout=30.0, verify=settings.IMS_TLS_VERIFY) as client:
+    with httpx.Client(timeout=30.0, verify=_tls_verify()) as client:
         try:
             resp = client.post(url, json=payload)
         except httpx.HTTPError as exc:
@@ -78,11 +95,28 @@ def exchange_sso_code(code: str) -> dict[str, str]:
     return {"username": data["username"], "role": data["role"]}
 
 
+IMS_STATUS_CACHE_SECONDS = 60
+
+
 def check_ims_connection() -> dict[str, Any]:
-    """Return connection status for the dashboard KPI.
+    """Return connection status for the dashboard KPI (cached 60 s).
 
     Keys: status (connected|auth_error|unreachable|not_configured), detail
+
+    Probing costs two HTTPS round trips to IMS (~1.5 s from the review Linode),
+    which made every dashboard load slow; a minute-old KPI is fine.
     """
+    from django.core.cache import cache
+
+    cached = cache.get("ims_connection_status")
+    if cached is not None:
+        return cached
+    result = _probe_ims_connection()
+    cache.set("ims_connection_status", result, IMS_STATUS_CACHE_SECONDS)
+    return result
+
+
+def _probe_ims_connection() -> dict[str, Any]:
     if not settings.IMS_BASE_URL:
         return {"status": "not_configured", "detail": "IMS_BASE_URL missing"}
     if not settings.IMS_API_TOKEN:
@@ -91,7 +125,7 @@ def check_ims_connection() -> dict[str, Any]:
     base = settings.IMS_BASE_URL.rstrip("/") + "/"
     headers = {"Authorization": f"Bearer {settings.IMS_API_TOKEN}"}
     try:
-        with httpx.Client(timeout=5.0, verify=settings.IMS_TLS_VERIFY, headers=headers) as client:
+        with httpx.Client(timeout=5.0, verify=_tls_verify(), headers=headers) as client:
             # Prefer lightweight health, then auth-gated ASE probe.
             try:
                 health = client.get(urljoin(base, "healthz"))
@@ -131,7 +165,7 @@ def fetch_ase_installations(*, include_devices: bool = False) -> list[dict[str, 
         include_devices,
         page_size,
     )
-    with httpx.Client(timeout=120.0, verify=settings.IMS_TLS_VERIFY, headers=headers) as client:
+    with httpx.Client(timeout=120.0, verify=_tls_verify(), headers=headers) as client:
         while True:
             params: dict[str, Any] = {"page": page, "pageSize": page_size}
             if include_devices:

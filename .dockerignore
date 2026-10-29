@@ -1,0 +1,28 @@
+# Never ship local state, secrets or capture artifacts into the review image.
+.git
+.github
+.venv
+venv
+.env
+.env.*
+!.env.example
+*.sqlite3
+media/
+logs/
+tmp/
+staticfiles/
+__pycache__/
+*.pyc
+.ruff_cache
+.vscode
+plans/
+in-progress-plans/
+audits_out/
+*.csv
+*.xlsx
+*.docx
+*.png
+CBW_Screenshots/
+# Only the public Supabase root CA is baked in; IMS's cert/key are mounted.
+certs/*
+!certs/supabase_ca.crt

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% load media_tags %}
 {% block title %}{{ installation.identifier }} — DST Camera Audit{% endblock %}
 {% block content %}
 <div class="browse-head">
@@ -169,7 +170,7 @@
       {% if layer.thumb_key %}
       <div class="layer-thumb">
         {% if layer.thumb %}
-        <img class="detail-thumb" src="{{ layer.thumb.image.url }}" alt="{{ layer.label }}">
+        <img class="detail-thumb" src="{{ layer.thumb.image|thumb_src }}" alt="{{ layer.label }}" loading="lazy">
         {% else %}
         <span class="thumb-empty">Not run</span>
         {% endif %}

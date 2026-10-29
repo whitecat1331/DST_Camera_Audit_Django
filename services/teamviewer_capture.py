@@ -13,6 +13,7 @@ from pathlib import Path
 
 from PIL import Image
 
+
 logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[str], None]
@@ -141,10 +142,21 @@ def _enum_session_windows(teamviewer_id: str = "") -> list[tuple[int, str, int]]
     return found
 
 
-def _find_session_window(gw, teamviewer_id: str, *, title_hint: str = "") -> _TVWindow | None:
-    """Return the best TeamViewer session window (fresh EnumWindows scan)."""
+def _find_session_window(
+    gw,
+    teamviewer_id: str,
+    *,
+    title_hint: str = "",
+    exclude: frozenset[int] = frozenset(),
+) -> _TVWindow | None:
+    """Return the best TeamViewer session window (fresh EnumWindows scan).
+
+    exclude: windows already open before this connect. Any "<host> - TeamViewer"
+    window qualifies, so a session left open from earlier would otherwise be
+    taken as the new one (an FX1260 lane once captured an "FX1361 L2" window).
+    """
     del gw  # PyGetWindow cache goes stale after login; use Win32 enum instead.
-    windows = _enum_session_windows(teamviewer_id)
+    windows = [w for w in _enum_session_windows(teamviewer_id) if w[0] not in exclude]
     if title_hint:
         hinted = [w for w in windows if title_hint in w[1]]
         if hinted:
@@ -346,11 +358,9 @@ def _clear_password_field(pyautogui) -> None:
     """Clear the focused password field before typing a candidate."""
     pyautogui.hotkey("ctrl", "a")
     time.sleep(0.15)
-    pyautogui.press("backspace")
-    time.sleep(0.15)
-    # Extra backspaces in case Ctrl+A didn't select (some remote desktops).
-    for _ in range(40):
-        pyautogui.press("backspace")
+    # Extra backspaces in case Ctrl+A didn't select (some remote desktops). One
+    # call: pyautogui pauses 0.1 s after every call, so 40 calls cost 4 s.
+    pyautogui.press("backspace", presses=40, interval=0.005)
     time.sleep(0.2)
 
 
@@ -379,18 +389,49 @@ def _grab_session_image(hwnd) -> Image.Image | None:
         return None
 
 
-def _looks_like_reconnect_dialog(img: Image.Image) -> bool:
-    """Heuristic: TeamViewer 'connection lost' card is a bright white centered panel."""
+def reconnect_card_score(img: Image.Image) -> float:
+    """Share of center rows whose widest flat-white run has the same left/right edges.
+
+    TeamViewer's "connection lost" card is a flat white rectangle: most of its rows
+    (all but the text lines) share one set of edges. A bright DragonCam photo (a
+    sunlit road) has wide white runs too, but their edges wander row to row.
+    Measured 2026-10-29: real frames ≤ 0.16 (three bright L2 photos included),
+    a synthetic card 0.67.
+    """
+    from collections import Counter
+
     rgb = img.convert("RGB")
     w, h = rgb.size
+    crop = rgb.crop((int(w * 0.28), int(h * 0.32), int(w * 0.72), int(h * 0.68)))
+    crop = crop.resize((max(1, crop.width // 2), max(1, crop.height // 2)), Image.NEAREST)
+    cw, ch = crop.size
+    px = crop.load()
+    edges: Counter[tuple[int, int]] = Counter()
+    for y in range(ch):
+        best = (0, 0, 0)
+        start = None
+        for x in range(cw + 1):
+            white = False
+            if x < cw:
+                r, g, b = px[x, y]
+                white = min(r, g, b) >= 245 and max(r, g, b) - min(r, g, b) <= 6
+            if white and start is None:
+                start = x
+            elif not white and start is not None:
+                if x - start > best[0]:
+                    best = (x - start, start, x)
+                start = None
+        if best[0] >= 0.35 * cw:
+            edges[(best[1] // 2, best[2] // 2)] += 1
+    return edges.most_common(1)[0][1] / ch if edges else 0.0
+
+
+def _looks_like_reconnect_dialog(img: Image.Image) -> bool:
+    """TeamViewer 'connection lost' card: a flat white rectangle in the center."""
+    w, h = img.size
     if w < 100 or h < 100:
         return False
-    crop = rgb.crop((int(w * 0.28), int(h * 0.32), int(w * 0.72), int(h * 0.68)))
-    pixels = list(crop.getdata())
-    if not pixels:
-        return False
-    bright = sum(1 for r, g, b in pixels if r >= 235 and g >= 235 and b >= 235)
-    return (bright / len(pixels)) >= 0.22
+    return reconnect_card_score(img) >= 0.35
 
 
 def _focus_remote_desktop(pyautogui, hwnd) -> None:
@@ -411,61 +452,167 @@ def _focus_remote_desktop(pyautogui, hwnd) -> None:
         logger.warning("[TV] focus click failed: %s", type(exc).__name__)
 
 
-def _wait_until_session_interactive(
+# Frames are compared at this size: enough to see a lock screen give way to the
+# desktop, cheap enough to grab every 0.4 s.
+_FRAME_SIZE = (192, 104)
+# Mean per-channel difference (0-255) between frames at _FRAME_SIZE. Measured on
+# FX1173 L1 (2026-10-29): an idle session 0.0-0.1 between grabs; the DragonCam
+# desktop up to 2.7 as its picture updates; clicking the lock clock to show the
+# password prompt 5.4; the prompt giving way to the desktop 64.8.
+STABLE_DIFF = 4.0
+WAKE_DIFF = 3.0
+UNLOCK_DIFF = 15.0
+RECONNECT_WAIT_SEC = 40
+
+
+class PartnerOffline(RuntimeError):
+    """TeamViewer said "Unable to connect": the partner isn't online."""
+
+
+def _small_frame(hwnd) -> Image.Image | None:
+    img = _grab_session_image(hwnd)
+    return None if img is None else img.convert("RGB").resize(_FRAME_SIZE)
+
+
+def frame_diff(a: Image.Image | None, b: Image.Image | None) -> float:
+    if a is None or b is None:
+        return 255.0
+    from PIL import ImageChops, ImageStat
+
+    return sum(ImageStat.Stat(ImageChops.difference(a, b)).mean) / 3
+
+
+def _wait_until_settled(
     hwnd,
     should_cancel: CancelFn | None,
     *,
-    timeout_sec: float = 50,
+    timeout_sec: float,
     progress: ProgressFn | None = None,
-) -> bool:
-    """Wait out TeamViewer 'connection lost / reconnecting' overlays."""
-    deadline = time.time() + timeout_sec
-    saw_dialog = False
+) -> Image.Image | None:
+    """Poll the session until two frames in a row barely change (and no reconnect card).
+
+    Returns the settled frame, or the last one when the timeout ran out.
+    """
+    start = time.time()
+    deadline = start + timeout_sec
+    prev = None
+    calm = 0
     while time.time() < deadline:
         if should_cancel and should_cancel():
             raise CaptureCancelled("TeamViewer capture cancelled")
         if not ctypes.windll.user32.IsWindow(hwnd):
-            return False
-        img = _grab_session_image(hwnd)
-        if img is not None and _looks_like_reconnect_dialog(img):
-            saw_dialog = True
+            return None
+        full = _grab_session_image(hwnd)
+        if full is not None and _looks_like_reconnect_dialog(full):
             if progress:
                 progress("Waiting for TeamViewer reconnect…")
-            logger.info("[TV] reconnect dialog detected — waiting")
-            _sleep_cancellable(2.0, should_cancel)
+            deadline = max(deadline, start + RECONNECT_WAIT_SEC)  # a reconnect may take a while
+            prev, calm = None, 0
+            _sleep_cancellable(1.0, should_cancel)
             continue
-        if img is not None:
-            if saw_dialog:
-                logger.info("[TV] reconnect dialog cleared")
-                _sleep_cancellable(1.5, should_cancel)
-            return True
-        _sleep_cancellable(1.0, should_cancel)
-    logger.warning("[TV] session still not interactive after %.0fs", timeout_sec)
-    return False
+        cur = None if full is None else full.convert("RGB").resize(_FRAME_SIZE)
+        calm = calm + 1 if cur is not None and frame_diff(cur, prev) < STABLE_DIFF else 0
+        if calm >= 2:
+            return cur
+        prev = cur
+        _sleep_cancellable(0.4, should_cancel)
+    logger.info("[TV] session not settled after %.0fs", timeout_sec)
+    return prev
 
 
-def _attempt_os_passwords(
+def _login(
     pyautogui,
+    hwnd,
     passwords: list[str],
+    order: list[int],
+    should_cancel: CancelFn | None,
     progress: ProgressFn,
-    *,
-    hwnd: int | None = None,
-) -> None:
-    """Type the camera/OS password on the Ubuntu lock-screen password field."""
-    if not passwords:
-        return
-    for idx, cam_pwd in enumerate(passwords, start=1):
-        progress(f"Login password {idx}/{len(passwords)}")
-        logger.info("[TV] login password attempt %s/%s len=%s", idx, len(passwords), len(cam_pwd))
-        try:
-            if hwnd is not None:
-                _focus_remote_desktop(pyautogui, hwnd)
-            _clear_password_field(pyautogui)
-            _type_secret(pyautogui, cam_pwd)
-            pyautogui.press("enter")
-            time.sleep(7)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[TV] password attempt %s failed: %s", idx, type(exc).__name__)
+) -> int | None:
+    """Type camera passwords (in `order`) until the lock screen gives way.
+
+    Returns the number that unlocked, or None. Stops at the first unlock, so a
+    password is never typed into the desktop. Every password is tried otherwise:
+    "the wake click changed nothing" is not proof of an unlocked session (the
+    prompt may already be up, FX1408 2026-10-29), and a wrong remembered
+    password must still fall through to the other one.
+    """
+    _focus_remote_desktop(pyautogui, hwnd)
+    for attempt, number in enumerate(order, start=1):
+        if should_cancel and should_cancel():
+            raise CaptureCancelled("TeamViewer capture cancelled")
+        progress(f"Login password {attempt}/{len(order)}")
+        if attempt > 1:
+            _focus_remote_desktop(pyautogui, hwnd)
+        _clear_password_field(pyautogui)
+        _type_secret(pyautogui, passwords[number - 1])
+        typed = _small_frame(hwnd)
+        pyautogui.press("enter")
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            _sleep_cancellable(0.4, should_cancel)
+            if frame_diff(_small_frame(hwnd), typed) >= UNLOCK_DIFF:
+                logger.info("[TV] unlocked with camera password #%s (try %s)", number, attempt)
+                return number
+        logger.info("[TV] camera password #%s did not unlock", number)
+    return None
+
+
+def _main_window() -> int | None:
+    """The TeamViewer main window (title exactly "TeamViewer", no owner)."""
+    user32 = ctypes.windll.user32
+    found: list[int] = []
+
+    def _cb(hwnd, _lp):
+        if user32.IsWindowVisible(hwnd) and not user32.GetWindow(hwnd, 4):
+            if _get_window_title(hwnd).strip().lower() == "teamviewer":
+                found.append(hwnd)
+        return True
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    return found[0] if found else None
+
+
+def _unable_to_connect_ok(hwnd) -> tuple[int, int] | None:
+    """Screen point of the "Unable to connect" dialog's blue OK button, if showing.
+
+    The dialog is drawn inside the main window, centered, OK at (+188, +45).
+    """
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        return None
+    left, top, width, height = _hwnd_rect(hwnd)
+    x, y = left + width // 2 + 188, top + height // 2 + 45
+    try:
+        img = ImageGrab.grab(bbox=(x - 20, y - 17, x + 20, y + 17), all_screens=True).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return None
+    px = list(img.getdata())
+    blue = sum(1 for r, _g, b in px if b > 180 and r < 160) / max(1, len(px))
+    return (x, y) if blue >= 0.5 else None
+
+
+def _click_ok(main: int, point: tuple[int, int]) -> None:
+    import pyautogui
+
+    ctypes.windll.user32.SetForegroundWindow(main)
+    time.sleep(0.2)
+    pyautogui.click(*point)
+
+
+def _clear_unable_to_connect() -> None:
+    main = _main_window()
+    ok = _unable_to_connect_ok(main) if main else None
+    if ok:
+        logger.info("[TV] clearing a leftover 'Unable to connect' dialog")
+        _click_ok(main, ok)
+        time.sleep(0.5)
+
+
+def _auth_window() -> int | None:
+    """TeamViewer asks for a password: the connection password was refused."""
+    return ctypes.windll.user32.FindWindowW(None, "TeamViewer Authentication") or None
 
 
 def _sleep_cancellable(seconds: float, should_cancel: CancelFn | None, *, chunk: float = 0.4) -> None:
@@ -576,6 +723,64 @@ def _close_session_notes(
         time.sleep(0.5)
 
 
+def _connect(
+    gw,
+    teamviewer_id: str,
+    teamviewer_path: str,
+    passwords: list[str],
+    order: list[int],
+    stale: frozenset[int],
+    wait_sec: float,
+    progress: ProgressFn,
+    cancelled: CancelFn,
+) -> tuple[_TVWindow, int]:
+    """Launch the session; returns (window, connection password number).
+
+    Watches what TeamViewer actually shows instead of a fixed wait:
+    session window → connected; "TeamViewer Authentication" → that password was
+    refused, try the next; "Unable to connect" → partner offline, stop.
+    """
+    _clear_unable_to_connect()  # a dialog left from an earlier lane must not read as this one's
+    for attempt, number in enumerate(order, start=1):
+        if cancelled():
+            raise CaptureCancelled("TeamViewer capture cancelled")
+        progress(f"TeamViewer connect {teamviewer_id} (try {attempt}/{len(order)})")
+        try:
+            proc = subprocess.Popen(
+                [teamviewer_path, "-i", str(teamviewer_id), "--Password", str(passwords[number - 1])]
+            )
+        except OSError as exc:
+            logger.warning("[TV] launch failed: %s", type(exc).__name__)
+            continue
+        t0 = time.time()
+        while time.time() - t0 < wait_sec:
+            if cancelled():
+                if proc.poll() is None:
+                    proc.terminate()
+                raise CaptureCancelled("TeamViewer capture cancelled")
+            win = _find_session_window(gw, teamviewer_id, exclude=stale)
+            if win:
+                logger.info("[TV] session window=%r in %.1fs", win.title, time.time() - t0)
+                return win, number
+            auth = _auth_window()
+            if auth:
+                logger.info("[TV] connection password #%s refused for id=%s", number, teamviewer_id)
+                ctypes.windll.user32.PostMessageW(auth, 0x0010, 0, 0)
+                break
+            main = _main_window() if time.time() - t0 > 2 else None
+            ok = _unable_to_connect_ok(main) if main else None
+            if ok:
+                _click_ok(main, ok)
+                logger.info("[TV] partner offline id=%s (%.1fs)", teamviewer_id, time.time() - t0)
+                raise PartnerOffline(f"TeamViewer partner {teamviewer_id} is offline (Unable to connect)")
+            time.sleep(0.25)
+        else:
+            logger.info("[TV] no session for id=%s after %.0fs", teamviewer_id, wait_sec)
+        if proc.poll() is None:
+            proc.terminate()
+    raise RuntimeError(f"TeamViewer session failed for id={teamviewer_id}")
+
+
 def capture_dragoneye_via_teamviewer(
     *,
     teamviewer_id: str,
@@ -585,7 +790,7 @@ def capture_dragoneye_via_teamviewer(
     filename: str = "de_tv.png",
     camera_username: str = "",  # unused — kept for call-site compatibility
     teamviewer_path: str = DEFAULT_TEAMVIEWER_PATH,
-    wait_for_connection_sec: int = 60,
+    wait_for_connection_sec: int = 30,
     on_progress: ProgressFn | None = None,
     should_cancel: CancelFn | None = None,
 ) -> Path:
@@ -616,114 +821,62 @@ def capture_dragoneye_via_teamviewer(
         raise RuntimeError("No TeamViewer connection passwords configured")
 
     win = None
-    proc = None
     t0 = time.perf_counter()
-    logger.info("[TV] connect id=%s passwords=%s", teamviewer_id, len(teamviewer_passwords))
+    tv_id = str(teamviewer_id)
+    logger.info("[TV] connect id=%s passwords=%s", tv_id, len(teamviewer_passwords))
 
+    stale = frozenset(hwnd for hwnd, _title, _area in _enum_session_windows())
+    if stale:
+        logger.info("[TV] ignoring %s session window(s) open before connect", len(stale))
     try:
-        for idx, tv_pwd in enumerate(teamviewer_passwords, start=1):
-            if _cancelled():
-                raise CaptureCancelled("TeamViewer capture cancelled")
-            progress(f"TeamViewer connect {teamviewer_id} (try {idx}/{len(teamviewer_passwords)})")
-            try:
-                proc = subprocess.Popen(
-                    [teamviewer_path, "-i", str(teamviewer_id), "--Password", str(tv_pwd)]
-                )
-            except OSError as exc:
-                logger.warning("[TV] launch failed: %s", type(exc).__name__)
-                continue
-
-            _sleep_cancellable(10, should_cancel)
-            if proc.poll() is not None and proc.returncode != 0:
-                logger.info("[TV] process exited early code=%s", proc.returncode)
-                continue
-
-            elapsed = 0
-            win = None
-            while elapsed < wait_for_connection_sec:
-                if _cancelled():
-                    raise CaptureCancelled("TeamViewer capture cancelled")
-                win = _find_session_window(gw, teamviewer_id)
-                if win:
-                    break
-                if proc.poll() is not None and proc.returncode != 0:
-                    break
-                _sleep_cancellable(2, should_cancel)
-                elapsed += 2
-
-            if win:
-                logger.info("[TV] session window='%s'", win.title)
-                break
-
-            if proc and proc.poll() is None:
-                proc.terminate()
-            win = None
-            logger.info("[TV] password try %s failed for id=%s", idx, teamviewer_id)
-
-        if not win:
-            raise RuntimeError(f"TeamViewer session failed for id={teamviewer_id}")
+        win, connect_no = _connect(
+            gw,
+            tv_id,
+            teamviewer_path,
+            teamviewer_passwords,
+            list(range(1, len(teamviewer_passwords) + 1)),  # .env order: TV_PASSWORD #1, then #2
+            stale,
+            wait_for_connection_sec,
+            progress,
+            _cancelled,
+        )
+        logger.info("[TV] connected with TeamViewer password #%s", connect_no)
 
         session_title_hint = win.title
         session_hwnd = win._hWnd
         try:
             win.activate()
-            _sleep_cancellable(3, should_cancel)
-        except CaptureCancelled:
-            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("[TV] activate failed: %s", type(exc).__name__)
 
-        progress("Waiting for remote session to stabilize…")
-        if not _wait_until_session_interactive(
-            session_hwnd,
-            should_cancel,
-            timeout_sec=55,
-            progress=progress,
-        ):
-            raise RuntimeError(
-                f"TeamViewer session unstable (reconnect) for id={teamviewer_id}"
-            )
+        progress("Waiting for remote session to settle…")
+        if _wait_until_settled(session_hwnd, should_cancel, timeout_sec=12, progress=progress) is None:
+            raise RuntimeError(f"TeamViewer session closed before login for id={tv_id}")
 
-        _focus_remote_desktop(pyautogui, session_hwnd)
-        _sleep_cancellable(1.5, should_cancel)
-
-        # Remote Ubuntu lock screen: wake field, then try OS passwords (preferred last first).
         if camera_passwords:
-            if _cancelled():
-                raise CaptureCancelled("TeamViewer capture cancelled")
-            progress(f"OS login ({len(camera_passwords)} password try)")
-            _attempt_os_passwords(
+            progress(f"OS login ({len(camera_passwords)} password(s))")
+            _login(
                 pyautogui,
+                session_hwnd,
                 camera_passwords,
+                # TV_CAMERA_PASSWORDS is already ordered TV_PASSWORD #2, then #1.
+                list(range(1, len(camera_passwords) + 1)),
+                should_cancel,
                 progress,
-                hwnd=session_hwnd,
             )
 
         # Do NOT send Escape or type TV_USERNAME — both break the session / desktop.
-        _sleep_cancellable(3, should_cancel)
-
-        # Login / unlock can drop the TeamViewer stream briefly — wait it out.
         progress("Waiting after OS login…")
-        _wait_until_session_interactive(
-            session_hwnd,
-            should_cancel,
-            timeout_sec=40,
-            progress=progress,
-        )
+        _wait_until_settled(session_hwnd, should_cancel, timeout_sec=8, progress=progress)
 
         # Re-resolve session window in case the handle changed after login.
         try:
-            refreshed = _find_session_window(gw, teamviewer_id, title_hint=session_title_hint)
+            refreshed = _find_session_window(
+                gw, tv_id, title_hint=session_title_hint, exclude=stale
+            )
             if refreshed is not None:
                 win = refreshed
                 session_hwnd = win._hWnd
-                try:
-                    win.activate()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[TV] activate before capture failed: %s", type(exc).__name__)
-                _sleep_cancellable(1.5, should_cancel)
-        except CaptureCancelled:
-            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("[TV] refresh session window failed: %s", type(exc).__name__)
 
@@ -745,7 +898,7 @@ def capture_dragoneye_via_teamviewer(
                     win.activate()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[TV] activate on attempt %s failed: %s", attempt, type(exc).__name__)
-                _sleep_cancellable(0.8, should_cancel)
+                _sleep_cancellable(0.4, should_cancel)
                 left, top, width, height = _hwnd_rect(win._hWnd)
                 logger.info(
                     "[TV] capture attempt %s hwnd=%s title=%r bounds=%sx%s@%s,%s",
@@ -784,11 +937,6 @@ def capture_dragoneye_via_teamviewer(
             raise RuntimeError(f"TeamViewer screenshot failed: {last_err}") from last_err
     except CaptureCancelled:
         logger.info("[TV] cancelled id=%s — cleaning up", teamviewer_id)
-        if proc and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
         cleanup_teamviewer_ui(teamviewer_id=str(teamviewer_id))
         raise
     finally:

@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Any
 
 from django.conf import settings
 from django.contrib import messages
@@ -9,8 +10,9 @@ from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_GET, require_POST
 from django.utils import timezone
+from django.http import FileResponse, Http404
 
-from audits.models import AuditJob
+from audits.models import AuditJob, AuditRound
 from audits.runner import enqueue_audit_job, request_job_cancel
 from cameras.models import Installation
 from cameras.roles import role_at_least
@@ -90,6 +92,10 @@ def _shot_payload(shot) -> dict:
             captured.strftime("%Y-%m-%d %H:%M:%S %Z") if captured else ""
         ),
     }
+
+
+# Site rows returned per DST status poll (totals still cover every site).
+DST_STATUS_SITE_ROWS = 150
 
 
 def _parse_dst_progress(target_host: str, progress_message: str) -> dict:
@@ -231,12 +237,22 @@ def audit_job_status(request, pk):
             progress["phase"] = "failed"
         elif job.status == AuditJob.Status.CANCELLED:
             progress["phase"] = "cancelled"
-        children = list(
-            job.child_jobs.order_by("created_at").prefetch_related("screenshots")[:500]
+        # A fleet run has 800+ sites and this is polled every 2 s: totals come from
+        # one aggregate over all sites, rows only for the newest DST_STATUS_SITE_ROWS
+        # (running ones first), and no screenshot lists (the page shows a count).
+        from django.db.models import Count
+
+        counts = dict(
+            job.child_jobs.order_by().values("status").annotate(n=Count("id")).values_list("status", "n")
         )
+        children = list(
+            job.child_jobs.annotate(shots=Count("screenshots")).order_by("-created_at")[
+                :DST_STATUS_SITE_ROWS
+            ]
+        )
+        children.sort(key=lambda c: c.status != AuditJob.Status.RUNNING)
         site_rows = []
         for child in children:
-            child_shots = [_shot_payload(s) for s in child.screenshots.all() if s.image]
             kind = (child.target_host or "").strip().lower()
             if kind not in {"lti", "de"}:
                 kind = "—"
@@ -249,20 +265,19 @@ def audit_job_status(request, pk):
                     "message": child.progress_message or child.get_status_display(),
                     "error_message": child.error_message,
                     "detail_url": f"/audits/{child.pk}/",
-                    "screenshots": child_shots,
-                    "shot_count": len(child_shots),
+                    "shot_count": child.shots,
                 }
             )
+        total_sites = sum(counts.values())
         payload["dst"] = {
             **progress,
             "sites": site_rows,
-            "sites_done": sum(
-                1
-                for s in site_rows
-                if s["status"] in ("succeeded", "failed", "cancelled")
-            ),
-            "sites_ok": sum(1 for s in site_rows if s["status"] == "succeeded"),
-            "sites_failed": sum(1 for s in site_rows if s["status"] == "failed"),
+            "sites_total": total_sites,
+            "sites_shown": len(site_rows),
+            "sites_done": sum(counts.get(k, 0) for k in ("succeeded", "failed", "cancelled", "skipped")),
+            "sites_ok": counts.get("succeeded", 0),
+            "sites_failed": counts.get("failed", 0),
+            "sites_skipped": counts.get("skipped", 0),
         }
 
     if job.device_type == AuditJob.DeviceType.CONFIRM_BATCH:
@@ -755,6 +770,7 @@ def _dst_recent_audit_rows(limit: int = 12) -> list[dict]:
 
     recent = (
         AuditJob.objects.filter(device_type=AuditJob.DeviceType.DST_AUDIT)
+        .select_related("round")
         .prefetch_related("child_jobs", "child_jobs__screenshots")
         .order_by("-created_at")[:limit]
     )
@@ -817,6 +833,9 @@ def _dst_recent_audit_rows(limit: int = 12) -> list[dict]:
                 ),
                 "site_count": len(children_payload),
                 "sites_summary": sites_summary,
+                "round": parent.round.name if parent.round_id else "",
+                "finished": parent.status
+                not in (AuditJob.Status.PENDING, AuditJob.Status.RUNNING),
                 "detail_url": f"/audits/{parent.pk}/",
                 "children": children_payload,
             }
@@ -913,6 +932,19 @@ def dst_audit_page(request):
 
     settle = int(getattr(settings, "DST_POWER_SETTLE_SECONDS", 90))
 
+    from audits.publish import shared_configured
+
+    can_publish = can_audit and settings.DST_ROLE == "capture" and shared_configured()
+    active_publish = (
+        AuditJob.objects.filter(
+            device_type=AuditJob.DeviceType.PUBLISH, status=AuditJob.Status.RUNNING
+        )
+        .order_by("-created_at")
+        .first()
+        if can_publish
+        else None
+    )
+
     return render(
         request,
         "audits/dst_audit.html",
@@ -931,6 +963,14 @@ def dst_audit_page(request):
             "active_job": active_job,
             "recent_jobs": recent_rows,
             "settle_seconds": settle,
+            "can_publish": can_publish,
+            "can_schedule": can_audit and settings.DST_ROLE == "capture",
+            "schedules": _dst_schedules(),
+            "device_now": _device_now().strftime("%Y-%m-%d %H:%M %Z"),
+            "default_round_date": _device_now().strftime("%Y-%m-%d HH:MM"),
+            "publish_runs": [r for r in recent_rows if r["finished"]],
+            "rounds": list(AuditRound.objects.values_list("name", flat=True)[:20]),
+            "active_publish": active_publish,
             "has_filters": bool(q or state or agency or (scope and scope != "all")),
         },
     )
@@ -962,18 +1002,62 @@ def _dst_serials_for_inst(inst) -> list[str]:
 
 
 @login_required
+@require_POST
+def publish_dst(request):
+    """Publish finished DST runs to the shared DB (background job; VPN must be off)."""
+    from audits.publish import PublishError, shared_configured, start_publish_job
+
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if settings.DST_ROLE != "capture" or not shared_configured():
+        return JsonResponse({"error": "Publishing is only available on the capture laptop with DB_HOST set."}, status=400)
+    try:
+        body = json.loads(request.body.decode() or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "invalid JSON"}, status=400)
+    try:
+        run_ids = [int(x) for x in body.get("run_ids") or []]
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "run_ids must be job ids"}, status=400)
+    if not run_ids:
+        return JsonResponse({"error": "Select at least one run."}, status=400)
+    try:
+        job = start_publish_job(run_ids, str(body.get("round") or ""), request.user)
+    except PublishError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    logger.info("[PUBLISH] user=%s started job=%s runs=%s", request.user.username, job.pk, run_ids)
+    return JsonResponse({"job_id": job.pk})
+
+
+@login_required
 def dst_recent_audits(request):
     """JSON: recent parent DST audits with nested site children."""
     return JsonResponse({"jobs": _dst_recent_audit_rows(12)})
 
 
-@login_required
-@require_POST
-def start_dst_audit(request):
-    """Start a fleet DST audit (power-all → settle → capture → OvrC times)."""
-    if not role_at_least(request.user, "technician"):
-        return JsonResponse({"error": "forbidden"}, status=403)
+def _device_now():
+    from audits.scheduling import device_now
 
+    return device_now()
+
+
+def _dst_schedules():
+    """Upcoming schedules plus the last few that ran, newest first."""
+    from audits.models import ScheduledAudit
+
+    upcoming = list(ScheduledAudit.objects.filter(status=ScheduledAudit.Status.SCHEDULED))
+    recent = list(
+        ScheduledAudit.objects.exclude(status=ScheduledAudit.Status.SCHEDULED).order_by("-fire_at")[:5]
+    )
+    for s in upcoming + recent:
+        # The device's zone with its own DST rules, as Task Scheduler shows it.
+        s.local_label = s.fire_at.astimezone().strftime("%a %Y-%m-%d %H:%M %Z")
+        s.site_count = len(s.installation_ids or [])
+    return upcoming + recent
+
+
+def _dst_run_options(request):
+    """Parse a Start/Schedule request: (options, None) or (None, error response)."""
     if request.content_type and "application/json" in request.content_type:
         try:
             body = json.loads(request.body.decode() or "{}")
@@ -983,34 +1067,69 @@ def start_dst_audit(request):
         state = str(body.get("state") or "").strip()
         agency = str(body.get("agency") or "").strip()
         raw_ids = body.get("installation_ids") or body.get("ids") or []
+        publish_round = str(body.get("publish_round") or "")
     else:
         scope = (request.POST.get("scope") or "all").strip().lower()
         state = (request.POST.get("state") or "").strip()
         agency = (request.POST.get("agency") or "").strip()
         raw_ids = request.POST.getlist("installation_ids")
+        publish_round = request.POST.get("publish_round") or ""
 
     if scope not in {"all", "lti", "de"}:
-        return JsonResponse({"error": "scope must be all, lti, or de"}, status=400)
+        return None, JsonResponse({"error": "scope must be all, lti, or de"}, status=400)
 
     installation_ids: list[int] = []
     if isinstance(raw_ids, str):
         raw_ids = [p for p in raw_ids.replace(";", ",").split(",") if p.strip()]
     if not isinstance(raw_ids, (list, tuple)):
-        return JsonResponse({"error": "installation_ids must be a list"}, status=400)
+        return None, JsonResponse({"error": "installation_ids must be a list"}, status=400)
     for x in raw_ids:
         try:
             installation_ids.append(int(x))
         except (TypeError, ValueError):
-            return JsonResponse({"error": f"invalid installation id: {x!r}"}, status=400)
+            return None, JsonResponse({"error": f"invalid installation id: {x!r}"}, status=400)
     # Preserve order, drop duplicates.
     seen: set[int] = set()
     installation_ids = [i for i in installation_ids if not (i in seen or seen.add(i))]
 
     if not installation_ids:
-        return JsonResponse(
+        return None, JsonResponse(
             {"error": "Select at least one site to audit"},
             status=400,
         )
+
+    if publish_round.strip():
+        from audits.publish import PublishError, clean_round_name, shared_configured
+
+        if settings.DST_ROLE != "capture" or not shared_configured():
+            return None, JsonResponse({"error": "Publishing is only available on the capture laptop with DB_HOST set."}, status=400)
+        try:
+            publish_round = clean_round_name(publish_round)
+        except PublishError as exc:
+            return None, JsonResponse({"error": str(exc)}, status=400)
+    else:
+        publish_round = ""
+
+    return {
+        "scope": scope,
+        "state": state,
+        "agency": agency,
+        "installation_ids": installation_ids,
+        "publish_round": publish_round,
+    }, None
+
+
+@login_required
+@require_POST
+def start_dst_audit(request):
+    """Start a fleet DST audit (power-all → settle → capture → OvrC times)."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    opts, error = _dst_run_options(request)
+    if error:
+        return error
+    scope, state, agency = opts["scope"], opts["state"], opts["agency"]
 
     running = AuditJob.objects.filter(
         device_type=AuditJob.DeviceType.DST_AUDIT,
@@ -1019,35 +1138,20 @@ def start_dst_audit(request):
     if running:
         return JsonResponse({"error": "A DST Audit is already running"}, status=409)
 
-    from audits.runner import (
-        _active_dst_installations,
-        _encode_dst_audit_meta,
-        write_dst_selection,
-    )
+    from audits.runner import create_dst_audit_job
 
-    sites = _active_dst_installations(
-        scope=scope,
-        state=state,
-        agency=agency,
-        installation_ids=installation_ids,
-    )
-    if not sites:
-        return JsonResponse(
-            {"error": "None of the selected sites are eligible for DST audit"},
-            status=400,
+    try:
+        job, sites = create_dst_audit_job(
+            request.user,
+            scope=scope,
+            state=state,
+            agency=agency,
+            installation_ids=opts["installation_ids"],
+            publish_round=opts["publish_round"],
         )
-
-    # Only persist IDs that survived eligibility checks.
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
     resolved_ids = [inst.pk for inst in sites]
-    meta = _encode_dst_audit_meta(scope, state, agency)
-    job = AuditJob.objects.create(
-        pole_number="DST-ALL",
-        target_host=meta,
-        device_type=AuditJob.DeviceType.DST_AUDIT,
-        created_by=request.user,
-        progress_message=f"Queued — {len(sites)} site(s)",
-    )
-    write_dst_selection(job.pk, resolved_ids)
     enqueue_audit_job(job.pk)
     logger.info(
         "[DST] start job=%s sites=%s selected=%s scope=%s state=%s agency=%s user=%s",
@@ -1464,6 +1568,7 @@ def start_confirm_captures(request):
         installation_id = body.get("installation_id")
     else:
         raw_ids = request.POST.getlist("installation_ids")
+        publish_round = request.POST.get("publish_round") or ""
         installation_id = request.POST.get("installation_id")
 
     installation_ids: list[int] = []
@@ -1576,7 +1681,299 @@ def start_confirm_captures(request):
     )
 
 
+def _rejection_recent_rows(limit: int = 12) -> list[dict]:
+    from audits.runner import _eastern_display
+
+    recent = (
+        AuditJob.objects.filter(
+            device_type=AuditJob.DeviceType.REJECTION_REPORT,
+            parent_job__isnull=True,
+        )
+        .prefetch_related("child_jobs")
+        .order_by("-created_at")[:limit]
+    )
+    rows: list[dict] = []
+    for job in recent:
+        children = list(job.child_jobs.all())
+        when = job.finished_at or job.created_at
+        rows.append(
+            {
+                "id": job.pk,
+                "label": f"#{job.pk}",
+                "status": job.status,
+                "status_display": job.get_status_display(),
+                "when_display": _eastern_display(when),
+                "message": job.progress_message or job.get_status_display(),
+                "site_count": len(children),
+                "detail_url": f"/audits/{job.pk}/",
+                "download_url": f"/audits/rejection-report/{job.pk}/download/",
+            }
+        )
+    return rows
+
+
+@login_required
+def rejection_report_page(request):
+    """Rejection CSV report — upload, match, run, and download the result."""
+    can_audit = role_at_least(request.user, "technician")
+    active_job = (
+        AuditJob.objects.filter(
+            device_type=AuditJob.DeviceType.REJECTION_REPORT,
+            parent_job__isnull=True,
+            status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    return render(
+        request,
+        "audits/rejection_report.html",
+        {
+            "can_audit": can_audit,
+            "active_job": active_job,
+            "active_download_url": (
+                f"/audits/rejection-report/{active_job.pk}/download/"
+                if active_job
+                else ""
+            ),
+            "recent_jobs": _rejection_recent_rows(12),
+        },
+    )
+
+
+def _read_rejection_csv_upload(request) -> tuple[str, Any]:
+    upload = request.FILES.get("file") or request.FILES.get("rejection_csv")
+    if upload is None:
+        return "Upload a rejection .csv file", None
+    name = (getattr(upload, "name", "") or "").lower()
+    if not name.endswith(".csv"):
+        return "File must be a .csv", None
+    return "", upload
+
+
+def _serialize_rejection_rows(report) -> list[dict]:
+    out = []
+    for item in report.rows:
+        out.append(
+            {
+                "serial": item.row.serial,
+                "count": item.row.count,
+                "reason": item.row.reason,
+                "source_row": item.row.source_row,
+                "status": item.status,
+                "installation_id": item.installation_id,
+                "identifier": item.identifier,
+                "pole": item.pole,
+                "kind": item.kind,
+                "match_by": item.match_by,
+                "reason_note": item.reason,
+            }
+        )
+    return out
+
+
+@login_required
+@require_POST
+def preview_rejection_report(request):
+    """Parse + match a rejection CSV and return a preview JSON."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    err, upload = _read_rejection_csv_upload(request)
+    if err:
+        return JsonResponse({"error": err}, status=400)
+
+    from services.rejection_csv import parse_rejection_csv
+    from services.rejection_match import match_rejection_rows
+
+    try:
+        rows = parse_rejection_csv(upload.read())
+        report = match_rejection_rows(rows)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[REJECTION] preview parse failed")
+        return JsonResponse({"error": f"Could not read CSV: {exc}"}, status=400)
+
+    preview_rows = []
+    for item in report.rows:
+        preview_rows.append(
+            {
+                "serial": item.row.serial,
+                "count": item.row.count,
+                "reason": item.row.reason,
+                "status": item.status,
+                "kind": item.kind,
+                "identifier": item.identifier,
+                "pole": item.pole,
+                "match_by": item.match_by,
+                "reason_note": item.reason,
+            }
+        )
+
+    return JsonResponse(
+        {
+            "ok": True,
+            "row_count": len(preview_rows),
+            "matched_count": report.matched_count,
+            "unmatched_count": report.unmatched_count,
+            "ineligible_count": report.ineligible_count,
+            "duplicate_count": report.duplicate_count,
+            "rows": preview_rows,
+        }
+    )
+
+
+@login_required
+@require_POST
+def start_rejection_report(request):
+    """Parse the CSV again, persist rows, and enqueue the report job."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    err, upload = _read_rejection_csv_upload(request)
+    if err:
+        return JsonResponse({"error": err}, status=400)
+
+    from services.rejection_csv import parse_rejection_csv
+    from services.rejection_match import match_rejection_rows
+
+    try:
+        rows = parse_rejection_csv(upload.read())
+        report = match_rejection_rows(rows)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[REJECTION] start parse failed")
+        return JsonResponse({"error": f"Could not read CSV: {exc}"}, status=400)
+
+    if not report.rows:
+        return JsonResponse({"error": "CSV contained no rows"}, status=400)
+
+    running = AuditJob.objects.filter(
+        device_type__in=[
+            AuditJob.DeviceType.REJECTION_REPORT,
+            AuditJob.DeviceType.CONFIRM_BATCH,
+            AuditJob.DeviceType.CONFIRM_SITE,
+            AuditJob.DeviceType.VBE_DAILY_ALL,
+            AuditJob.DeviceType.DST_AUDIT,
+        ],
+        parent_job__isnull=True,
+        status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
+    ).exists()
+    if running:
+        return JsonResponse(
+            {"error": "Another fleet capture is already running (Rejection / Confirm / VBE / DST)"},
+            status=409,
+        )
+
+    from audits.runner import write_rejection_selection
+
+    serialized = _serialize_rejection_rows(report)
+    job = AuditJob.objects.create(
+        pole_number="REJECTION",
+        target_host=f"0/{len(serialized)}",
+        device_type=AuditJob.DeviceType.REJECTION_REPORT,
+        created_by=request.user,
+        progress_message=f"Queued — {len(serialized)} row(s)",
+    )
+    write_rejection_selection(job.pk, serialized)
+    enqueue_audit_job(job.pk)
+    logger.info(
+        "[REJECTION] start job=%s rows=%s user=%s",
+        job.pk,
+        len(serialized),
+        request.user.get_username(),
+    )
+    return JsonResponse(
+        {
+            "ok": True,
+            "job_id": job.pk,
+            "rows": len(serialized),
+            "status_url": f"/audits/{job.pk}/status/",
+            "detail_url": f"/audits/{job.pk}/",
+            "download_url": f"/audits/rejection-report/{job.pk}/download/",
+        }
+    )
+
+
+@login_required
+@require_GET
+def download_rejection_report(request, pk):
+    """Serve the generated .xlsx report for a finished rejection job."""
+    job = get_object_or_404(AuditJob, pk=pk, device_type=AuditJob.DeviceType.REJECTION_REPORT)
+    from audits.runner import _rejection_report_xlsx_path
+
+    path = _rejection_report_xlsx_path(job.pk)
+    if not path.exists():
+        raise Http404("Report not ready")
+    return FileResponse(
+        path.open("rb"),
+        as_attachment=True,
+        filename=f"rejection_report_{job.pk}.xlsx",
+    )
+
+
 def _dst_site_kind_safe(inst) -> str:
     from audits.runner import _dst_site_kind
 
     return _dst_site_kind(inst) or ""
+
+
+@login_required
+@require_POST
+def schedule_dst_audit(request):
+    """Schedule a one-time DST audit of the selected sites at a device-local time."""
+    from audits.scheduling import ScheduleError, create_schedule, parse_local
+
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if settings.DST_ROLE != "capture":
+        return JsonResponse({"error": "Scheduling is only available on the capture laptop."}, status=400)
+    opts, error = _dst_run_options(request)
+    if error:
+        return error
+    try:
+        body = json.loads(request.body.decode() or "{}")
+        sched = create_schedule(request.user, parse_local(str(body.get("fire_at") or "")), opts)
+    except (json.JSONDecodeError, ScheduleError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    return JsonResponse({"ok": True, "id": sched.pk})
+
+
+@login_required
+@require_POST
+def schedule_action(request, pk, action):
+    from audits.models import ScheduledAudit
+    from audits.scheduling import ScheduleError, cancel_schedule, run_now
+
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    if action not in ("cancel", "run"):
+        raise Http404
+    sched = get_object_or_404(ScheduledAudit, pk=pk)
+    try:
+        (cancel_schedule if action == "cancel" else run_now)(sched)
+    except ScheduleError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    logger.info("[SCHED] #%s %s by %s", pk, action, request.user.get_username())
+    return JsonResponse({"ok": True})
+
+
+@login_required
+@require_GET
+def schedule_status(request):
+    """The Scheduled audits table as JSON, so the DST page follows a fire without a reload."""
+    if not role_at_least(request.user, "technician"):
+        return JsonResponse({"error": "forbidden"}, status=403)
+    return JsonResponse(
+        {
+            "schedules": [
+                {
+                    "id": s.pk,
+                    "status": s.status,
+                    "status_label": s.get_status_display(),
+                    "message": s.message,
+                    "job_id": s.job_id,
+                    "publish_round": s.publish_round,
+                }
+                for s in _dst_schedules()
+            ]
+        }
+    )

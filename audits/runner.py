@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from django.conf import settings
 from django.core.files import File
 from django.db import close_old_connections
 from django.utils import timezone
+
+from audits.ovrc_time import OVRC_FIELD_NAMES, ovrc_fields
 
 logger = logging.getLogger(__name__)
 
@@ -131,11 +134,28 @@ def reap_orphaned_audit_jobs() -> int:
     """
     from audits.models import AuditJob
 
+    from django.db.models import Q
+
+    from audits.models import ScheduledAudit
+    from services.task_scheduler import pid_alive
+
     close_old_connections()
     now = timezone.now()
     qs = AuditJob.objects.filter(
         status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
     )
+    # A scheduled run is its own process: leave it alone while that process lives.
+    for sched in ScheduledAudit.objects.filter(status=ScheduledAudit.Status.RUNNING):
+        if pid_alive(sched.pid):
+            qs = qs.exclude(
+                Q(pk=sched.job_id)
+                | Q(parent_job_id=sched.job_id)
+                | Q(device_type=AuditJob.DeviceType.PUBLISH, created_at__gte=sched.fire_at)
+            )
+        else:
+            ScheduledAudit.objects.filter(pk=sched.pk).update(
+                status=ScheduledAudit.Status.FAILED, message="Interrupted: the run's process ended"
+            )
     count = qs.count()
     if not count:
         return 0
@@ -174,22 +194,68 @@ def _set_progress(job_id: int, message: str, *, mirror_parent: bool = True) -> N
                 AuditJob.objects.filter(pk=parent_id).update(progress_message=text)
 
 
-def _save_shot(job_id: int, filepath: Path, label: str) -> None:
+def _save_shot(job_id: int, filepath: Path, label: str, *, captured_at=None, reading=None) -> None:
+    """Store a capture with when it was grabbed and the device clock it shows.
+
+    captured_at defaults to the image file's write time (the grab; the row is
+    saved seconds later). reading (services.device_clock.Reading) defaults to
+    reading the image itself; OvrC passes the reading it already has.
+    """
     from audits.models import AuditJob, AuditScreenshot
 
     close_old_connections()
+    filepath = Path(filepath)
     job = AuditJob.objects.get(pk=job_id)
+    if captured_at is None:
+        captured_at = _file_written_at(filepath)
+    if reading is None:
+        reading = _read_device_clock(label, filepath, captured_at, job.site_tz)
     with filepath.open("rb") as fh:
-        shot = AuditScreenshot(job=job, label=label)
+        shot = AuditScreenshot(
+            job=job,
+            label=label,
+            captured_at=captured_at,
+            device_time_raw=reading.raw if reading else "",
+            device_time=reading.iso if reading else "",
+            device_time_source=reading.source if reading else "",
+        )
         shot.image.save(filepath.name, File(fh), save=True)
-    captured_at = timezone.localtime(shot.created_at)
     logger.info(
-        "[AUDIT] Job %s saved screenshot label=%s path=%s captured_at=%s",
+        "[AUDIT] Job %s saved screenshot label=%s path=%s captured_at=%s device=%s",
         job_id,
         label,
         filepath.name,
-        captured_at.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        timezone.localtime(captured_at or shot.created_at).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        f"{reading.iso} ({reading.source})" if reading else "unread",
     )
+
+
+def _ovrc_reading(raw: str):
+    """OvrC's "Sun, Aug 02, 2026 01:11 AM EDT" as a device reading (None if unparsed)."""
+    from audits.ovrc_time import parse_ovrc_local
+    from services.device_clock import Reading
+
+    wall, _zone = parse_ovrc_local(raw)
+    return Reading(" ".join((raw or "").split())[:128], wall, "ovrc") if wall else None
+
+
+def _file_written_at(path: Path):
+    from datetime import datetime, timezone as dt_timezone
+
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=dt_timezone.utc)
+    except OSError:
+        return timezone.now()
+
+
+def _read_device_clock(label: str, path: Path, captured_at, site_tz: str):
+    """The device clock shown in a capture, or None (OCR off, missing or unreadable)."""
+    if not getattr(settings, "DEVICE_CLOCK_OCR", True) and label != "cbw":
+        return None
+    from audits.device_drift import expected_wall
+    from services.device_clock import read_capture
+
+    return read_capture(label, path, expected_wall(captured_at, site_tz))
 
 
 def _lane2_present(pole_number: str) -> bool:
@@ -737,6 +803,7 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
 
     errors: list[str] = []
     times: list[str] = []
+    readings: list[dict] = []
     _set_progress(job_id, f"OvrC local time for {len(unique_fx)} FX…")
     t0 = time.perf_counter()
     try:
@@ -751,7 +818,9 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
         )
         for r in results:
             label = f"ovrc_{r.fx_number.lower()}"
-            _save_shot(job_id, r.screenshot_path, label)
+            _save_shot(
+                job_id, r.screenshot_path, label, captured_at=r.captured_at, reading=_ovrc_reading(r.local_time)
+            )
             line = _format_ovrc_timestamp_line(r.fx_number, r.local_time)
             _set_progress(job_id, line)
             logger.info(
@@ -762,6 +831,9 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
                 line,
             )
             times.append(line)
+            readings.append(
+                ovrc_fields(r.fx_number, r.local_time, r.captured_at or timezone.now())
+            )
         logger.info(
             "[AUDIT] Job %s OvrC done count=%s elapsed=%.1fs",
             job_id,
@@ -772,7 +844,9 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
             from audits.models import AuditJob
 
             # One OvrC timestamp line on the job (last FX if several).
-            AuditJob.objects.filter(pk=job_id).update(progress_message=times[-1][:255])
+            AuditJob.objects.filter(pk=job_id).update(
+                progress_message=times[-1][:255], **readings[-1]
+            )
     except CaptureCancelled:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -857,16 +931,25 @@ def _dst_fleet_ovrc_times(
                 errors.append(f"{site_key}: OvrC missing result for {fx}")
 
     child_times: dict[int, list[str]] = {}
+    child_readings: dict[int, list[dict]] = {}
     child_errs: dict[int, list[str]] = {}
     for r in results:
         fx = (r.fx_number or "").strip().upper()
         label = f"ovrc_{fx.lower()}"
         line = _format_ovrc_timestamp_line(fx, r.local_time)
+        reading = ovrc_fields(fx, r.local_time, r.captured_at or timezone.now())
         owners = fx_owners.get(fx) or []
         for child_pk, site_key, _child_dir in owners:
             try:
-                _save_shot(child_pk, Path(r.screenshot_path), label)
+                _save_shot(
+                    child_pk,
+                    Path(r.screenshot_path),
+                    label,
+                    captured_at=r.captured_at,
+                    reading=_ovrc_reading(r.local_time),
+                )
                 child_times.setdefault(child_pk, []).append(line)
+                child_readings.setdefault(child_pk, []).append(reading)
                 logger.info(
                     "[DST] Job %s fleet OvrC ok child=%s site=%s fx=%s raw=%s est=%s",
                     parent_job_id,
@@ -904,15 +987,21 @@ def _dst_fleet_ovrc_times(
             # OvrC timestamp is the progress line; warnings stay on error_message.
             if times:
                 child.progress_message = times[-1][:255]
+                for key, value in child_readings[child_pk][-1].items():
+                    setattr(child, key, value)
             elif warns:
                 child.progress_message = f"Done with warnings ({warns})"
             else:
                 child.progress_message = "Done"
-            # Fleet OvrC runs after the per-site TV pass — bump finished_at so
-            # audit Finished is not earlier than the OvrC capture wall time.
-            child.finished_at = timezone.now()
+            # finished_at stays the capture finish; the OvrC read has ovrc_captured_at.
         child.save(
-            update_fields=["error_message", "status", "progress_message", "finished_at"]
+            update_fields=[
+                "error_message",
+                "status",
+                "progress_message",
+                "finished_at",
+                *OVRC_FIELD_NAMES,
+            ]
         )
 
     logger.info(
@@ -1336,6 +1425,406 @@ def _run_confirm_batch(job_id: int, output_dir: Path) -> tuple[list[str], int]:
     return all_errors, sites_ok
 
 
+def _rejection_selection_path(job_id: int) -> Path:
+    return Path(settings.MEDIA_ROOT) / "audits" / f"rejection_selection_{job_id}.json"
+
+
+def write_rejection_selection(job_id: int, rows: list[dict]) -> Path:
+    """Persist parsed + matched rejection CSV rows for the background worker."""
+    import json
+
+    path = _rejection_selection_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"rows": rows}), encoding="utf-8")
+    logger.info("[REJECTION] Job %s selection written count=%s", job_id, len(rows))
+    return path
+
+
+def read_rejection_selection(job_id: int) -> list[dict]:
+    """Return the persisted rejection rows, or [] when none exist."""
+    import json
+
+    path = _rejection_selection_path(job_id)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.exception("[REJECTION] Job %s failed to read selection", job_id)
+        return []
+    return data.get("rows") or []
+
+
+def _rejection_report_dir(job_id: int) -> Path:
+    return Path(settings.MEDIA_ROOT) / "rejection_report" / str(job_id)
+
+
+def _rejection_report_xlsx_path(job_id: int) -> Path:
+    return _rejection_report_dir(job_id) / "report.xlsx"
+
+
+def _rejection_tv_credentials() -> tuple[list[str], list[str], str, str]:
+    """Return (connect_passwords, login_passwords, camera_username, tv_path)."""
+    tv_passwords = list(getattr(settings, "TEAMVIEWER_PASSWORDS", []) or [])
+    cam_passwords = list(getattr(settings, "TV_CAMERA_PASSWORDS", []) or [])
+    if not cam_passwords:
+        legacy = list(getattr(settings, "TV_PASSWORDS", []) or [])
+        cam_passwords = [legacy[-1]] if legacy else list(tv_passwords[-1:] if tv_passwords else [])
+    cam_user = getattr(settings, "TV_USERNAME", "") or ""
+    tv_path = getattr(settings, "TEAMVIEWER_PATH", "") or ""
+    connect_passwords = tv_passwords or cam_passwords
+    login_passwords = cam_passwords
+    return connect_passwords, login_passwords, cam_user, tv_path
+
+
+def _rejection_fx_capture(
+    job_id: int,
+    inst,
+    fx: str,
+    output_dir: Path,
+    *,
+    connect_passwords: list[str],
+    login_passwords: list[str],
+    cam_user: str,
+    tv_path: str,
+) -> list[str]:
+    """Capture each TeamViewer lane for one FX serial."""
+    from services.rejection_match import resolve_fx_tv_targets
+    from services.teamviewer_capture import (
+        CaptureCancelled,
+        capture_dragoneye_via_teamviewer,
+    )
+
+    targets = resolve_fx_tv_targets(inst, fx)
+    if not targets:
+        return [f"No TeamViewer ID mapped for {fx}"]
+
+    errors: list[str] = []
+    used_filenames: set[str] = set()
+    for target in targets:
+        _raise_if_cancelled(job_id)
+        label = target.get("thumb_key") or "de_tv"
+        lane_bit = target.get("lane") or "TV"
+        filename = f"{label}.png"
+        if filename in used_filenames:
+            filename = f"{fx.lower()}_{label}.png"
+        used_filenames.add(filename)
+        try:
+            _set_progress(
+                job_id,
+                f"TeamViewer {fx} {lane_bit} ({target['teamviewer_id']})…",
+            )
+            path = capture_dragoneye_via_teamviewer(
+                teamviewer_id=target["teamviewer_id"],
+                teamviewer_passwords=connect_passwords,
+                camera_passwords=login_passwords,
+                output_dir=output_dir,
+                filename=filename,
+                camera_username=cam_user,
+                teamviewer_path=tv_path,
+                on_progress=lambda msg: _set_progress(job_id, msg),
+                should_cancel=lambda: is_job_cancelled(job_id),
+            )
+            _save_shot(job_id, path, label)
+        except CaptureCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{fx} {lane_bit}: {exc}")
+    return errors
+
+
+def _rejection_ds_capture(
+    job_id: int,
+    inst,
+    ds_serial: str,
+    output_dir: Path,
+) -> list[str]:
+    """Capture the VNC lane for one DS serial."""
+    from services.rejection_match import resolve_ds_vnc_target
+    from services.vnc_capture import capture_vnc
+
+    host, lane_key, thumb = resolve_ds_vnc_target(inst, ds_serial)
+    if not host:
+        return [f"Unable to locate VNC lane for {ds_serial}"]
+    try:
+        _set_progress(job_id, f"VNC {ds_serial} connect {host}…")
+        path = capture_vnc(
+            output_dir=output_dir,
+            host=host,
+            password=settings.TF_VNC_PASSWORD,
+            filename=f"{thumb or 'vnc'}.png",
+            on_progress=lambda msg: _set_progress(job_id, msg),
+        )
+        _save_shot(job_id, path, thumb or "vnc")
+        return []
+    except Exception as exc:  # noqa: BLE001
+        return [f"VNC {lane_key or ds_serial}: {exc}"]
+
+
+def _run_rejection_report(job_id: int, output_dir: Path) -> tuple[list[str], int]:
+    """Run the rejection CSV report: power on, capture, build .xlsx/.csv."""
+    from audits.models import AuditJob
+    from cameras.models import Installation
+    from services.ovrc_capture import ensure_dcam_on_for_fxes
+    from services.teamviewer_capture import CaptureCancelled
+
+    close_old_connections()
+    _raise_if_cancelled(job_id)
+    bulk = AuditJob.objects.get(pk=job_id)
+
+    rows = read_rejection_selection(job_id)
+    if not rows:
+        return ["No rejection CSV rows loaded"], 0
+
+    total = len(rows)
+    matched = [r for r in rows if r.get("status") == "matched"]
+    _set_progress(job_id, f"Rejection Report: 0/{total} rows…")
+    AuditJob.objects.filter(pk=job_id).update(target_host=f"0/{total}")
+
+    all_errors: list[str] = []
+    power_ok: dict[str, bool] = {}
+    power_text: dict[str, str] = {}
+    result_by_serial: dict[str, str] = {}
+    shot_by_serial: dict[str, str] = {}
+
+    fx_rows = [r for r in matched if r.get("kind") == "de"]
+    lti_rows = [r for r in matched if r.get("kind") == "lti"]
+
+    # ── Phase 1: power on ────────────────────────────────────────────────
+    if fx_rows:
+        fx_serials = list(dict.fromkeys((r["serial"] or "").strip().upper() for r in fx_rows))
+        fx_serials = [fx for fx in fx_serials if fx]
+        ovrc_user = (getattr(settings, "OVRC_USERNAME", "") or "").strip()
+        ovrc_pass = (getattr(settings, "OVRC_PASSWORD", "") or "").strip()
+        if not ovrc_user or not ovrc_pass:
+            for fx in fx_serials:
+                power_ok[fx] = False
+                power_text[fx] = "UNABLE TO TURN ON: OVRC_USERNAME / OVRC_PASSWORD not configured"
+        else:
+            _set_progress(job_id, f"Rejection power-on: {len(fx_serials)} FX…")
+            try:
+                results = ensure_dcam_on_for_fxes(
+                    fx_serials,
+                    username=ovrc_user,
+                    password=ovrc_pass,
+                    base_url=getattr(settings, "OVRC_BASE_URL", "") or "https://app.ovrc.com",
+                    headless=True,
+                    on_progress=lambda msg: _set_progress(job_id, msg),
+                )
+                by_fx = {(r.fx_number or "").strip().upper(): r for r in results}
+                for fx in fx_serials:
+                    res = by_fx.get(fx)
+                    if res is None:
+                        power_ok[fx] = False
+                        power_text[fx] = "UNABLE TO TURN ON: no DCAM result"
+                    else:
+                        power_ok[fx] = True
+                        power_text[fx] = f"DCAM {res.action}"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[REJECTION] Job %s FX power-on failed: %s",
+                    job_id,
+                    type(exc).__name__,
+                )
+                for fx in fx_serials:
+                    power_ok[fx] = False
+                    power_text[fx] = f"UNABLE TO TURN ON: {type(exc).__name__}"
+
+    if lti_rows:
+        from services.cbw_relays import turn_all_relays_on
+
+        by_pole: dict[str, list[str]] = {}
+        for r in lti_rows:
+            pole = (r.get("pole") or "").strip()
+            serial = (r["serial"] or "").strip().upper()
+            if pole:
+                by_pole.setdefault(pole, []).append(serial)
+        _set_progress(job_id, f"Rejection power-on: {len(by_pole)} LTI pole(s)…")
+        for pole, serials in by_pole.items():
+            try:
+                result = turn_all_relays_on(
+                    pole,
+                    settings.CBW_USERNAME,
+                    settings.CBW_PASSWORDS,
+                )
+                action = result.action
+                for serial in serials:
+                    power_ok[serial] = True
+                    power_text[serial] = f"relays {action}"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[REJECTION] Job %s LTI power-on failed pole=%s: %s",
+                    job_id,
+                    pole,
+                    type(exc).__name__,
+                )
+                for serial in serials:
+                    power_ok[serial] = False
+                    power_text[serial] = f"UNABLE TO TURN ON: {exc}"
+
+    # ── Phase 2: capture matched + powered-on rows ───────────────────────
+    connect_passwords, login_passwords, cam_user, tv_path = _rejection_tv_credentials()
+    captured = 0
+
+    for r in rows:
+        serial = (r["serial"] or "").strip().upper()
+        status = r.get("status")
+        if status != "matched":
+            note = r.get("reason_note") or r.get("reason") or status
+            result_by_serial[serial] = f"{(status or 'unmatched').upper()}: {note}"
+
+    for index, r in enumerate(matched, start=1):
+        _raise_if_cancelled(job_id)
+        serial = (r["serial"] or "").strip().upper()
+        kind = r.get("kind") or "?"
+        _set_progress(job_id, f"Rejection Report {index}/{len(matched)}: {serial} ({kind})")
+        AuditJob.objects.filter(pk=job_id).update(
+            target_host=f"{index - 1}/{total}",
+            progress_message=f"Rejection Report {index}/{len(matched)}: {serial} ({kind})",
+        )
+
+        if not power_ok.get(serial):
+            result_by_serial[serial] = power_text.get(serial, "UNABLE TO TURN ON")
+            all_errors.append(f"{serial}: {result_by_serial[serial]}")
+            continue
+
+        inst = Installation.objects.filter(
+            pk=r.get("installation_id"), is_active=True
+        ).first()
+        if inst is None:
+            result_by_serial[serial] = "UNABLE TO TURN ON: installation no longer active"
+            all_errors.append(f"{serial}: {result_by_serial[serial]}")
+            continue
+
+        child = AuditJob.objects.create(
+            pole_number=serial,
+            target_host=kind,
+            device_type=AuditJob.DeviceType.REJECTION_SITE,
+            status=AuditJob.Status.RUNNING,
+            created_by=bulk.created_by,
+            parent_job=bulk,
+            started_at=timezone.now(),
+            progress_message=f"Rejection report {job_id} ({index}/{len(matched)})",
+        )
+        with _cancel_lock:
+            child_ev = threading.Event()
+            _cancel_flags[child.pk] = child_ev
+            _job_children.setdefault(job_id, set()).add(child.pk)
+            pev = _cancel_flags.get(job_id)
+            if pev is not None and pev.is_set():
+                child_ev.set()
+        child_dir = output_dir / serial.replace("/", "_").replace("\\", "_")
+        child_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if kind == "de":
+                errors = _rejection_fx_capture(
+                    child.pk,
+                    inst,
+                    serial,
+                    child_dir,
+                    connect_passwords=connect_passwords,
+                    login_passwords=login_passwords,
+                    cam_user=cam_user,
+                    tv_path=tv_path,
+                )
+            else:
+                errors = _rejection_ds_capture(child.pk, inst, serial, child_dir)
+
+            child.refresh_from_db()
+            if child.status == AuditJob.Status.CANCELLED or is_job_cancelled(child.pk):
+                raise CaptureCancelled("Audit cancelled by user")
+            has_shots = child.screenshots.exists()
+            if has_shots:
+                captured += 1
+                child.status = AuditJob.Status.SUCCEEDED
+                child.progress_message = (
+                    f"Done with warnings ({len(errors)})" if errors else "Done"
+                )
+                shot = child.screenshots.first()
+                if shot is not None and shot.image:
+                    shot_by_serial[serial] = shot.image.path
+                result_by_serial[serial] = (
+                    f"OK (warnings: {len(errors)})" if errors else "OK"
+                )
+            else:
+                child.status = AuditJob.Status.FAILED
+                child.progress_message = "Failed"
+                detail = "; ".join(errors) if errors else "no screenshot"
+                result_by_serial[serial] = f"CAPTURE FAILED: {detail}"
+            if errors:
+                child.error_message = "; ".join(errors)[:2000]
+                for err in errors:
+                    all_errors.append(f"{serial}: {err}")
+            child.finished_at = timezone.now()
+            child.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                    "progress_message",
+                    "finished_at",
+                    "target_host",
+                ]
+            )
+        except CaptureCancelled:
+            child.refresh_from_db()
+            if child.status != AuditJob.Status.CANCELLED:
+                child.status = AuditJob.Status.CANCELLED
+                child.error_message = "Cancelled by user"
+                child.progress_message = "Cancelled"
+                child.finished_at = timezone.now()
+                child.save(
+                    update_fields=[
+                        "status",
+                        "error_message",
+                        "progress_message",
+                        "finished_at",
+                    ]
+                )
+            _clear_cancel_flag(child.pk)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[REJECTION] Job %s child failed serial=%s", job_id, serial)
+            child.status = AuditJob.Status.FAILED
+            child.error_message = str(exc)[:2000]
+            child.progress_message = "Failed"
+            child.finished_at = timezone.now()
+            child.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                    "progress_message",
+                    "finished_at",
+                ]
+            )
+            result_by_serial[serial] = f"CAPTURE FAILED: {exc}"
+            all_errors.append(f"{serial}: {exc}")
+        finally:
+            _clear_cancel_flag(child.pk)
+
+    # ── Phase 3: build report ────────────────────────────────────────────
+    from services.rejection_report import ReportRow, build_rejection_report
+
+    report_rows = []
+    for r in rows:
+        serial = (r["serial"] or "").strip().upper()
+        path = shot_by_serial.get(serial, "")
+        report_rows.append(
+            ReportRow(
+                serial=r["serial"],
+                count=r.get("count", ""),
+                reason=r.get("reason", ""),
+                result=result_by_serial.get(serial, ""),
+                screenshot_path=path,
+            )
+        )
+    xlsx_path = _rejection_report_xlsx_path(job_id)
+    build_rejection_report(report_rows, xlsx_path)
+
+    _set_progress(job_id, f"Rejection Report finished {captured}/{len(matched)} camera(s)")
+    AuditJob.objects.filter(pk=job_id).update(target_host=f"{captured}/{len(matched)}")
+    return all_errors, captured
+
+
 def _dst_site_kind(inst) -> str | None:
     """Return 'lti' or 'de' when the installation is eligible for DST audit."""
     if inst.is_dragoneye:
@@ -1397,7 +1886,9 @@ def _active_dst_installations(
         if agency:
             qs = qs.filter(agency__iexact=agency)
 
-    qs = qs.order_by("primary_platform", "pole_number", "identifier")
+    # fx_numbers / site kind read inst.devices; prefetch so a fleet page is a
+    # handful of queries, not one per installation (32 ms each to Supabase).
+    qs = qs.order_by("primary_platform", "pole_number", "identifier").prefetch_related("devices")
     by_id = {inst.pk: inst for inst in qs}
     candidates = (
         [by_id[i] for i in ids if i in by_id]
@@ -1424,16 +1915,18 @@ def _dst_selection_path(job_id: int) -> Path:
     return Path(settings.MEDIA_ROOT) / "audits" / f"dst_selection_{job_id}.json"
 
 
-def write_dst_selection(job_id: int, installation_ids: list[int]) -> Path:
-    """Persist selected installation PKs for a DST audit parent job."""
+def write_dst_selection(
+    job_id: int, installation_ids: list[int], *, publish_round: str = ""
+) -> Path:
+    """Persist selected installation PKs (and run options) for a DST audit parent job."""
     path = _dst_selection_path(job_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     import json
 
-    path.write_text(
-        json.dumps({"installation_ids": [int(x) for x in installation_ids]}),
-        encoding="utf-8",
-    )
+    data: dict = {"installation_ids": [int(x) for x in installation_ids]}
+    if publish_round:
+        data["publish_round"] = publish_round
+    path.write_text(json.dumps(data), encoding="utf-8")
     logger.info(
         "[DST] Job %s selection written count=%s path=%s",
         job_id,
@@ -1441,6 +1934,17 @@ def write_dst_selection(job_id: int, installation_ids: list[int]) -> Path:
         path,
     )
     return path
+
+
+def read_dst_publish_round(job_id: int) -> str:
+    """Round to publish the run into when it finishes ("" = don't publish)."""
+    import json
+
+    try:
+        data = json.loads(_dst_selection_path(job_id).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(data.get("publish_round") or "").strip()
 
 
 def read_dst_selection(job_id: int) -> list[int] | None:
@@ -1528,7 +2032,10 @@ def _power_on_all_de_sites(
 ) -> tuple[int, bool, list[str]]:
     """Phase 1 DE: one OvrC login, DCAM ON for every selected FX.
 
-    Returns (power_ok_count, any_turned_on, errors).
+    Returns (power_ok_count, any_turned_on, errors). An FX that fails in OvrC is a
+    warning, not a skip: OvrC's page timing out says nothing certain about the
+    camera (FX1173 times out in OvrC every run, yet its TeamViewer answers), and an
+    offline TeamViewer partner now fails in ~10 s anyway.
     """
     from services.ovrc_capture import ensure_dcam_on_for_fxes
 
@@ -1583,6 +2090,7 @@ def _power_on_all_de_sites(
             base_url=getattr(settings, "OVRC_BASE_URL", "") or "https://app.ovrc.com",
             headless=True,
             on_progress=lambda msg: _set_progress(job_id, f"Phase 1/4: {msg}"),
+            continue_on_error=True,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -1593,7 +2101,7 @@ def _power_on_all_de_sites(
         return (
             0,
             False,
-            [f"power-on DE fleet: {exc}"],
+            [f"power-on DE fleet: {type(exc).__name__}: {exc}"],
         )
 
     by_fx = {(r.fx_number or "").strip().upper(): r for r in results}
@@ -1607,6 +2115,11 @@ def _power_on_all_de_sites(
         missing = [fx for fx in fx_list if fx not in by_fx]
         if missing:
             errors.append(f"power-on {key}: no DCAM result for {', '.join(missing)}")
+            continue
+        dead = [fx for fx in fx_list if by_fx[fx].action == "failed"]
+        if dead:
+            detail = "; ".join(f"{fx}: {by_fx[fx].detail}" for fx in dead)
+            errors.append(f"power-on {key}: OvrC DCAM failed ({detail})")
             continue
         bits = [f"{fx}:{by_fx[fx].action}" for fx in fx_list]
         changed = any((by_fx[fx].action or "") == "turned_on" for fx in fx_list)
@@ -1749,6 +2262,517 @@ def _run_dst_site_capture(
     return errors
 
 
+def _dst_camera_network_up(lti_sites: list) -> bool:
+    """True when a CBW of the first few LTI sites answers (camera VPN is up)."""
+    from services.ip_map import cbw_ip
+    from services.netstate import camera_network_up
+
+    hosts = []
+    for inst in lti_sites[:3]:
+        try:
+            hosts.append(cbw_ip(_dst_site_key(inst)))
+        except Exception:  # noqa: BLE001 — a pole that doesn't map just isn't probed
+            continue
+    return camera_network_up(hosts)
+
+
+def _dst_release_vpn(job_id: int) -> tuple[list[str], bool]:
+    """Release the user's camera VPN before the DE half; returns (warnings, network_ok)."""
+    from services.netstate import release_vpn
+
+    result = release_vpn(progress=lambda msg: _set_progress(job_id, msg))
+    logger.info(
+        "[DST] Job %s VPN release: %s network_ok=%s (%s)",
+        job_id,
+        result.released,
+        result.network_ok,
+        result.detail,
+    )
+    _set_progress(job_id, f"Network: {result.detail}")
+    if not result.network_ok:
+        return [f"{result.detail}; DE skipped. Reconnect Wi-Fi or reopen the WatchGuard app"], False
+    if result.released:
+        return [], True
+    return [f"VPN release failed ({result.detail}); DE captures ran on the VPN"], True
+
+
+class _DstRun:
+    """Counters shared by the halves of one fleet DST audit."""
+
+    def __init__(self, job_id: int, bulk, total: int, output_dir: Path) -> None:
+        self.job_id = job_id
+        self.bulk = bulk
+        self.total = total
+        self.output_dir = output_dir
+        self.errors: list[str] = []
+        self.sites_ok = 0
+        self.power_ok = 0
+        self.index = 0
+        self.half = ""
+        self.de_ovrc: list[tuple[int, str, list[str], Path]] = []
+        # Site key → why it's skipped: power-on showed it unreachable.
+        self.offline: dict[str, str] = {}
+        self.skipped = 0
+        # DE children with no TeamViewer ID: OvrC time only, settled after the OvrC pass.
+        self.ovrc_only: list[int] = []
+        # LTI sites run in a pool: every counter change goes through record().
+        self.lock = threading.Lock()
+        self.done = 0
+        self.half_total = 0
+        self.half_counts: Counter[str] = Counter()
+
+    def start_half(self, half: str, total: int) -> None:
+        with self.lock:
+            self.half = half
+            self.half_total = total
+            self.half_counts = Counter()
+
+    def record(self, outcome: str, errors: list[str] | tuple = ()) -> str:
+        """Count one finished site (ok / failed / skipped / ovrc); returns the progress line."""
+        with self.lock:
+            self.done += 1
+            self.half_counts[outcome] += 1
+            if outcome == "ok":
+                self.sites_ok += 1
+            elif outcome == "skipped":
+                self.skipped += 1
+            self.errors.extend(errors)
+            c = self.half_counts
+            parts = [f"{c['ok']} ok", f"{c['failed']} failed", f"{c['skipped']} skipped"]
+            if c["ovrc"]:
+                parts.append(f"{c['ovrc']} OvrC-only")
+            return f"{self.half}: {sum(c.values())}/{self.half_total} · " + " · ".join(parts)
+
+
+def _dst_power_on_lti(run: _DstRun, lti_sites: list) -> bool:
+    """CBW relays in parallel; True when any relay was turned on.
+
+    Sites that fail get one more pass before they count as offline: a single
+    timed-out pass is not proof (220105 timed out, then answered in 0.15 s).
+    """
+    from audits.models import AuditJob
+
+    job_id = run.job_id
+    _set_progress(job_id, f"[VPN] LTI 1/3: powering on {len(lti_sites)} site(s)…")
+    AuditJob.objects.filter(pk=job_id).update(
+        target_host=f"power_on 0/{run.total}"
+    )
+    turned_on, failed = _dst_power_on_pass(run, lti_sites, "power-on")
+    if failed:
+        logger.info("[DST] Job %s power-on retry for %s site(s)", job_id, len(failed))
+        again, failed = _dst_power_on_pass(run, [inst for inst, _err in failed], "power-on retry")
+        turned_on = turned_on or again
+    for inst, err in failed:
+        run.errors.append(f"power-on {err}")
+        run.offline[_dst_site_key(inst)] = "offline: CBW power-on failed twice"
+        logger.warning("[DST] Job %s power-on fail %s", job_id, err)
+    return turned_on
+
+
+def _dst_power_on_pass(run: _DstRun, sites: list, label: str) -> tuple[bool, list[tuple[object, str]]]:
+    """One parallel relay pass; returns (any_turned_on, [(inst, error)])."""
+    from audits.models import AuditJob
+
+    job_id = run.job_id
+    max_workers = min(
+        len(sites),
+        max(1, int(getattr(settings, "DST_POWER_ON_CONCURRENT", 10))),
+    )
+    logger.info("[DST] Job %s phase1 LTI relays %s sites=%s workers=%s", job_id, label, len(sites), max_workers)
+    turned_on = False
+    failed: list[tuple[object, str]] = []
+    done = 0
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix=f"dst-pwr-{job_id}",
+    ) as pool:
+        futures = {pool.submit(_power_on_lti_site, inst): inst for inst in sites}
+        for fut in as_completed(futures):
+            _raise_if_cancelled(job_id)
+            inst = futures[fut]
+            done += 1
+            changed = False
+            try:
+                summary, err, changed = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                err = f"{_dst_site_key(inst)}: {exc}"
+                summary = _dst_site_key(inst)
+            if err:
+                failed.append((inst, err))
+            else:
+                run.power_ok += 1
+                if changed:
+                    turned_on = True
+                logger.info("[DST] Job %s %s ok %s", job_id, label, summary)
+            _set_progress(
+                job_id,
+                f"[VPN] LTI 1/3: {label} {done}/{len(sites)} "
+                f"(fleet {run.power_ok}/{run.total})…",
+            )
+            AuditJob.objects.filter(pk=job_id).update(
+                target_host=f"power_on {run.power_ok}/{run.total}"
+            )
+    return turned_on, failed
+
+
+def _dst_settle(job_id: int, turned_on: bool, label: str) -> None:
+    """Boot wait after a power-on, only when something was actually turned on."""
+    from audits.models import AuditJob
+
+    settle = max(0, int(getattr(settings, "DST_POWER_SETTLE_SECONDS", 90)))
+    if settle > 0 and turned_on:
+        logger.info(
+            "[DST] Job %s %s settle wait=%ss (cameras were turned on)",
+            job_id,
+            label,
+            settle,
+        )
+        deadline = time.monotonic() + settle
+        while True:
+            _raise_if_cancelled(job_id)
+            remaining = int(max(0, deadline - time.monotonic()))
+            if remaining <= 0:
+                break
+            _set_progress(
+                job_id,
+                f"{label}: waiting {remaining}s for cameras to boot…",
+            )
+            AuditJob.objects.filter(pk=job_id).update(
+                target_host=f"settle {remaining}s"
+            )
+            time.sleep(min(5, remaining))
+    elif settle > 0:
+        logger.info(
+            "[DST] Job %s %s settle skipped — all sites already on",
+            job_id,
+            label,
+        )
+        _set_progress(job_id, f"{label}: boot wait skipped (already on)")
+        AuditJob.objects.filter(pk=job_id).update(target_host="settle skipped")
+
+
+def _de_has_teamviewer(inst) -> bool:
+    from services.device_layers import resolve_de_tv_capture_targets
+    from services.dragoneye_ids import mappings_for_fx
+
+    if resolve_de_tv_capture_targets(inst):
+        return True
+    return any(mappings_for_fx(fx) for fx in (inst.fx_numbers or []))
+
+
+def _dst_site_tz(job_id: int, key: str, inst) -> str:
+    """The zone this site's device clocks are checked against (audits/site_timezone.py)."""
+    from audits.site_timezone import site_timezone
+
+    tz, why = site_timezone(inst)
+    _dst_log(job_id, "site %s timezone %s (%s)", key, tz, why)
+    return tz
+
+
+def _dst_skip_site(run: _DstRun, key: str, kind: str, index: int, reason: str, site_tz: str = "") -> None:
+    """Record a site known offline as a SKIPPED child, without trying it."""
+    from audits.models import AuditJob
+
+    now = timezone.now()
+    child = AuditJob.objects.create(
+        pole_number=key,
+        target_host=kind,
+        device_type=AuditJob.DeviceType.DST_SITE,
+        status=AuditJob.Status.SKIPPED,
+        created_by_id=getattr(run.bulk, "created_by_id", None),
+        parent_job_id=run.job_id,
+        started_at=now,
+        finished_at=now,
+        progress_message=f"Skipped ({reason})"[:255],
+        error_message=f"Not attempted: {reason}",
+        site_tz=site_tz,
+    )
+    logger.info("[DST] Job %s skipped site=%s (%s)", run.job_id, key, reason)
+    _dst_site_done(run, run.record("skipped"), child.pk)
+
+
+def _dst_site_done(run: _DstRun, line: str, child_pk: int | None = None) -> None:
+    """Count a finished site and hand its child to the run's live publisher.
+
+    OvrC-only sites pass no child_pk: they only finish in the OvrC pass, and
+    the final publish sends them.
+    """
+    from audits.models import AuditJob
+
+    AuditJob.objects.filter(pk=run.job_id).update(target_host=f"capture {run.done}/{run.total}")
+    _set_progress(run.job_id, line)
+    publisher = _live_publishers.get(run.job_id)
+    if publisher is not None and child_pk is not None:
+        publisher.site_done(child_pk)
+
+
+# Run id -> its LivePublisher, while the run captures (see _start_live_publish).
+_live_publishers: dict[int, object] = {}
+
+
+def _start_live_publish(job_id: int, bulk) -> None:
+    """Publish sites as they finish when the run has a round (review fills in as it goes)."""
+    round_name = read_dst_publish_round(job_id)
+    if not round_name or not getattr(settings, "DST_LIVE_PUBLISH", True):
+        return
+    from audits.publish import LivePublisher
+
+    _live_publishers[job_id] = LivePublisher(job_id, round_name, bulk.created_by).start()
+    logger.info("[DST] Job %s live publish to %r", job_id, round_name)
+
+
+def _stop_live_publish(job_id: int):
+    """Stop the run's live publisher; returns its SentCache (None when there was none)."""
+    publisher = _live_publishers.pop(job_id, None)
+    return publisher.close() if publisher is not None else None
+
+
+def _dst_queue_ovrc_only(run: _DstRun, child, inst, key: str, child_dir: Path) -> None:
+    """DE site with no TeamViewer ID: no TV step; the fleet OvrC pass captures its time."""
+    fx_list = list(dict.fromkeys((fx or "").strip().upper() for fx in (inst.fx_numbers or []) if (fx or "").strip()))
+    child.progress_message = "OvrC only (no TeamViewer ID)"
+    child.save(update_fields=["progress_message"])
+    with run.lock:
+        run.de_ovrc.append((child.pk, key, fx_list, child_dir))
+        run.ovrc_only.append(child.pk)
+    logger.info("[DST] Job %s OvrC-only site=%s fx=%s", run.job_id, key, ",".join(fx_list))
+    _dst_site_done(run, run.record("ovrc"))
+
+
+def _dst_settle_ovrc_only(run: _DstRun) -> None:
+    """After the OvrC pass: an OvrC-only site is ok when its OvrC time was captured."""
+    from audits.models import AuditJob
+
+    for child in AuditJob.objects.filter(pk__in=run.ovrc_only):
+        if child.status == AuditJob.Status.CANCELLED:
+            continue
+        if child.screenshots.exists():
+            with run.lock:
+                run.sites_ok += 1
+            child.status = AuditJob.Status.SUCCEEDED
+        else:
+            child.status = AuditJob.Status.FAILED
+            child.progress_message = "Failed"
+            child.error_message = (child.error_message or "OvrC time not captured")[:2000]
+            with run.lock:
+                run.errors.append(f"{child.pole_number}: OvrC time not captured")
+        child.finished_at = child.finished_at or timezone.now()
+        child.save(update_fields=["status", "progress_message", "error_message", "finished_at"])
+        _clear_cancel_flag(child.pk)
+
+
+def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
+    """Capture one site as a child dst_site job; records into run."""
+    from audits.models import AuditJob
+    from services.teamviewer_capture import CaptureCancelled
+
+    job_id = run.job_id
+    _raise_if_cancelled(job_id)
+    close_old_connections()
+    _dst_log(
+        job_id,
+        "phase3 loop index=%s/%s inst_pk=%s",
+        index,
+        run.total,
+        getattr(inst, "pk", None),
+    )
+    t_key = time.perf_counter()
+    key = _dst_site_key(inst)
+    kind = _dst_site_kind(inst) or "?"
+    _dst_log(
+        job_id,
+        "phase3 site key=%s kind=%s (resolve %.2fs)",
+        key,
+        kind,
+        time.perf_counter() - t_key,
+    )
+    site_tz = _dst_site_tz(job_id, key, inst)
+    reason = run.offline.get(key)
+    if reason:
+        _dst_skip_site(run, key, kind, index, reason, site_tz)
+        return
+    _set_progress(job_id, f"{run.half}: capturing {key} ({kind})…")
+    _dst_log(job_id, "phase3 creating child AuditJob…")
+    t_child = time.perf_counter()
+    child = AuditJob.objects.create(
+        pole_number=key,
+        target_host=kind,
+        device_type=AuditJob.DeviceType.DST_SITE,
+        status=AuditJob.Status.RUNNING,
+        created_by_id=getattr(run.bulk, "created_by_id", None),
+        parent_job_id=job_id,
+        started_at=timezone.now(),
+        progress_message=f"DST audit {job_id} ({index}/{run.total})",
+        site_tz=site_tz,
+    )
+    _dst_log(
+        job_id,
+        "phase3 child created pk=%s (%.2fs)",
+        child.pk,
+        time.perf_counter() - t_child,
+    )
+    with _cancel_lock:
+        child_ev = threading.Event()
+        _cancel_flags[child.pk] = child_ev
+        _job_children.setdefault(job_id, set()).add(child.pk)
+        pev = _cancel_flags.get(job_id)
+        if pev is not None and pev.is_set():
+            child_ev.set()
+    _dst_log(job_id, "phase3 cancel flag registered for child=%s", child.pk)
+    child_dir = run.output_dir / key.replace("/", "_").replace("\\", "_")
+    _dst_log(job_id, "phase3 preparing child dir %s", child_dir)
+    child_dir.mkdir(parents=True, exist_ok=True)
+    _dst_log(job_id, "phase3 child dir ready")
+    if kind == "de" and not _de_has_teamviewer(inst):
+        # Stays registered (and running) until the OvrC pass, so a cancel still reaches it.
+        _dst_queue_ovrc_only(run, child, inst, key, child_dir)
+        return
+    outcome = "failed"
+    site_errors: list[str] = []
+    try:
+        close_old_connections()
+        _dst_log(
+            job_id,
+            "phase3 invoking site capture child=%s kind=%s",
+            child.pk,
+            kind,
+        )
+        # DE OvrC times run once after all TeamViewer lanes (fleet pass).
+        errors = _run_dst_site_capture(
+            child.pk,
+            inst,
+            child_dir,
+            kind=kind,
+            include_ovrc=False,
+        )
+        _dst_log(
+            job_id,
+            "phase3 site capture returned child=%s errors=%s",
+            child.pk,
+            len(errors),
+        )
+        child.refresh_from_db()
+        if child.status == AuditJob.Status.CANCELLED or is_job_cancelled(child.pk):
+            raise CaptureCancelled("Audit cancelled by user")
+        has_shots = child.screenshots.exists()
+        if has_shots:
+            outcome = "ok"
+            child.status = AuditJob.Status.SUCCEEDED
+            child.progress_message = (
+                f"Done with warnings ({len(errors)})" if errors else "Done"
+            )
+        else:
+            child.status = AuditJob.Status.FAILED
+            child.progress_message = "Failed"
+        if errors:
+            child.error_message = "; ".join(errors)[:2000]
+            site_errors.extend(f"{key}: {err}" for err in errors)
+        elif not has_shots:
+            site_errors.append(f"{key}: no screenshots")
+            child.error_message = "No screenshots captured"
+        child.target_host = kind
+        child.finished_at = timezone.now()
+        child.save(
+            update_fields=[
+                "status",
+                "error_message",
+                "progress_message",
+                "finished_at",
+                "target_host",
+            ]
+        )
+        if kind == "de" and child.status != AuditJob.Status.CANCELLED:
+            fx_list = [
+                (fx or "").strip().upper()
+                for fx in (inst.fx_numbers or [])
+                if (fx or "").strip()
+            ]
+            fx_list = list(dict.fromkeys(fx_list))
+            if fx_list:
+                with run.lock:
+                    run.de_ovrc.append((child.pk, key, fx_list, child_dir))
+        logger.info(
+            "[DST] Job %s child %s site=%s status=%s shots=%s",
+            job_id,
+            child.pk,
+            key,
+            child.status,
+            child.screenshots.count(),
+        )
+    except CaptureCancelled:
+        child.refresh_from_db()
+        if child.status != AuditJob.Status.CANCELLED:
+            child.status = AuditJob.Status.CANCELLED
+            child.error_message = "Cancelled by user"
+            child.progress_message = "Cancelled"
+            child.finished_at = timezone.now()
+            child.save(
+                update_fields=[
+                    "status",
+                    "error_message",
+                    "progress_message",
+                    "finished_at",
+                ]
+            )
+        _clear_cancel_flag(child.pk)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[DST] Job %s child failed site=%s", job_id, key)
+        child.status = AuditJob.Status.FAILED
+        child.error_message = str(exc)[:2000]
+        child.progress_message = "Failed"
+        child.finished_at = timezone.now()
+        child.save(
+            update_fields=[
+                "status",
+                "error_message",
+                "progress_message",
+                "finished_at",
+            ]
+        )
+        site_errors.append(f"{key}: {exc}")
+    finally:
+        _clear_cancel_flag(child.pk)
+
+    _dst_site_done(run, run.record(outcome, site_errors), child.pk)
+
+
+def _dst_capture_half(run: _DstRun, sites: list, half: str, *, workers: int = 1) -> None:
+    """Capture a half's sites; LTI runs `workers` sites at once (DE stays 1: one desktop)."""
+    from audits.models import AuditJob
+
+    run.start_half(half, len(sites))
+    workers = max(1, min(workers, len(sites)))
+    _dst_log(run.job_id, "%s capture begin sites=%s workers=%s", half, len(sites), workers)
+    AuditJob.objects.filter(pk=run.job_id).update(target_host=f"capture {run.done}/{run.total}")
+    numbered = []
+    for inst in sites:
+        run.index += 1
+        numbered.append((inst, run.index))
+    if workers == 1:
+        for inst, index in numbered:
+            _dst_capture_site(run, inst, index)
+        return
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"dst-site-{run.job_id}") as pool:
+        futures = [pool.submit(_dst_capture_site_in_thread, run, inst, index) for inst, index in numbered]
+        try:
+            for fut in as_completed(futures):
+                fut.result()  # re-raises CaptureCancelled
+        except BaseException:
+            for fut in futures:
+                fut.cancel()
+            raise
+
+
+def _dst_capture_site_in_thread(run: _DstRun, inst, index: int) -> None:
+    from django.db import connection
+
+    try:
+        _dst_capture_site(run, inst, index)
+    finally:
+        connection.close()  # pool threads each hold their own DB connection
+
+
 def _run_dst_audit(
     job_id: int,
     output_dir: Path,
@@ -1757,16 +2781,19 @@ def _run_dst_audit(
     state: str = "",
     agency: str = "",
 ) -> tuple[list[str], int]:
-    """Fleet DST audit: power on all sites first, settle, then capture.
+    """Fleet DST audit in two network halves that never interleave.
 
-    Phase 1 — LTI relays (parallel) + one OvrC login for all DE DCAM outlets
-    Phase 2 — shared boot settle (skipped if everything was already on)
-    Phase 3 — capture each site (TV/CBW/VNC), then one fleet OvrC time pass
+    The user connects the camera VPN beforehand (MFA); DST never connects it.
 
-    Creates a child dst_site job per installation. Returns (errors, sites_ok).
+    LTI half, on the VPN: CBW relays on → boot wait → every LTI capture.
+    Release: DST drops the VPN (TeamViewer and the shared DB need it off).
+    DE half, direct: one OvrC login turns DCAM on → boot wait → every DE
+    TeamViewer capture → one fleet OvrC time pass.
+
+    Camera network down at the start → LTI is skipped and reported; DE still
+    runs. Creates a child dst_site job per installation. Returns (errors, sites_ok).
     """
     from audits.models import AuditJob
-    from services.teamviewer_capture import CaptureCancelled
 
     close_old_connections()
     _raise_if_cancelled(job_id)
@@ -1788,13 +2815,12 @@ def _run_dst_audit(
     if not sites:
         return ["No eligible installations for DST audit"], 0
 
-    total = len(sites)
     lti_sites = [s for s in sites if _dst_site_kind(s) == "lti"]
     de_sites = [s for s in sites if _dst_site_kind(s) == "de"]
     logger.info(
         "[DST] Job %s starting fleet audit total=%s lti=%s de=%s scope=%s state=%s agency=%s selected=%s",
         job_id,
-        total,
+        len(sites),
         len(lti_sites),
         len(de_sites),
         scope,
@@ -1802,309 +2828,182 @@ def _run_dst_audit(
         agency or "*",
         len(selected_ids) if selected_ids is not None else "all",
     )
+    skipped: list[str] = []
+    if lti_sites and not _dst_camera_network_up(lti_sites):
+        msg = (
+            f"LTI skipped ({len(lti_sites)} site(s)): camera network not reachable. "
+            "Connect the VPN before the run."
+        )
+        skipped.append(msg)
+        logger.warning("[DST] Job %s %s", job_id, msg)
+        _set_progress(job_id, msg)
+        lti_sites = []
+    if not lti_sites and not de_sites:
+        return skipped, 0
 
-    all_errors: list[str] = []
-    power_ok = 0
-    any_turned_on = False
+    run = _DstRun(job_id, bulk, len(lti_sites) + len(de_sites), output_dir)
+    run.errors.extend(skipped)
+    _start_live_publish(job_id, bulk)  # the caller stops it (_stop_live_publish)
 
-    # ── Phase 1a: CBW relays (parallel) ──────────────────────────────────
+    # ── LTI half (camera VPN) ────────────────────────────────────────────
     if lti_sites:
-        _set_progress(job_id, f"Phase 1/4: powering on {len(lti_sites)} LTI site(s)…")
-        AuditJob.objects.filter(pk=job_id).update(
-            target_host=f"power_on 0/{total}"
+        turned_on = _dst_power_on_lti(run, lti_sites)
+        _dst_settle(job_id, turned_on, "[VPN] LTI 2/3")
+        _dst_capture_half(
+            run,
+            lti_sites,
+            "[VPN] LTI 3/3",
+            workers=int(getattr(settings, "DST_LTI_SITE_CONCURRENT", 4)),
         )
-        max_workers = min(
-            len(lti_sites),
-            max(1, int(getattr(settings, "AUDIT_STEP_CONCURRENT", 3))),
-        )
-        logger.info(
-            "[DST] Job %s phase1 LTI relays workers=%s",
-            job_id,
-            max_workers,
-        )
-        done = 0
-        with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix=f"dst-pwr-{job_id}",
-        ) as pool:
-            futures = {pool.submit(_power_on_lti_site, inst): inst for inst in lti_sites}
-            for fut in as_completed(futures):
-                _raise_if_cancelled(job_id)
-                inst = futures[fut]
-                done += 1
-                changed = False
-                try:
-                    summary, err, changed = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    err = f"{_dst_site_key(inst)}: {exc}"
-                    summary = _dst_site_key(inst)
-                if err:
-                    all_errors.append(f"power-on {err}")
-                    logger.warning("[DST] Job %s power-on fail %s", job_id, err)
-                else:
-                    power_ok += 1
-                    if changed:
-                        any_turned_on = True
-                    logger.info("[DST] Job %s power-on ok %s", job_id, summary)
-                _set_progress(
-                    job_id,
-                    f"Phase 1/4: LTI power-on {done}/{len(lti_sites)} "
-                    f"(fleet {power_ok}/{total})…",
-                )
-                AuditJob.objects.filter(pk=job_id).update(
-                    target_host=f"power_on {power_ok}/{total}"
-                )
 
-    # ── Phase 1b: OvrC DCAM for all DE sites (one login) ─────────────────
+    # ── Release: the order never goes back to the VPN ───────────────────
+    if de_sites or read_dst_publish_round(job_id):
+        _raise_if_cancelled(job_id)
+        warnings, network_ok = _dst_release_vpn(job_id)
+        run.errors.extend(warnings)
+        if not network_ok:
+            de_sites = []  # no internet: TeamViewer/OvrC can't work, don't burn the lanes
+
+    # ── DE half (direct) ─────────────────────────────────────────────────
     if de_sites:
-        logger.info("[DST] Job %s phase1 DE OvrC DCAM count=%s", job_id, len(de_sites))
+        _raise_if_cancelled(job_id)
+        _set_progress(job_id, f"[direct] DE 1/4: powering on {len(de_sites)} site(s) (OvrC)…")
         de_ok, de_changed, de_errs = _power_on_all_de_sites(job_id, de_sites)
-        power_ok += de_ok
-        if de_changed:
-            any_turned_on = True
+        run.power_ok += de_ok
         for err in de_errs:
-            all_errors.append(err)
+            run.errors.append(err)
             logger.warning("[DST] Job %s power-on fail %s", job_id, err)
-        AuditJob.objects.filter(pk=job_id).update(
-            target_host=f"power_on {power_ok}/{total}"
-        )
-
-    logger.info(
-        "[DST] Job %s phase1 complete power_ok=%s/%s turned_on=%s errors=%s",
-        job_id,
-        power_ok,
-        total,
-        any_turned_on,
-        len(all_errors),
-    )
-
-    # ── Phase 2: settle / boot wait (only if something was powered on) ───
-    settle = max(0, int(getattr(settings, "DST_POWER_SETTLE_SECONDS", 90)))
-    if settle > 0 and any_turned_on:
-        logger.info(
-            "[DST] Job %s phase2 settle wait=%ss (cameras were turned on)",
-            job_id,
-            settle,
-        )
-        deadline = time.monotonic() + settle
-        while True:
+        AuditJob.objects.filter(pk=job_id).update(target_host=f"power_on {run.power_ok}/{run.total}")
+        _dst_settle(job_id, de_changed, "[direct] DE 2/4")
+        _dst_capture_half(run, de_sites, "[direct] DE 3/4")
+        if run.de_ovrc:
             _raise_if_cancelled(job_id)
-            remaining = int(max(0, deadline - time.monotonic()))
-            if remaining <= 0:
-                break
-            _set_progress(
-                job_id,
-                f"Phase 2/4: waiting {remaining}s for cameras to boot…",
-            )
-            AuditJob.objects.filter(pk=job_id).update(
-                target_host=f"settle {remaining}s"
-            )
-            time.sleep(min(5, remaining))
-    elif settle > 0:
-        logger.info(
-            "[DST] Job %s phase2 settle skipped — all sites already on",
-            job_id,
-        )
-        _set_progress(job_id, "Phase 2/4: settle skipped (already on)")
-        AuditJob.objects.filter(pk=job_id).update(target_host="settle skipped")
+            _set_progress(job_id, "[direct] DE 4/4: OvrC device times…")
+            run.errors.extend(_dst_fleet_ovrc_times(job_id, run.de_ovrc, output_dir / "_ovrc_fleet"))
+        _dst_settle_ovrc_only(run)
 
-    # ── Phase 3: capture each site (TV/CBW/VNC), then one fleet OvrC pass ─
-    sites_ok = 0
-    de_ovrc_assignments: list[tuple[int, str, list[str], Path]] = []
-    _dst_log(job_id, "phase3 begin total=%s", total)
-    _set_progress(job_id, f"Phase 3/4: capturing 0/{total} sites…")
-    AuditJob.objects.filter(pk=job_id).update(target_host=f"capture 0/{total}")
-
-    for index, inst in enumerate(sites, start=1):
-        _raise_if_cancelled(job_id)
-        close_old_connections()
-        _dst_log(
-            job_id,
-            "phase3 loop index=%s/%s inst_pk=%s",
-            index,
-            total,
-            getattr(inst, "pk", None),
-        )
-        t_key = time.perf_counter()
-        key = _dst_site_key(inst)
-        kind = _dst_site_kind(inst) or "?"
-        _dst_log(
-            job_id,
-            "phase3 site key=%s kind=%s (resolve %.2fs)",
-            key,
-            kind,
-            time.perf_counter() - t_key,
-        )
-        _set_progress(job_id, f"Phase 3/4: {index}/{total} capturing {key} ({kind})…")
-        _dst_log(job_id, "phase3 creating child AuditJob…")
-        t_child = time.perf_counter()
-        child = AuditJob.objects.create(
-            pole_number=key,
-            target_host=kind,
-            device_type=AuditJob.DeviceType.DST_SITE,
-            status=AuditJob.Status.RUNNING,
-            created_by_id=getattr(bulk, "created_by_id", None),
-            parent_job_id=job_id,
-            started_at=timezone.now(),
-            progress_message=f"DST audit {job_id} ({index}/{total})",
-        )
-        _dst_log(
-            job_id,
-            "phase3 child created pk=%s (%.2fs)",
-            child.pk,
-            time.perf_counter() - t_child,
-        )
-        with _cancel_lock:
-            child_ev = threading.Event()
-            _cancel_flags[child.pk] = child_ev
-            _job_children.setdefault(job_id, set()).add(child.pk)
-            pev = _cancel_flags.get(job_id)
-            if pev is not None and pev.is_set():
-                child_ev.set()
-        _dst_log(job_id, "phase3 cancel flag registered for child=%s", child.pk)
-        child_dir = output_dir / key.replace("/", "_").replace("\\", "_")
-        _dst_log(job_id, "phase3 preparing child dir %s", child_dir)
-        child_dir.mkdir(parents=True, exist_ok=True)
-        _dst_log(job_id, "phase3 child dir ready")
-        try:
-            close_old_connections()
-            _dst_log(
-                job_id,
-                "phase3 invoking site capture child=%s kind=%s",
-                child.pk,
-                kind,
-            )
-            # DE OvrC times run once after all TeamViewer lanes (fleet pass).
-            errors = _run_dst_site_capture(
-                child.pk,
-                inst,
-                child_dir,
-                kind=kind,
-                include_ovrc=False,
-            )
-            _dst_log(
-                job_id,
-                "phase3 site capture returned child=%s errors=%s",
-                child.pk,
-                len(errors),
-            )
-            child.refresh_from_db()
-            if child.status == AuditJob.Status.CANCELLED or is_job_cancelled(child.pk):
-                raise CaptureCancelled("Audit cancelled by user")
-            has_shots = child.screenshots.exists()
-            if has_shots:
-                sites_ok += 1
-                child.status = AuditJob.Status.SUCCEEDED
-                child.progress_message = (
-                    f"Done with warnings ({len(errors)})" if errors else "Done"
-                )
-            else:
-                child.status = AuditJob.Status.FAILED
-                child.progress_message = "Failed"
-            if errors:
-                child.error_message = "; ".join(errors)[:2000]
-                for err in errors:
-                    all_errors.append(f"{key}: {err}")
-            elif not has_shots:
-                all_errors.append(f"{key}: no screenshots")
-                child.error_message = "No screenshots captured"
-            child.target_host = kind
-            child.finished_at = timezone.now()
-            child.save(
-                update_fields=[
-                    "status",
-                    "error_message",
-                    "progress_message",
-                    "finished_at",
-                    "target_host",
-                ]
-            )
-            if kind == "de" and child.status != AuditJob.Status.CANCELLED:
-                fx_list = [
-                    (fx or "").strip().upper()
-                    for fx in (inst.fx_numbers or [])
-                    if (fx or "").strip()
-                ]
-                fx_list = list(dict.fromkeys(fx_list))
-                if fx_list:
-                    de_ovrc_assignments.append((child.pk, key, fx_list, child_dir))
-            logger.info(
-                "[DST] Job %s child %s site=%s status=%s shots=%s",
-                job_id,
-                child.pk,
-                key,
-                child.status,
-                child.screenshots.count(),
-            )
-        except CaptureCancelled:
-            child.refresh_from_db()
-            if child.status != AuditJob.Status.CANCELLED:
-                child.status = AuditJob.Status.CANCELLED
-                child.error_message = "Cancelled by user"
-                child.progress_message = "Cancelled"
-                child.finished_at = timezone.now()
-                child.save(
-                    update_fields=[
-                        "status",
-                        "error_message",
-                        "progress_message",
-                        "finished_at",
-                    ]
-                )
-            _clear_cancel_flag(child.pk)
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[DST] Job %s child failed site=%s", job_id, key)
-            child.status = AuditJob.Status.FAILED
-            child.error_message = str(exc)[:2000]
-            child.progress_message = "Failed"
-            child.finished_at = timezone.now()
-            child.save(
-                update_fields=[
-                    "status",
-                    "error_message",
-                    "progress_message",
-                    "finished_at",
-                ]
-            )
-            all_errors.append(f"{key}: {exc}")
-        finally:
-            _clear_cancel_flag(child.pk)
-
-        AuditJob.objects.filter(pk=job_id).update(
-            target_host=f"capture {sites_ok}/{total}"
-        )
-        _set_progress(
-            job_id,
-            f"Phase 3/4: {index}/{total} done — {sites_ok} ok, "
-            f"{len(all_errors)} warning(s)…",
-        )
-
-    # Fleet OvrC pass: one login for every DE FX after all TV captures.
-    if de_ovrc_assignments:
-        _raise_if_cancelled(job_id)
-        ovrc_errs = _dst_fleet_ovrc_times(
-            job_id,
-            de_ovrc_assignments,
-            output_dir / "_ovrc_fleet",
-        )
-        for err in ovrc_errs:
-            all_errors.append(err)
-
-    _set_progress(job_id, f"DST Audit finished {sites_ok}/{total} site(s)")
-    AuditJob.objects.filter(pk=job_id).update(
-        target_host=f"done {sites_ok}/{total}"
-    )
+    if run.skipped:
+        run.errors.append(f"Skipped {run.skipped} offline site(s) without trying them")
+    skipped = f", {run.skipped} skipped offline" if run.skipped else ""
+    _set_progress(job_id, f"DST Audit finished {run.sites_ok}/{run.total} site(s){skipped}")
+    AuditJob.objects.filter(pk=job_id).update(target_host=f"done {run.sites_ok}/{run.total}")
     logger.info(
         "[DST] Job %s finished sites_ok=%s/%s errors=%s",
         job_id,
-        sites_ok,
-        total,
-        len(all_errors),
+        run.sites_ok,
+        run.total,
+        len(run.errors),
     )
-    if sites_ok == 0 and not all_errors:
-        all_errors.append("No sites captured")
-    return all_errors, sites_ok
+    if run.sites_ok == 0 and not run.errors:
+        run.errors.append("No sites captured")
+    return run.errors, run.sites_ok
+
+
+def _start_dst_auto_publish(job) -> threading.Thread | None:
+    """Publish a finished DST run into its round, when the start asked for one.
+
+    Its own thread, outside the worker slot: the publish may wait (held) until
+    the VPN is off. Not a daemon, so a management-command run waits for it.
+    """
+    from audits.publish import PublishError, publish_after_run
+
+    round_name = read_dst_publish_round(job.pk)
+    if not round_name:
+        _stop_live_publish(job.pk)
+        return None
+
+    def _publish() -> None:
+        close_old_connections()
+        try:
+            # Sites already sent live and unchanged since are skipped.
+            cache = _stop_live_publish(job.pk)
+            pub = publish_after_run(job.pk, round_name, job.created_by, cache=cache)
+            logger.info("[DST] Job %s auto-publish job=%s status=%s", job.pk, pub.pk, pub.status)
+        except PublishError as exc:
+            logger.warning("[DST] Job %s auto-publish refused: %s", job.pk, exc)
+        except Exception:  # noqa: BLE001
+            logger.exception("[DST] Job %s auto-publish crashed", job.pk)
+        finally:
+            close_old_connections()
+
+    thread = threading.Thread(target=_publish, name=f"dst-publish-{job.pk}")
+    thread.start()
+    return thread
+
+
+def create_dst_audit_job(
+    user,
+    *,
+    scope: str,
+    state: str,
+    agency: str,
+    installation_ids: list[int],
+    publish_round: str = "",
+):
+    """Create a queued DST_AUDIT parent for the eligible subset of installation_ids.
+
+    Returns (job, sites). Raises ValueError when nothing is eligible. The
+    caller enqueues it (Start button) or runs it in-process (schedule).
+    """
+    from audits.models import AuditJob
+
+    sites = _active_dst_installations(
+        scope=scope,
+        state=state,
+        agency=agency,
+        installation_ids=installation_ids,
+    )
+    if not sites:
+        raise ValueError("None of the selected sites are eligible for DST audit")
+    job = AuditJob.objects.create(
+        pole_number="DST-ALL",
+        target_host=_encode_dst_audit_meta(scope, state, agency),
+        device_type=AuditJob.DeviceType.DST_AUDIT,
+        created_by=user,
+        progress_message=f"Queued — {len(sites)} site(s)",
+    )
+    # Only persist IDs that survived eligibility checks.
+    write_dst_selection(
+        job.pk, [inst.pk for inst in sites], publish_round=publish_round or default_publish_round()
+    )
+    return job, sites
+
+
+def default_publish_round() -> str:
+    """The audit's name when none was typed: `DST audit <local date> <HH:MM>`.
+
+    It names the round the run publishes into. With the time, two runs on the
+    same day get their own rounds instead of sharing one. Empty when this
+    install can't publish (not the capture laptop, no shared DB).
+    """
+    from audits.publish import shared_configured
+
+    if getattr(settings, "DST_ROLE", "") != "capture" or not shared_configured():
+        return ""
+    from datetime import datetime
+
+    return f"DST audit {datetime.now().astimezone():%Y-%m-%d %H:%M}"  # the laptop clock
+
+
+def mirror_db_cancel(job_id: int, stop: threading.Event, interval: float = 3.0) -> None:
+    """Cancel job_id here when another process marks it cancelled in the DB.
+
+    A scheduled run lives in its own process, so the DST page's Cancel only
+    reaches it through the job's status row.
+    """
+    from audits.models import AuditJob
+
+    while not stop.wait(interval):
+        try:
+            close_old_connections()
+            status = AuditJob.objects.filter(pk=job_id).values_list("status", flat=True).first()
+        except Exception:  # noqa: BLE001 — try again next tick
+            continue
+        if status == AuditJob.Status.CANCELLED and not is_job_cancelled(job_id):
+            logger.info("[AUDIT] Job %s cancelled from another process", job_id)
+            with _cancel_lock:
+                for pk in (job_id, *_job_children.get(job_id, set())):
+                    _cancel_flags.setdefault(pk, threading.Event()).set()
 
 
 def _parse_dst_audit_meta(raw: str) -> dict[str, str]:
@@ -2265,6 +3164,16 @@ def _run_job(job_id: int) -> None:
                 progress_message="Cancelled",
                 finished_at=timezone.now(),
             )
+            # Children still waiting (e.g. DE OvrC-only sites before the OvrC pass).
+            AuditJob.objects.filter(
+                parent_job_id=job_id,
+                status__in=[AuditJob.Status.PENDING, AuditJob.Status.RUNNING],
+            ).update(
+                status=AuditJob.Status.CANCELLED,
+                error_message="Cancelled by user",
+                progress_message="Cancelled",
+                finished_at=timezone.now(),
+            )
             logger.info(
                 "[AUDIT] Job %s cancelled elapsed=%.1fs",
                 job_id,
@@ -2407,12 +3316,18 @@ def _run_job(job_id: int) -> None:
                 return
 
             if job.device_type == AuditJob.DeviceType.DST_AUDIT:
-                errors, sites_ok = _run_dst_audit(job_id, output_dir)
+                try:
+                    errors, sites_ok = _run_dst_audit(job_id, output_dir)
+                except BaseException:
+                    _stop_live_publish(job_id)  # what it sent stays; a manual publish reconciles
+                    raise
                 job.refresh_from_db()
                 if job.status == AuditJob.Status.CANCELLED or is_job_cancelled(job_id):
+                    _stop_live_publish(job_id)
                     _finalize_cancelled()
                     return
                 if sites_ok == 0:
+                    _stop_live_publish(job_id)
                     raise RuntimeError("; ".join(errors) or "DST Audit failed")
                 job.status = AuditJob.Status.SUCCEEDED
                 if errors:
@@ -2437,6 +3352,7 @@ def _run_job(job_id: int) -> None:
                     len(errors),
                     time.perf_counter() - t0,
                 )
+                _start_dst_auto_publish(job)
                 return
 
             if job.device_type == AuditJob.DeviceType.CONFIRM_BATCH:
@@ -2515,6 +3431,40 @@ def _run_job(job_id: int) -> None:
                     "[CONFIRM] Job %s site finished shots=%s errors=%s elapsed=%.1fs",
                     job_id,
                     job.screenshots.count(),
+                    len(errors),
+                    time.perf_counter() - t0,
+                )
+                return
+
+            if job.device_type == AuditJob.DeviceType.REJECTION_REPORT:
+                errors, captured = _run_rejection_report(job_id, output_dir)
+                job.refresh_from_db()
+                if job.status == AuditJob.Status.CANCELLED or is_job_cancelled(job_id):
+                    _finalize_cancelled()
+                    return
+                report_path = _rejection_report_xlsx_path(job_id)
+                if not report_path.exists():
+                    raise RuntimeError("; ".join(errors) or "Rejection report was not produced")
+                job.status = AuditJob.Status.SUCCEEDED
+                if errors:
+                    job.error_message = "; ".join(errors)[:2000]
+                job.progress_message = (
+                    f"Done with warnings ({len(errors)})" if errors else "Done"
+                )
+                job.finished_at = timezone.now()
+                job.save(
+                    update_fields=[
+                        "status",
+                        "error_message",
+                        "progress_message",
+                        "finished_at",
+                        "target_host",
+                    ]
+                )
+                logger.info(
+                    "[REJECTION] Job %s finished captured=%s errors=%s elapsed=%.1fs",
+                    job_id,
+                    captured,
                     len(errors),
                     time.perf_counter() - t0,
                 )
