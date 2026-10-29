@@ -25,6 +25,9 @@ ProgressFn = Callable[[str], None]
 
 # Retry Selenium navigation with the same password before trying the next one.
 _MENU_TIMEOUT_RETRIES = 2
+# Clicks on Date/Time before giving up and saving whatever page is shown.
+_DATE_TIME_CLICKS = 3
+_DATE_TIME_WAIT_SECONDS = 12
 
 
 def _noop_progress(_: str) -> None:
@@ -80,6 +83,64 @@ def _save_current_time(driver, filepath: Path) -> None:
     write_clock_sidecar(filepath, rest.splitlines()[0] if found and rest else "")
 
 
+def _wait_for_menu_settled(driver, target: str, timeout: float = 20, quiet: float = 2) -> int:
+    """Wait until the menu's link count stops changing; returns the count.
+
+    A slow CBW builds its menu in steps after #menu-content is visible. On
+    2026-10-29 (233201) we read it at 21 of 27 links ("Logging", not yet
+    "Logging & Cloud"), and the Date/Time link we clicked was replaced under
+    us: the click did nothing and we saved General Information twice.
+    """
+    deadline = time.monotonic() + timeout
+    count = len(driver.find_elements(By.CSS_SELECTOR, "#menu-content a"))
+    stable_since = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        now = len(driver.find_elements(By.CSS_SELECTOR, "#menu-content a"))
+        if now != count:
+            count, stable_since = now, time.monotonic()
+        elif time.monotonic() - stable_since >= quiet:
+            return count
+    logger.warning("[CBW] menu still changing after %.0fs links=%s target=%s", timeout, count, target)
+    return count
+
+
+def _open_date_time(driver, find_links, target: str) -> bool:
+    """Click Date/Time until its "Current:" clock shows; re-find the link each time.
+
+    The link can be replaced by a late menu rebuild, and a click on the old
+    element is silently ignored, so a page that doesn't come gets a fresh
+    element and another click.
+    """
+    wait = WebDriverWait(driver, _DATE_TIME_WAIT_SECONDS)
+    for attempt in range(1, _DATE_TIME_CLICKS + 1):
+        links = find_links()
+        if not links:
+            return False
+        driver.execute_script("arguments[0].click();", links[0])
+        if _wait_for_date_time_page(wait, target, warn=attempt == _DATE_TIME_CLICKS):
+            if attempt > 1:
+                logger.info("[CBW] Date/Time loaded on click %s target=%s", attempt, target)
+            return True
+    return False
+
+
+def _wait_for_date_time_page(wait: WebDriverWait, target: str, warn: bool = True) -> bool:
+    """Wait for the Date/Time content ("Current:" clock) to replace the previous page.
+
+    The click swaps #mainContent in place, so waiting for it to be visible is
+    satisfied by the page already there. A slow (cellular) CBW took >2 s on
+    2026-10-29 (220036) and we screenshotted General Information instead.
+    """
+    try:
+        wait.until(EC.text_to_be_present_in_element((By.ID, "mainContent"), "Current"))
+        return True
+    except TimeoutException:
+        if warn:
+            logger.warning("[CBW] Date/Time page did not load; saving what is shown target=%s", target)
+        return False
+
+
 def screenshot_date_time(
     url: str,
     username: str,
@@ -133,9 +194,8 @@ def screenshot_date_time(
         wait.until(EC.presence_of_element_located((By.ID, "menu-content")))
         wait.until(EC.visibility_of_element_located((By.ID, "menu-content")))
         logger.info("[CBW] menu visible after %.1fs target=%s", time.perf_counter() - t0, target)
-        time.sleep(2)
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#menu-content a")))
-        time.sleep(0.5)
+        _wait_for_menu_settled(driver, target)
 
         menu_items = driver.find_elements(By.CSS_SELECTOR, "#menu-content a")
         labels = [m.text.strip() for m in menu_items if m.text.strip()]
@@ -157,9 +217,16 @@ def screenshot_date_time(
             for item in menu_items:
                 if item.text.strip() == "Date/Time":
                     progress("CBW opening Date/Time (top-level)")
-                    driver.execute_script("arguments[0].click();", item)
-                    wait.until(EC.visibility_of_element_located((By.ID, "mainContent")))
-                    time.sleep(2)
+                    _open_date_time(
+                        driver,
+                        lambda: [
+                            m
+                            for m in driver.find_elements(By.CSS_SELECTOR, "#menu-content a")
+                            if m.text.strip() == "Date/Time"
+                        ],
+                        target,
+                    )
+                    time.sleep(1)
                     driver.save_screenshot(str(filepath))
                     _save_current_time(driver, filepath)
                     logger.info(
@@ -187,9 +254,8 @@ def screenshot_date_time(
             raise RuntimeError("Date/Time link not found under General Settings")
 
         progress("CBW opening Date/Time")
-        driver.execute_script("arguments[0].click();", date_time_links[0])
-        wait.until(EC.visibility_of_element_located((By.ID, "mainContent")))
-        time.sleep(2)
+        _open_date_time(driver, lambda: _find_date_time_elements(driver), target)
+        time.sleep(1)
         driver.save_screenshot(str(filepath))
         _save_current_time(driver, filepath)
         logger.info(
@@ -285,6 +351,8 @@ def capture_cbw_with_passwords(
                 )
                 if idx != hint:
                     _write_password_hint(host, idx)
+                if not _has_clock(path) and (deadline is None or time.monotonic() < deadline):
+                    _recapture_for_clock(url, username, passwords[idx - 1], path, on_progress)
                 return path
             except TimeoutException as exc:
                 last_error = exc
@@ -318,6 +386,48 @@ def capture_cbw_with_passwords(
             break
 
     raise RuntimeError(f"CBW capture failed for {host}: {last_error}")
+
+
+def _has_clock(image: Path) -> bool:
+    """Whether the capture's sidecar holds a readable "Current:" clock."""
+    from services.device_clock import CLOCK_SIDECAR_SUFFIX, parse_cbw_current
+
+    try:
+        text = Path(str(image) + CLOCK_SIDECAR_SUFFIX).read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return parse_cbw_current(text) is not None
+
+
+def _recapture_for_clock(url, username, password, image: Path, on_progress) -> bool:
+    """One fresh capture when the first one has no clock; keep it only if it has one.
+
+    No clock means the Date/Time page never loaded (every unread CBW on
+    2026-10-29: 220036 once, 233201 twice), not a misread: the clock is page
+    text. A new Chrome session usually gets the page; if it doesn't either,
+    the first capture stays.
+    """
+    from services.device_clock import CLOCK_SIDECAR_SUFFIX
+
+    image = Path(image)
+    retry_name = f"retry_{image.name}"
+    retry = image.with_name(retry_name)
+    logger.warning("[CBW] no Date/Time clock in capture; recapturing once path=%s", image)
+    (on_progress or _noop_progress)("CBW Date/Time did not load; capturing again")
+    try:
+        screenshot_date_time(url, username, password, image.parent, filename=retry_name, on_progress=on_progress)
+        if _has_clock(retry):
+            retry.replace(image)
+            Path(str(retry) + CLOCK_SIDECAR_SUFFIX).replace(str(image) + CLOCK_SIDECAR_SUFFIX)
+            logger.info("[CBW] recapture read the clock path=%s", image)
+            return True
+        logger.warning("[CBW] recapture had no clock either; keeping the first path=%s", image)
+    except Exception as exc:  # noqa: BLE001 — the first capture still stands
+        logger.warning("[CBW] recapture failed path=%s: %s: %s", image, type(exc).__name__, str(exc)[:200])
+    finally:
+        for leftover in (retry, Path(str(retry) + CLOCK_SIDECAR_SUFFIX)):
+            leftover.unlink(missing_ok=True)
+    return False
 
 
 def _setting(name: str, default):
