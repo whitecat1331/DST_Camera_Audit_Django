@@ -273,8 +273,11 @@ Result (2026-10-29): **accepted.**
   - `_wait_until_settled` replaces the fixed sleeps: two calm frames, with a visible reconnect card extending the wait to 40 s.
   - `_login` types the remembered camera password first and stops at the unlock. When the wake click changes nothing and the first password changes nothing, it doesn't type a second one.
   - The 40 backspaces are now one pyautogui call (4 s → 0.2 s).
-  - Password numbers per TeamViewer ID are kept in `tv_password_hints.json` (git-ignored, numbers only), seeded from the keeper CSV: 367 IDs, 213 on #1, 154 on #2.
-  - `services/password_hints.py` is shared with the CBW hints.
+  - ~~Password numbers per TeamViewer ID kept in `tv_password_hints.json`, seeded from the keeper CSV.~~ **Removed 2026-10-29 at the user's direction:** the keeper CSV's passwords were wrong for FX1408 (job 256: the lock screen was captured).
+    - TeamViewer now uses only the `.env` order: connect tries `TV_PASSWORD` #1, then #2; the camera login tries #2, then #1.
+    - The login now tries every password until the camera unlocks. The "wake click changed nothing" guard is removed: on FX1408 the prompt was already up, so the guard stopped after one wrong password.
+    - The file is retired to `tmp/import/tv_password_hints.retired.json`.
+    - CBW hints (`services/password_hints.py`) are unchanged.
 - **Bug found and fixed: the reconnect-card check was a false positive on bright DragonCam photos.**
   - Its "≥ 22 % bright pixels in the center" test fired on sunlit L2 photos, so good lanes failed after ~100 s. That's 244127 L2 in run 188 (re-checked) and 244127 / 266007 L2 in job 246.
   - It now measures card **shape**: the share of center rows whose flat-white run has the same edges. Real frames ≤ 0.16, a synthetic card 0.67, threshold 0.35.
@@ -323,8 +326,48 @@ Acceptance:
 - Auto-publish lands in the review dropdown.
 - The phase timings are recorded in this plan's Verification section.
 
+### Phase 4b — Live publish (gated; before Phase 5)
+Problem (user, 2026-10-29): sites reach the review page only after the whole run ends, in one serial batch.
+- **Evidence:**
+  - Publish 275 (6 sites, 14 images) took 17 s after run 268 ended (≈ 1.2 s/image); shared-DB round trip 40 ms.
+  - Images average 580 KB. A fleet run has ≈ 2,000 → ≈ 1.1 GB.
+  - Serial publish after the run ≈ 35–45 min.
+- **Spike** (`tmp/spike/publish_upload_spike.py`, 12 real images, own rows deleted):
+  - 1 worker 0.79 s/img (6.9 Mbit/s); 4 workers 0.31 s/img (17.6 Mbit/s); 8 workers no better (upload-bound).
+
+Work:
+1. Image uploads within a publish run 4 at a time (`DST_PUBLISH_UPLOAD_CONCURRENT`, default 4), each worker on its own shared-DB connection.
+2. **Live publisher.** When the run has a round, a background thread publishes each site as it finishes, whenever the shared DB answers. During the LTI half (VPN on) it holds the queue. Once the VPN is released, it drains the LTI backlog while DE captures, then follows each DE site.
+   - The parent row is upserted first (still running).
+   - A publish failure never touches the capture; that site is simply retried at the end.
+3. **Final publish** (the existing PUBLISH job) re-sends only what changed since the live publish: the parent, DE sites given OvrC times by the fleet pass, OvrC-only sites. Images already uploaded in this process are skipped without a query.
+4. A cancelled or crashed run stops the live publisher. What it already sent stays; a manual publish reconciles.
+
+Acceptance:
+- Tests:
+  - live publish waits while the shared DB is unreachable and then drains;
+  - a site published live and unchanged isn't re-sent at the end; a changed one is;
+  - an upload failure doesn't fail the capture;
+  - parallel uploads count correctly.
+- Live small run (LTI + DE, with a name): sites appear on the review page before the run ends. The final PUBLISH job finishes in seconds and has the same rows/images as a full publish.
+
+Result (2026-10-29): **implemented; tests pass; live small run pending.**
+- **Tests:** 177 OK. New ones:
+  - live site not re-sent;
+  - changed-after-live site re-sent;
+  - failed live batch left for the final publish;
+  - thread holds while unreachable, then drains in one batch;
+  - close while held returns at once;
+  - parallel upload counts and error propagation;
+  - the runner hands finished sites (skipped too, OvrC-only not) to the publisher; no round means no publisher.
+- **Live mechanics on the shared DB, without a capture:** run 268 re-published into its own round `Small_Test_Six`, where every upsert is a no-op.
+  - Live publisher: 6/6 sites in 5.0 s.
+  - Final publish with the cache: **0.6 s**, parent only, "6 site(s) already published live".
+  - Shared row counts unchanged (7 jobs, 14 screenshots).
+- **Still to accept:** the user's next small LTI + DE test with a name. Sites must show on the review page while DE is still capturing.
+
 ## Status
-in progress — Phases 1–3 accepted 2026-10-29; Phase 4 not needed on the projection. Next: Phase 5, the full-fleet timed run (needs the user to connect the VPN with MFA first, ~4–5.5 h).
+in progress — Phases 1–3 accepted 2026-10-29; Phase 4 not needed on the projection. Phase 4b (live publish) in progress. Next: Phase 5, the full-fleet timed run (needs the user to connect the VPN with MFA first, ~4–5.5 h).
 
 ## Checklist
 - [x] User decision F6: keeper CSV merge-imported 2026-10-29 (119 → 13 unmapped); the 13 get OvrC only; passwords stay in `.env`, and only a per-device index will be stored.
@@ -337,4 +380,6 @@ in progress — Phases 1–3 accepted 2026-10-29; Phase 4 not needed on the proj
 - [x] Phase 3 accepted (166 tests; live job 251: 6 lanes 17.6–22.9 s; offline partner 2.7 s; screenshots unchanged)
 - [x] Phase 4 decision: not needed on the projection (≈ 4–5.5 h); revisit if Phase 5 is over 8 h
 - [ ] Phase 4 spike + implementation + acceptance (only if Phase 5 is over budget)
+- [x] Phase 4b implemented (live publish + parallel uploads; 177 tests; live mechanics on run 268: final publish 0.6 s)
+- [ ] Phase 4b accepted (tests + live small run: sites on the review page before the run ends)
 - [ ] Phase 5 accepted: full fleet under 8 h
