@@ -1,8 +1,9 @@
 """TeamViewer DE lane: frame thresholds on real frames, login stops at unlock, fast connect failures."""
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
+from unittest import mock, skipUnless
 
 from django.test import SimpleTestCase
 from PIL import Image
@@ -10,6 +11,8 @@ from PIL import Image
 from services import teamviewer_capture as tvc
 
 FRAMES = Path(__file__).parent / "testdata" / "tv"  # FX1173 L1, 2026-10-29, at _FRAME_SIZE
+# _connect and the capture drive TeamViewer through ctypes.windll and pyautogui.
+windows_only = skipUnless(sys.platform == "win32", "TeamViewer automation is Windows-only")
 
 
 def frame(name):
@@ -109,6 +112,7 @@ class LoginTests(SimpleTestCase):
         self.assertEqual(screen.typed, ["pw-one", "pw-two"])
 
 
+@windows_only
 class ConnectTests(SimpleTestCase):
     def connect(self, *, sessions, auth=(), offline=False, leftover=False):
         launched = []
@@ -172,6 +176,7 @@ class ConnectTests(SimpleTestCase):
         click.assert_called_once_with(10, 10)  # the leftover, before launching
 
 
+@windows_only
 class PasswordOrderTests(SimpleTestCase):
     """Only the .env order counts: connect #1 then #2; the camera list is passed as given."""
 
