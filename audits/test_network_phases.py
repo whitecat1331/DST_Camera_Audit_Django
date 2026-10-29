@@ -352,7 +352,8 @@ class PublishAfterRunTests(TestCase):
             typed, _ = runner.create_dst_audit_job(
                 self.user, scope="all", state="", agency="", installation_ids=[5], publish_round="R2"
             )
-        self.assertRegex(runner.read_dst_publish_round(job.pk), r"^DST audit \d{4}-\d{2}-\d{2}$")
+        # Date and time, so two runs on the same day get their own rounds.
+        self.assertRegex(runner.read_dst_publish_round(job.pk), r"^DST audit \d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
         self.assertEqual(runner.read_dst_publish_round(typed.pk), "R2")
         with mock.patch.object(publish, "shared_configured", return_value=False):
             self.assertEqual(runner.default_publish_round(), "")  # can't publish here → no round

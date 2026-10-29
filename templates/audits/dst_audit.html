@@ -97,8 +97,9 @@
   </div>
   {% if can_publish %}
   <div class="dst-actions">
-    <input type="text" id="dst-start-round" list="dst-publish-rounds" maxlength="128"
-      placeholder="Publish to round (default: DST audit {{ default_round_date }})" aria-label="Publish the run into this round when it finishes; empty publishes to DST audit and the run date">
+    <label class="dst-schedule-label" for="dst-start-round">Audit name</label>
+    <input type="text" id="dst-start-round" list="dst-publish-rounds" maxlength="128" size="44"
+      placeholder="DST audit {{ default_round_date }} (start date and time)" aria-label="Audit name: the round the run publishes into when it finishes; empty uses DST audit and the start date and time">
   </div>
   {% if can_schedule %}
   <div class="dst-actions dst-schedule-actions">
@@ -118,7 +119,7 @@
       <tr data-id="{{ s.pk }}">
         <td>{{ s.local_label }}</td>
         <td>{{ s.site_count }}</td>
-        <td class="dst-schedule-round">{{ s.publish_round|default:"DST audit (run date)" }}</td>
+        <td class="dst-schedule-round">{{ s.publish_round|default:"DST audit (start date and time)" }}</td>
         <td class="dst-schedule-status">
           <span class="badge status-{% if s.status == 'done' %}succeeded{% elif s.status == 'scheduled' %}pending{% else %}{{ s.status }}{% endif %}">{{ s.get_status_display }}</span>
           {% if s.message %}<span class="muted">{{ s.message }}</span>{% endif %}
@@ -954,7 +955,7 @@
       if (
         !confirm(
           `Schedule a DST audit of ${ids.length} site(s) at ${when}?\n\n` +
-            (round ? `Publishes to round "${round}" when done.\n` : `Publishes to round "DST audit <run date>" when done.\n`) +
+            (round ? `Audit name: "${round}" (publishes there when done).\n` : `Audit name: "DST audit <start date and time>" (publishes there when done).\n`) +
             `\nBefore you leave: connect the VPN, keep the laptop plugged in, signed in, ` +
             `unlocked and awake, with TeamViewer running.`
         )
@@ -1000,7 +1001,11 @@
       }
       if (
         !confirm(
-          `Start DST Audit for ${ids.length} selected site(s)?\n\n` +
+          `Start DST Audit for ${ids.length} selected site(s)?\n` +
+            (document.getElementById("dst-start-round")
+              ? `Audit name: "${document.getElementById("dst-start-round").value.trim() || "DST audit <start date and time>"}"\n`
+              : "") +
+            `\n` +
             `1) LTI on the camera VPN: relays on, boot wait, every LTI capture\n` +
             `2) Disconnect the VPN\n` +
             `3) DE off the VPN: OvrC DCAM on, boot wait, every TeamViewer capture\n` +

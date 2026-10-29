@@ -967,7 +967,7 @@ def dst_audit_page(request):
             "can_schedule": can_audit and settings.DST_ROLE == "capture",
             "schedules": _dst_schedules(),
             "device_now": _device_now().strftime("%Y-%m-%d %H:%M %Z"),
-            "default_round_date": _device_now().strftime("%Y-%m-%d"),
+            "default_round_date": _device_now().strftime("%Y-%m-%d HH:MM"),
             "publish_runs": [r for r in recent_rows if r["finished"]],
             "rounds": list(AuditRound.objects.values_list("name", flat=True)[:20]),
             "active_publish": active_publish,

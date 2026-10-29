@@ -2871,9 +2871,11 @@ def create_dst_audit_job(
 
 
 def default_publish_round() -> str:
-    """Round a run publishes into when none was typed: `DST audit <local date>`.
+    """The audit's name when none was typed: `DST audit <local date> <HH:MM>`.
 
-    Empty when this install can't publish (not the capture laptop, no shared DB).
+    It names the round the run publishes into. With the time, two runs on the
+    same day get their own rounds instead of sharing one. Empty when this
+    install can't publish (not the capture laptop, no shared DB).
     """
     from audits.publish import shared_configured
 
@@ -2881,7 +2883,7 @@ def default_publish_round() -> str:
         return ""
     from datetime import datetime
 
-    return f"DST audit {datetime.now().astimezone():%Y-%m-%d}"  # the laptop clock
+    return f"DST audit {datetime.now().astimezone():%Y-%m-%d %H:%M}"  # the laptop clock
 
 
 def mirror_db_cancel(job_id: int, stop: threading.Event, interval: float = 3.0) -> None:
