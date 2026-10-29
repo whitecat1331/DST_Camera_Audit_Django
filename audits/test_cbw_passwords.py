@@ -79,9 +79,15 @@ class DateTimePageWaitTests(SimpleTestCase):
 
 
 class CbwDateTimeClickTests(SimpleTestCase):
+    @staticmethod
+    def menu_page(followed=False):
+        driver = mock.Mock(current_url="http://10.3.201.177/setup.html#")
+        driver.execute_script.return_value = followed
+        return driver
+
     def test_a_click_that_loads_nothing_is_retried_on_a_fresh_link(self):
         """233201 (2026-10-29): a late menu rebuild swallowed the click twice in a row."""
-        driver = mock.Mock()
+        driver = self.menu_page()
         finds = []
 
         def find_links():
@@ -95,10 +101,42 @@ class CbwDateTimeClickTests(SimpleTestCase):
         self.assertEqual(len(clicked), 2)
 
     def test_gives_up_after_the_last_click(self):
-        driver = mock.Mock()
+        driver = self.menu_page()
         with mock.patch.object(cbw_capture, "_wait_for_date_time_page", return_value=False):
             self.assertFalse(cbw_capture._open_date_time(driver, lambda: [object()], "h"))
         self.assertEqual(driver.execute_script.call_count, cbw_capture._DATE_TIME_CLICKS)
+
+    def test_a_click_the_menu_did_not_handle_is_retried_not_waited_on(self):
+        """233127 (2026-10-29): the click opened the bare date-time.html template."""
+        driver = self.menu_page()
+        # Blocked more times than there are tries: blocked clicks don't use one up.
+        driver.execute_script.side_effect = [True] * (cbw_capture._DATE_TIME_CLICKS + 2) + [False]
+        with (
+            mock.patch.object(cbw_capture, "_wait_for_date_time_page", return_value=True) as waited,
+            mock.patch.object(cbw_capture.time, "sleep"),
+        ):
+            self.assertTrue(cbw_capture._open_date_time(driver, lambda: [object()], "10.3.127.177"))
+        self.assertEqual(waited.call_count, 1)
+
+    def test_a_menu_that_never_handles_clicks_gives_up(self):
+        driver = self.menu_page(followed=True)
+        clock = iter(range(0, 1000, 5))
+        with (
+            mock.patch.object(cbw_capture.time, "sleep"),
+            mock.patch.object(cbw_capture.time, "monotonic", side_effect=lambda: next(clock)),
+        ):
+            self.assertFalse(cbw_capture._open_date_time(driver, lambda: [object()], "h"))
+        driver.back.assert_not_called()
+
+    def test_a_page_that_left_the_menu_goes_back(self):
+        driver = self.menu_page()
+        driver.current_url = "http://10.3.127.177/date-time.html"
+        with (
+            mock.patch.object(cbw_capture, "_wait_for_date_time_page", return_value=True),
+            mock.patch.object(cbw_capture, "_wait_for_menu_settled"),
+        ):
+            self.assertFalse(cbw_capture._open_date_time(driver, lambda: [object()], "10.3.127.177"))
+        self.assertEqual(driver.back.call_count, cbw_capture._DATE_TIME_CLICKS)
 
 
 @override_settings(CBW_PASSWORD_HINTS_PATH=str(HINTS), CBW_CAPTURE_BUDGET_SECONDS=0)

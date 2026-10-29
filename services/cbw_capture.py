@@ -29,6 +29,8 @@ _MENU_TIMEOUT_RETRIES = 2
 # Clicks on Date/Time before giving up and saving whatever page is shown.
 _DATE_TIME_CLICKS = 3
 _DATE_TIME_WAIT_SECONDS = 12
+# How long to keep re-clicking while the menu's scripts aren't handling clicks yet.
+_MENU_READY_SECONDS = 20
 
 
 def _noop_progress(_: str) -> None:
@@ -62,9 +64,11 @@ def _find_date_time_elements(driver: webdriver.Chrome):
     hidden. Link-text lookups only see shown links, and the old text XPath
     then returned the hidden <li class="adminOnly"> before its <a>: a click on
     the <li> does nothing (233201, 2026-10-29: 3 of 5 captures). A JS click on
-    the hidden <a> loads the page in under a second.
+    the hidden <a> loads the page in under a second. Only the menu's own link:
+    clicked anywhere the menu doesn't handle it, it is a plain link to the bare
+    date-time.html template (233127, 2026-10-29: "Current: Init...").
     """
-    links = driver.find_elements(By.CSS_SELECTOR, "#menu-content a[href*='date-time'], a[href*='date-time']")
+    links = driver.find_elements(By.CSS_SELECTOR, "#menu-content a[href*='date-time']")
     if links:
         return links
     links = driver.find_elements(By.LINK_TEXT, "Date/Time")
@@ -86,13 +90,18 @@ def _save_current_time(driver, filepath: Path) -> None:
     """
     from services.device_clock import write_clock_sidecar
 
+    write_clock_sidecar(filepath, _current_clock_text(driver))
+
+
+def _current_clock_text(driver) -> str:
+    """The line under "Current:" in #mainContent ("" when not shown)."""
     try:
         text = driver.find_element(By.ID, "mainContent").text
     except Exception:  # noqa: BLE001
-        return
+        return ""
     _, found, rest = text.partition("Current")
     rest = rest.lstrip(": \n")
-    write_clock_sidecar(filepath, rest.splitlines()[0] if found and rest else "")
+    return rest.splitlines()[0] if found and rest else ""
 
 
 def _wait_for_menu_settled(driver, target: str, timeout: float = 20, quiet: float = 2) -> int:
@@ -117,19 +126,50 @@ def _wait_for_menu_settled(driver, target: str, timeout: float = 20, quiet: floa
     return count
 
 
+# Click a link the way the menu does, but never let the browser follow it: a
+# window listener runs after the page's own handlers, and when none of them
+# took the click (preventDefault) it stops the navigation and says so.
+_CLICK_IN_PAGE_JS = """
+const link = arguments[0];
+let followed = false;
+const guard = (e) => { if (!e.defaultPrevented) { e.preventDefault(); followed = true; } };
+window.addEventListener("click", guard);
+try { link.click(); } finally { window.removeEventListener("click", guard); }
+return followed;
+"""
+
+
 def _open_date_time(driver, find_links, target: str) -> bool:
     """Click Date/Time until its "Current:" clock shows; re-find the link each time.
 
     The link can be replaced by a late menu rebuild, and a click on the old
     element is silently ignored, so a page that doesn't come gets a fresh
-    element and another click.
+    element and another click. A click the menu doesn't handle yet would
+    open the bare date-time.html template; it is blocked and retried instead.
     """
     wait = WebDriverWait(driver, _DATE_TIME_WAIT_SECONDS)
-    for attempt in range(1, _DATE_TIME_CLICKS + 1):
+    ready_by = time.monotonic() + _MENU_READY_SECONDS
+    attempt = 0
+    while attempt < _DATE_TIME_CLICKS:
         links = find_links()
         if not links:
             return False
-        driver.execute_script("arguments[0].click();", links[0])
+        if driver.execute_script(_CLICK_IN_PAGE_JS, links[0]):
+            # Not a real try: the menu isn't listening yet (233127 forced early:
+            # handled on the third click, ~5 s after the link appeared).
+            if time.monotonic() > ready_by:
+                logger.warning("[CBW] menu never handled the Date/Time click in %ss target=%s", _MENU_READY_SECONDS, target)
+                return False
+            logger.info("[CBW] menu not handling clicks yet; retrying target=%s", target)
+            time.sleep(1)
+            continue
+        attempt += 1
+        if "setup.html" not in driver.current_url:
+            # A handler let the browser leave the menu page anyway: go back.
+            logger.warning("[CBW] Date/Time click left setup.html url=%s target=%s", driver.current_url, target)
+            driver.back()
+            _wait_for_menu_settled(driver, target)
+            continue
         if _wait_for_date_time_page(wait, target, warn=attempt == _DATE_TIME_CLICKS):
             if attempt > 1:
                 logger.info("[CBW] Date/Time loaded on click %s target=%s", attempt, target)
@@ -220,8 +260,11 @@ def _wait_for_date_time_page(wait: WebDriverWait, target: str, warn: bool = True
     satisfied by the page already there. A slow (cellular) CBW took >2 s on
     2026-10-29 (220036) and we screenshotted General Information instead.
     """
+    from services.device_clock import parse_cbw_current
+
     try:
-        wait.until(EC.text_to_be_present_in_element((By.ID, "mainContent"), "Current"))
+        # The label shows first with "Init..." under it; the time fills in after.
+        wait.until(lambda d: parse_cbw_current(_current_clock_text(d)) is not None)
         return True
     except TimeoutException:
         if warn:
