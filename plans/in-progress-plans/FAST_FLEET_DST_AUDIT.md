@@ -144,6 +144,14 @@ Phase 4 (parallel DE sessions) is only needed if Phase 3's measured DE time miss
   - Fix: keep the capture finish time separate. Phase 2, folded in with the progress fix.
 - **F9 — Carry-over from run 188: the DE OvrC power-on raised an exception with an empty message** (`power-on DE fleet: Message: `).
   - It's the same code path at fleet scale. Watch run 196's result; if it repeats, fix it in Phase 1, since a failed fleet power-on would make F1 skip every DE site.
+  - **Addressed in Phase 1:**
+    - `ensure_dcam_on_for_fxes` aborted the whole batch on any one FX's exception; with `continue_on_error`, one bad FX no longer stops the rest.
+    - The error now carries the exception type (the empty `Message:` was a Selenium exception without text).
+    - Live confirmation is in Phase 3.
+- **F10 — The DST page doesn't scale to a fleet run** (found 2026-10-29).
+  - `audit_job_status` (`audits/views.py`) loads `child_jobs[:500]` with every screenshot payload on each 2 s poll.
+  - An 814-site run shows only 500 sites, and each poll re-sends every row and image entry.
+  - Fix in Phase 3 (item 6): return counts for all children, and rows only for the most recent / not-ok ones (or paginate).
 
 ## Execution phases
 
@@ -205,6 +213,33 @@ Acceptance:
   - Laptop RAM stays under ~80 % during the run.
   - No CBW or VNC errors that the serial run doesn't show on the same sites.
 
+Result (2026-10-29): **accepted.**
+- **Implemented:**
+  - `_dst_capture_half(workers=…)`: the LTI half uses `DST_LTI_SITE_CONCURRENT=4`; each pool thread closes its DB connection.
+  - Every counter change goes through `_DstRun.record()` under a lock.
+  - Progress reads `<half>: n/N · ok · failed · skipped`, and the page bar uses sites done, not successes (the "1/814" fix).
+  - `DST_POWER_ON_CONCURRENT=10`.
+  - F8: the OvrC pass no longer moves `finished_at`.
+  - New settings in `config/settings.py`, `.env.example` and the README.
+- **F7 root cause (better than a budget alone):**
+  - 220054's slow CBW was the password order, not the network. Its HTTP auth probe passes every password (no 401), so passwords 1 and 2 were each tried 3× at a 45 s menu timeout before 3 worked in 18 s.
+  - **Fix in `capture_cbw_with_passwords`:**
+    - try each password once per round before any retry;
+    - remember the working password **number** per host (`cbw_password_hints.json`, git-ignored, numbers only);
+    - `CBW_CAPTURE_BUDGET_SECONDS=150` as the backstop.
+- **Tests:** 152 OK.
+  - Pool: every site once, with overlap ≤ workers; cancel stops sites not started; counts and progress line.
+  - CBW: round-robin order, remembered number first, all-timeout retries, budget.
+- **Live, job 221:** 20 online LTI sites, VPN on, workers=4.
+  - 20/20 ok. The capture half took **354 s against a 1,202 s serial sum (3.4×)**; 446 s overall, including the 90 s boot wait, because 233009's relays were turned on.
+  - Power-on for 20 sites took 2 s.
+  - RAM peaked at 53 %.
+- **VNC check:** 15 lanes on 9 sites timed out. A serial TCP probe afterwards timed out on all 15 as well, so those CPUs are unreachable; parallelism doesn't cause it.
+- **Live, job 242:** the remembered password took 220054 / 220144 / 220194 from 113 / 118 / 111 s to 16 / 15 / 15 s.
+- **Projected LTI half for 373 online sites at 4 workers:**
+  - **~30 min once passwords are remembered** (~20 s per site);
+  - ~1.5–2 h on the first fleet run, while ~half the hosts still need the round-robin.
+
 ### Phase 3 — Faster DE lanes (gated)
 Work:
 1. **Replace the fixed 10 s launch sleep** with polling for the session window, every 0.5 s.
@@ -215,6 +250,7 @@ Work:
    - Offline partner: don't retry the next connection password.
    - Wrong password: try the next one.
 5. **Cap the reconnect-overlay wait per lane** (today 55 s + 40 s + 5 retries).
+6. **F10:** make the DST page's status poll scale to 800+ sites.
 
 Acceptance:
 - Live on the 3 test DE sites (255039, 266007, 244127) plus 1 known-offline TeamViewer ID.
@@ -248,15 +284,15 @@ Acceptance:
 - The phase timings are recorded in this plan's Verification section.
 
 ## Status
-in progress — Phase 1 implemented and accepted for LTI on 2026-10-29 (DE live checks are carried into Phase 3). Next: Phase 2.
+in progress — Phases 1 and 2 accepted 2026-10-29 (Phase 1's DE live checks are carried into Phase 3). Next: Phase 3 (DE lanes; needs the VPN off).
 
 ## Checklist
 - [x] User decision F6: keeper CSV merge-imported 2026-10-29 (119 → 13 unmapped); the 13 get OvrC only; passwords stay in `.env`, and only a per-device index will be stored.
 - [x] Run 196 cancelled (2026-10-28 22:30, by the user from the page). It never reached DE, so there is no DE or OvrC fleet baseline; Phase 3/5 measure their own.
 - [x] Phase 1 implemented (2026-10-29)
 - [x] Phase 1 accepted for LTI (tests + live job 216); DE paths are verified live in Phase 3's acceptance
-- [ ] Phase 2 implemented
-- [ ] Phase 2 accepted (tests + live 20-site timed run)
+- [x] Phase 2 implemented (2026-10-29)
+- [x] Phase 2 accepted (152 tests; live job 221: 3.4× on the capture half, RAM 53 %; job 242 password memory)
 - [ ] Phase 3 implemented
 - [ ] Phase 3 accepted (≤25 s online lane, ≤30 s offline lane, screenshots unchanged)
 - [ ] Phase 4 decision: needed? (based on Phase 3's measured DE projection)
