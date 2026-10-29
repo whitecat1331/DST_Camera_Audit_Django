@@ -394,6 +394,7 @@ table.data th {
 .status-succeeded { color: var(--ok); border-color: rgba(94, 200, 255, 0.5); }
 .status-failed { color: var(--danger); border-color: rgba(255, 107, 122, 0.5); }
 .status-running, .status-pending { color: var(--warn); border-color: rgba(255, 204, 102, 0.5); }
+.status-skipped { color: var(--muted); border-color: rgba(160, 160, 170, 0.45); }
 
 .messages { list-style: none; padding: 0; }
 .messages li {

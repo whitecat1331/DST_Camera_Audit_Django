@@ -261,10 +261,11 @@ def audit_job_status(request, pk):
             "sites_done": sum(
                 1
                 for s in site_rows
-                if s["status"] in ("succeeded", "failed", "cancelled")
+                if s["status"] in ("succeeded", "failed", "cancelled", "skipped")
             ),
             "sites_ok": sum(1 for s in site_rows if s["status"] == "succeeded"),
             "sites_failed": sum(1 for s in site_rows if s["status"] == "failed"),
+            "sites_skipped": sum(1 for s in site_rows if s["status"] == "skipped"),
         }
 
     if job.device_type == AuditJob.DeviceType.CONFIRM_BATCH:

@@ -50,7 +50,13 @@ class ReviewRow:
         return bool(self.review and self.review.completed)
 
     @property
+    def skipped(self) -> bool:
+        return self.job.status == AuditJob.Status.SKIPPED
+
+    @property
     def failed(self) -> bool:
+        if self.skipped:
+            return False
         return self.job.status != AuditJob.Status.SUCCEEDED or bool(
             (self.job.error_message or "").strip()
         )
@@ -141,6 +147,7 @@ def summarize(rows: list[ReviewRow]) -> dict[str, int]:
         "lti": sum(r.kind == "lti" for r in rows),
         "de": sum(r.kind == "de" for r in rows),
         "failed": sum(r.failed for r in rows),
+        "skipped": sum(r.skipped for r in rows),
         "drift": sum(r.drift_flagged for r in rows),
         "complete": sum(r.completed for r in rows),
         "unassigned": sum(not r.assigned_to for r in rows),

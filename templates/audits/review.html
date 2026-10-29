@@ -33,6 +33,7 @@
   <div class="dst-stat"><span class="dst-stat-n">{{ summary.de }}</span><span class="dst-stat-l">DE</span></div>
   <div class="dst-stat {% if summary.drift %}is-warn{% endif %}"><span class="dst-stat-n">{{ summary.drift }}</span><span class="dst-stat-l">drift flagged</span></div>
   <div class="dst-stat {% if summary.failed %}is-danger{% endif %}"><span class="dst-stat-n">{{ summary.failed }}</span><span class="dst-stat-l">failed</span></div>
+  {% if summary.skipped %}<div class="dst-stat"><span class="dst-stat-n">{{ summary.skipped }}</span><span class="dst-stat-l">skipped offline</span></div>{% endif %}
   <div class="dst-stat"><span class="dst-stat-n" id="review-complete-n">{{ summary.complete }}/{{ summary.cameras }}</span><span class="dst-stat-l">complete</span></div>
 </div>
 

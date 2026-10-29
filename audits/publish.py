@@ -38,6 +38,7 @@ FINISHED = (
     AuditJob.Status.SUCCEEDED,
     AuditJob.Status.FAILED,
     AuditJob.Status.CANCELLED,
+    AuditJob.Status.SKIPPED,
 )
 # Copied as-is; identity and foreign keys are remapped per database.
 _REMAPPED = {"id", "parent_job", "created_by", "round"}

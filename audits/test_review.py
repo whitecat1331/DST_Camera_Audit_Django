@@ -63,11 +63,21 @@ class ReviewRoundTests(TestCase):
         self.assertEqual(de.eastern_at_read, "Nov 01, 2026 02:11 AM EST")
         self.assertEqual(
             summarize(rows),
-            {"cameras": 2, "lti": 1, "de": 1, "failed": 0, "drift": 1, "complete": 0, "unassigned": 2},
+            {"cameras": 2, "lti": 1, "de": 1, "failed": 0, "skipped": 0, "drift": 1, "complete": 0, "unassigned": 2},
         )
         self.assertEqual([r.key for r in filter_rows(rows, Filters(drift=True))], ["266134"])
         self.assertEqual([r.key for r in filter_rows(rows, Filters(kind="lti"))], ["233038"])
         self.assertEqual(filter_rows(rows, Filters(failed=True)), [])
+
+    def test_a_skipped_offline_site_counts_as_skipped_not_failed(self):
+        self.site("600004", "lti", status=AuditJob.Status.SKIPPED, finished=timezone.now(),
+                  error_message="Not attempted: offline: CBW power-on failed")
+        rows = build_round_rows(self.round)
+        skipped = next(r for r in rows if r.key == "600004")
+        self.assertTrue(skipped.skipped)
+        self.assertFalse(skipped.failed)
+        summary = summarize(rows)
+        self.assertEqual((summary["skipped"], summary["failed"]), (1, 0))
 
     def test_small_drift_is_not_flagged(self):
         AuditJob.objects.filter(pk=self.de_new.pk).update(drift_seconds=-48)

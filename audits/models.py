@@ -54,6 +54,8 @@ class AuditJob(models.Model):
         SUCCEEDED = "succeeded", "Succeeded"
         FAILED = "failed", "Failed"
         CANCELLED = "cancelled", "Cancelled"
+        # DST site not attempted: known offline before capture (power-on failed).
+        SKIPPED = "skipped", "Skipped"
 
     pole_number = models.CharField(max_length=64, db_index=True)
     target_host = models.CharField(max_length=64, blank=True)

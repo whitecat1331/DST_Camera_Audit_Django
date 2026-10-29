@@ -150,7 +150,19 @@ class NetworkPhaseOrderTests(TestCase):
         self.sites = [site(1, "D1", "de"), site(2, "L1", "lti"), site(3, "D2", "de"), site(4, "L2", "lti")]
         self.events: list[str] = []
 
-    def run_audit(self, *, camera_up=True, released=True, network_ok=True, publish_round=""):
+    def run_audit(
+        self,
+        *,
+        camera_up=True,
+        released=True,
+        network_ok=True,
+        publish_round="",
+        lti_dead=(),
+        lti_flaky=(),
+        de_dead=(),
+        no_tv=(),
+        ovrc_shots=True,
+    ):
         runner.write_dst_selection(self.parent.pk, [s.pk for s in self.sites], publish_round=publish_round)
 
         def capture(child_pk, inst, child_dir, **kw):
@@ -167,22 +179,35 @@ class NetworkPhaseOrderTests(TestCase):
 
         def lti_power(inst):
             self.events.append(f"relay {inst.key}")
+            if inst.key in lti_dead or (inst.key in lti_flaky and self.events.count(f"relay {inst.key}") == 1):
+                return inst.key, f"{inst.key}: Failed to turn on relays", False
             return inst.key, None, False
+
+        def de_power(job_id, sites):
+            self.events.append("ovrc dcam on")
+            dead = {s.key for s in sites if s.key in de_dead}
+            return len(sites) - len(dead), False, [f"power-on {k}: OvrC DCAM failed" for k in sorted(dead)], dead
+
+        def ovrc_times(job_id, assignments, fleet_dir):
+            self.events.append("ovrc " + ",".join(key for _pk, key, _fx, _dir in assignments))
+            for child_pk, _key, _fx, _dir in assignments:
+                if ovrc_shots:
+                    job = AuditJob.objects.get(pk=child_pk)
+                    job.screenshots.create(label="ovrc_fx1").image.save("o.png", ContentFile(b"png"), save=True)
+                    AuditJob.objects.filter(pk=child_pk).update(status=AuditJob.Status.SUCCEEDED)
+            return []
 
         with (
             mock.patch.object(runner, "_active_dst_installations", return_value=self.sites),
             mock.patch.object(runner, "_dst_site_kind", side_effect=lambda s: s.kind),
             mock.patch.object(runner, "_dst_site_key", side_effect=lambda s: s.key),
             mock.patch.object(runner, "_power_on_lti_site", side_effect=lti_power),
-            mock.patch.object(
-                runner,
-                "_power_on_all_de_sites",
-                side_effect=lambda job_id, sites: self.events.append("ovrc dcam on") or (len(sites), False, []),
-            ),
+            mock.patch.object(runner, "_power_on_all_de_sites", side_effect=de_power),
+            mock.patch.object(runner, "_de_has_teamviewer", side_effect=lambda s: s.key not in no_tv),
             mock.patch.object(runner, "_dst_camera_network_up", return_value=camera_up),
             mock.patch.object(runner, "_dst_release_vpn", side_effect=release),
             mock.patch.object(runner, "_run_dst_site_capture", side_effect=capture),
-            mock.patch.object(runner, "_dst_fleet_ovrc_times", side_effect=lambda *a: self.events.append("ovrc") or []),
+            mock.patch.object(runner, "_dst_fleet_ovrc_times", side_effect=ovrc_times),
         ):
             return runner._run_dst_audit(self.parent.pk, runner.Path(MEDIA) / "run")
 
@@ -193,7 +218,7 @@ class NetworkPhaseOrderTests(TestCase):
         # DE power-on (OvrC) waits until the VPN is gone, like the DE captures.
         self.assertEqual(
             self.events[2:],
-            ["capture L1", "capture L2", "release", "ovrc dcam on", "capture D1", "capture D2", "ovrc"],
+            ["capture L1", "capture L2", "release", "ovrc dcam on", "capture D1", "capture D2", "ovrc D1,D2"],
         )
         self.assertEqual(sorted(self.events[:2]), ["relay L1", "relay L2"])
 
@@ -202,7 +227,7 @@ class NetworkPhaseOrderTests(TestCase):
         self.assertEqual(ok, 2)
         self.assertIn("LTI skipped (2 site(s))", errors[0])
         self.assertEqual(
-            self.events, ["release", "ovrc dcam on", "capture D1", "capture D2", "ovrc"]
+            self.events, ["release", "ovrc dcam on", "capture D1", "capture D2", "ovrc D1,D2"]
         )  # no relays, no LTI captures
 
     def test_failed_release_is_a_warning_and_de_still_runs(self):
@@ -224,6 +249,52 @@ class NetworkPhaseOrderTests(TestCase):
         self.events = []
         self.run_audit()  # no publish round → VPN left alone
         self.assertNotIn("release", self.events)
+
+    def children(self):
+        return {c.pole_number: c for c in AuditJob.objects.filter(parent_job=self.parent)}
+
+    def test_lti_site_whose_power_on_failed_is_skipped_not_tried(self):
+        errors, ok = self.run_audit(lti_dead={"L2"})
+        self.assertNotIn("capture L2", self.events)
+        self.assertEqual(ok, 3)
+        kids = self.children()
+        self.assertEqual(kids["L2"].status, AuditJob.Status.SKIPPED)
+        self.assertIn("CBW power-on failed twice", kids["L2"].error_message)
+        self.assertEqual(kids["L1"].status, AuditJob.Status.SUCCEEDED)
+        self.assertIn("Skipped 1 offline site(s) without trying them", errors)
+        self.assertEqual(
+            [c.pole_number for c in AuditJob.objects.filter(parent_job=self.parent).order_by("pk")],
+            ["L1", "L2", "D1", "D2"],
+        )  # a skipped site still gets its row, in run order
+
+    def test_power_on_that_fails_once_is_retried_and_the_site_captured(self):
+        errors, ok = self.run_audit(lti_flaky={"L2"})
+        self.assertEqual(self.events.count("relay L2"), 2)
+        self.assertEqual(self.events.count("relay L1"), 1)  # only failures are retried
+        self.assertIn("capture L2", self.events)
+        self.assertEqual((ok, errors), (4, []))
+
+    def test_de_site_whose_ovrc_power_on_failed_is_skipped_and_gets_no_ovrc_time(self):
+        errors, ok = self.run_audit(de_dead={"D1"})
+        self.assertNotIn("capture D1", self.events)
+        self.assertIn("ovrc D2", self.events)
+        self.assertEqual(self.children()["D1"].status, AuditJob.Status.SKIPPED)
+        self.assertEqual(ok, 3)
+
+    def test_de_site_without_teamviewer_id_gets_the_ovrc_time_only(self):
+        errors, ok = self.run_audit(no_tv={"D1"})
+        self.assertNotIn("capture D1", self.events)
+        self.assertIn("ovrc D1,D2", self.events)  # still in the OvrC pass
+        d1 = self.children()["D1"]
+        self.assertEqual(d1.status, AuditJob.Status.SUCCEEDED)
+        self.assertEqual(d1.error_message, "")
+        self.assertEqual(ok, 4)
+        self.assertEqual(errors, [])
+
+    def test_ovrc_only_site_without_an_ovrc_time_fails(self):
+        errors, ok = self.run_audit(no_tv={"D1"}, ovrc_shots=False)
+        self.assertEqual(self.children()["D1"].status, AuditJob.Status.FAILED)
+        self.assertIn("D1: OvrC time not captured", errors)
 
     def test_child_jobs_are_numbered_in_run_order(self):
         self.run_audit()
@@ -307,3 +378,71 @@ class StaleTeamViewerWindowTests(SimpleTestCase):
                 "FX1260 L1 - TeamViewer",
             )
             self.assertIsNone(tv._find_session_window(None, "123", exclude=frozenset({11, 22})))
+
+
+def de_site(key, *fx):
+    return SimpleNamespace(pole_number=key, identifier=key, ims_id=0, fx_numbers=list(fx))
+
+
+@override_settings(OVRC_USERNAME="u", OVRC_PASSWORD="p")
+class DePowerOnOfflineTests(TestCase):
+    """Which DE sites the OvrC power-on marks offline (skipped before TeamViewer)."""
+
+    def power_on(self, sites, *, results=None, raises=None):
+        from services import ovrc_capture
+
+        def fake(fx_numbers, **kw):
+            self.assertTrue(kw.get("continue_on_error"))
+            if raises:
+                raise raises
+            return results
+
+        with mock.patch.object(ovrc_capture, "ensure_dcam_on_for_fxes", side_effect=fake):
+            return runner._power_on_all_de_sites(0, sites)
+
+    def test_a_failed_fx_marks_only_its_site_offline(self):
+        from services.ovrc_capture import OvrcDcamResult
+
+        ok, _changed, errors, offline = self.power_on(
+            [de_site("A", "FX1"), de_site("B", "FX2", "FX3")],
+            results=[
+                OvrcDcamResult("FX1", "already_on"),
+                OvrcDcamResult("FX2", "turned_on"),
+                OvrcDcamResult("FX3", "failed", "TimeoutException: "),
+            ],
+        )
+        self.assertEqual((ok, offline), (1, {"B"}))
+        self.assertIn("FX3: TimeoutException", errors[0])
+
+    def test_a_failed_ovrc_login_marks_nothing_offline(self):
+        ok, _changed, errors, offline = self.power_on(
+            [de_site("A", "FX1")], raises=RuntimeError("login page timed out")
+        )
+        self.assertEqual((ok, offline), (0, set()))
+        self.assertIn("RuntimeError: login page timed out", errors[0])
+
+
+class EnsureDcamContinueOnErrorTests(SimpleTestCase):
+    def run_fleet(self, **kw):
+        from services import ovrc_capture
+
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+
+        def one(fx):
+            if fx == "FX2":
+                raise TimeoutError("no WattBox")
+            return ovrc_capture.OvrcDcamResult(fx, "already_on")
+
+        client.ensure_dcam_system_on.side_effect = one
+        with mock.patch.object(ovrc_capture, "OvrcClient", return_value=client):
+            return ovrc_capture.ensure_dcam_on_for_fxes(["FX1", "FX2", "FX3"], "u", "p", **kw)
+
+    def test_one_dead_fx_does_not_stop_the_rest(self):
+        results = self.run_fleet(continue_on_error=True)
+        self.assertEqual([(r.fx_number, r.action) for r in results], [("FX1", "already_on"), ("FX2", "failed"), ("FX3", "already_on")])
+        self.assertIn("TimeoutError: no WattBox", results[1].detail)
+
+    def test_default_still_raises_for_other_callers(self):
+        with self.assertRaises(TimeoutError):
+            self.run_fleet()

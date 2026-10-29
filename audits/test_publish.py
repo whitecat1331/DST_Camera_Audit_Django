@@ -113,6 +113,17 @@ class PublishRunsTests(TestCase):
             self.publish()
         self.assertFalse(AuditJob.objects.using(SHARED).exists())
 
+    def test_skipped_offline_site_is_finished_and_published(self):
+        skipped = AuditJob.objects.create(
+            pole_number="600004", target_host="lti", device_type=AuditJob.DeviceType.DST_SITE,
+            status=AuditJob.Status.SKIPPED, parent_job=self.run,
+        )
+        report = self.publish()
+        self.assertEqual(report.jobs, 3)
+        self.assertEqual(
+            AuditJob.objects.using(SHARED).get(public_id=skipped.public_id).status, AuditJob.Status.SKIPPED
+        )
+
     def test_non_dst_run_is_refused(self):
         with self.assertRaisesMessage(PublishError, "Not DST audit runs"):
             self.publish(self.site.pk)

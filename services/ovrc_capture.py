@@ -888,8 +888,13 @@ def ensure_dcam_on_for_fxes(
     base_url: str = DEFAULT_BASE_URL,
     headless: bool = True,
     on_progress: ProgressFn | None = None,
+    continue_on_error: bool = False,
 ) -> list[OvrcDcamResult]:
-    """Login once and ensure DCAM System is ON for each FX (no-op if already on)."""
+    """Login once and ensure DCAM System is ON for each FX (no-op if already on).
+
+    continue_on_error: one FX failing gives an action="failed" result instead of
+    aborting the rest. The login itself failing still raises.
+    """
     progress = on_progress or _noop_progress
     results: list[OvrcDcamResult] = []
     seen: set[str] = set()
@@ -911,7 +916,16 @@ def ensure_dcam_on_for_fxes(
         on_progress=progress,
     ) as client:
         for fx in ordered:
-            results.append(client.ensure_dcam_system_on(fx))
+            if not continue_on_error:
+                results.append(client.ensure_dcam_system_on(fx))
+                continue
+            try:
+                results.append(client.ensure_dcam_system_on(fx))
+            except Exception as exc:  # noqa: BLE001 — one dead WattBox must not stop the fleet
+                detail = f"{type(exc).__name__}: {exc}".strip()[:200]
+                logger.warning("[OVRC] fx=%s dcam failed: %s", fx, detail)
+                progress(f"OvrC {fx} DCAM: failed")
+                results.append(OvrcDcamResult(fx_number=fx, action="failed", detail=detail))
     return results
 
 
