@@ -6,16 +6,21 @@ shared DB (publish) need it off. The user connects the VPN beforehand (MFA);
 DST never connects it, it only releases it once, between the LTI and DE halves.
 
 The WatchGuard client is OpenVPN underneath: the tray app (wgsslvpnc.exe, the
-user's process) drives openvpn.exe (run by the wgsslvpnsrc service) through
-OpenVPN's management interface on 127.0.0.1. The interface takes one client
-at a time, so the tray app is closed first; then ``signal SIGTERM`` ends the
-tunnel. Neither step needs admin or MFA (Phase 0 of
-plans/in-progress-plans/UNATTENDED_NIGHTLY_DST_AUDIT.md).
+user's process) drives openvpn.exe (run by the wgsslvpnsrc service). On connect
+the tray has the service add WFP "LAN filters" and restart the DNS Client; only
+the tray's own disconnect/exit removes them. So the release asks the tray to
+exit through its own ``Global\\wgsslvpnc_ExitEvent`` (it closes the tunnel and
+cleans up, then stays open showing "Connection Closed"). Force-closing the tray
+leaves those filters behind and the laptop has no network until a reboot
+(issue I4 of plans/in-progress-plans/UNATTENDED_NIGHTLY_DST_AUDIT.md), so DST
+never does that. ``signal SIGTERM`` on OpenVPN's management interface is only
+used when the tray isn't running. Neither needs admin or MFA.
 """
 
 from __future__ import annotations
 
 import logging
+import ctypes
 import socket
 import subprocess
 import time
@@ -28,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 TRAY_EXE = "wgsslvpnc.exe"
 OPENVPN_EXE = "openvpn.exe"
+TRAY_EXIT_EVENT = r"Global\wgsslvpnc_ExitEvent"
+EVENT_MODIFY_STATE = 0x0002
+TUNNEL_GONE_SECONDS = 30.0
 CREATE_NO_WINDOW = 0x08000000
 
 
@@ -59,6 +67,16 @@ def any_reachable(targets: Iterable[tuple[str, int]], timeout: float = 4.0) -> b
 def camera_network_up(cbw_hosts: Iterable[str], timeout: float = 4.0) -> bool:
     """The LTI camera network answers (a CBW web port on any of these hosts)."""
     return any_reachable([(h, 80) for h in cbw_hosts], timeout)
+
+
+def internet_ok(timeout: float = 4.0) -> bool:
+    """DNS resolves and a public HTTPS host answers (the Wi-Fi is really usable)."""
+    host = getattr(settings, "DST_NET_CHECK_HOST", "www.google.com")
+    try:
+        socket.getaddrinfo(host, 443)
+    except OSError:
+        return False
+    return tcp_ok(host, 443, timeout)
 
 
 def shared_db_target() -> tuple[str, int]:
@@ -164,10 +182,35 @@ def send_sigterm(port: int, *, connect_seconds: float = 15.0) -> str:
     return line
 
 
+def signal_tray_exit() -> bool:
+    """Ask the WatchGuard tray app to disconnect through its own exit event."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenEventW.restype = ctypes.c_void_p
+    handle = k32.OpenEventW(EVENT_MODIFY_STATE, False, TRAY_EXIT_EVENT)
+    if not handle:
+        logger.warning("[NET] tray exit event not found (error %s)", ctypes.get_last_error())
+        return False
+    try:
+        return bool(k32.SetEvent(ctypes.c_void_p(handle)))
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(handle))
+
+
 @dataclass
 class ReleaseResult:
     released: bool
     detail: str
+    network_ok: bool = True
+
+
+def _wait(check: Callable[[], bool], seconds: float, poll: float = 2.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if check():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
 
 
 def release_vpn(
@@ -175,26 +218,35 @@ def release_vpn(
     wait_seconds: float = 60.0,
     progress: Callable[[str], None] = lambda msg: None,
 ) -> ReleaseResult:
-    """Drop the user's WatchGuard VPN, then wait until the shared DB answers.
+    """Drop the user's WatchGuard VPN, then check the laptop still has internet.
 
-    Never raises; the result says whether the VPN is gone and why not.
+    Never raises and never force-closes the tray app. The result says whether
+    the VPN is gone, and network_ok whether DNS + internet work afterwards.
     """
     if not vpn_up():
         return ReleaseResult(True, "VPN was not connected")
     progress("Releasing the camera VPN…")
-    _run(["taskkill", "/F", "/IM", TRAY_EXE])  # frees the one management client slot
-    port = management_port()
-    try:
-        reply = send_sigterm(port)
-    except ReleaseError as exc:
-        logger.warning("[NET] VPN release failed: %s", exc)
-        return ReleaseResult(False, str(exc))
-    logger.info("[NET] VPN release on port %s: %s", port, reply)
-    deadline = time.monotonic() + wait_seconds
-    while time.monotonic() < deadline:
-        if not vpn_up() and direct_up(timeout=3):
-            return ReleaseResult(True, "VPN released")
-        time.sleep(2)
-    if vpn_up():
-        return ReleaseResult(False, "VPN still connected after SIGTERM")
-    return ReleaseResult(True, "VPN released; shared DB not answering yet")
+    if _pids(TRAY_EXE):
+        if not signal_tray_exit():
+            return ReleaseResult(False, "the WatchGuard app did not accept the disconnect request")
+        how = "WatchGuard app disconnect"
+    else:
+        try:
+            how = send_sigterm(management_port())
+        except ReleaseError as exc:
+            logger.warning("[NET] VPN release failed: %s", exc)
+            return ReleaseResult(False, str(exc))
+    logger.info("[NET] VPN release requested: %s", how)
+    if not _wait(lambda: not vpn_up(), TUNNEL_GONE_SECONDS):
+        return ReleaseResult(False, f"VPN still connected {TUNNEL_GONE_SECONDS:.0f} s after the disconnect request")
+    progress("VPN released; checking the internet…")
+    if not _wait(internet_ok, wait_seconds):
+        logger.warning("[NET] no internet %ss after the VPN release", wait_seconds)
+        return ReleaseResult(
+            True,
+            "VPN released, but the laptop has no internet (DNS/HTTPS fail)",
+            network_ok=False,
+        )
+    if not direct_up(timeout=3):
+        return ReleaseResult(True, "VPN released; internet OK; shared DB not answering yet")
+    return ReleaseResult(True, "VPN released; internet OK")

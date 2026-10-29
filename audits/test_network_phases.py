@@ -78,29 +78,54 @@ class ReleaseVpnTests(SimpleTestCase):
         with mock.patch.object(netstate, "vpn_up", return_value=False):
             self.assertEqual(netstate.release_vpn(), netstate.ReleaseResult(True, "VPN was not connected"))
 
-    def test_closes_tray_app_then_sigterm(self):
-        up = iter([True, False])
+    def release(self, *, tray=True, exit_ok=True, up=(True, False), internet=True, sigterm=None):
+        ups = iter(up)
         with (
-            mock.patch.object(netstate, "vpn_up", side_effect=lambda: next(up)),
+            mock.patch.object(netstate, "vpn_up", side_effect=lambda: next(ups, up[-1])),
+            mock.patch.object(netstate, "_pids", return_value=[22004] if tray else []),
             mock.patch.object(netstate, "_run", return_value="") as run,
+            mock.patch.object(netstate, "signal_tray_exit", return_value=exit_ok) as tray_exit,
             mock.patch.object(netstate, "management_port", return_value=1337),
-            mock.patch.object(netstate, "send_sigterm", return_value="SUCCESS") as sig,
+            mock.patch.object(netstate, "send_sigterm", side_effect=sigterm or (lambda port: "SUCCESS")) as sig,
+            mock.patch.object(netstate, "internet_ok", return_value=internet),
             mock.patch.object(netstate, "direct_up", return_value=True),
+            mock.patch("time.sleep"),
+            mock.patch.object(netstate, "TUNNEL_GONE_SECONDS", 0),
         ):
-            result = netstate.release_vpn()
+            result = netstate.release_vpn(wait_seconds=0)
+        return result, run, tray_exit, sig
+
+    def test_asks_the_tray_app_to_disconnect_and_never_force_closes_it(self):
+        result, run, tray_exit, sig = self.release()
+        self.assertEqual(result, netstate.ReleaseResult(True, "VPN released; internet OK"))
+        tray_exit.assert_called_once_with()
+        sig.assert_not_called()
+        self.assertFalse(any("taskkill" in c.args[0] for c in run.call_args_list))
+
+    def test_tray_refuses_is_reported_and_nothing_else_is_tried(self):
+        result, run, _, sig = self.release(exit_ok=False)
+        self.assertFalse(result.released)
+        sig.assert_not_called()
+        self.assertFalse(any("taskkill" in c.args[0] for c in run.call_args_list))
+
+    def test_no_tray_app_falls_back_to_sigterm(self):
+        result, _, tray_exit, sig = self.release(tray=False)
         self.assertTrue(result.released)
-        self.assertEqual(run.call_args_list[0].args[0], ["taskkill", "/F", "/IM", "wgsslvpnc.exe"])
+        tray_exit.assert_not_called()
         sig.assert_called_once_with(1337)
 
     def test_refused_sigterm_is_reported_not_raised(self):
-        with (
-            mock.patch.object(netstate, "vpn_up", return_value=True),
-            mock.patch.object(netstate, "_run", return_value=""),
-            mock.patch.object(netstate, "management_port", return_value=1337),
-            mock.patch.object(netstate, "send_sigterm", side_effect=netstate.ReleaseError("nope")),
-        ):
-            result = netstate.release_vpn()
+        result, *_ = self.release(tray=False, sigterm=netstate.ReleaseError("nope"))
         self.assertEqual(result, netstate.ReleaseResult(False, "nope"))
+
+    def test_tunnel_still_up_is_not_released(self):
+        result, *_ = self.release(up=(True,))
+        self.assertFalse(result.released)
+
+    def test_no_internet_after_release_is_flagged(self):
+        result, *_ = self.release(internet=False)
+        self.assertTrue(result.released)
+        self.assertFalse(result.network_ok)
 
 
 def site(pk, key, kind):
@@ -125,7 +150,7 @@ class NetworkPhaseOrderTests(TestCase):
         self.sites = [site(1, "D1", "de"), site(2, "L1", "lti"), site(3, "D2", "de"), site(4, "L2", "lti")]
         self.events: list[str] = []
 
-    def run_audit(self, *, camera_up=True, released=True, publish_round=""):
+    def run_audit(self, *, camera_up=True, released=True, network_ok=True, publish_round=""):
         runner.write_dst_selection(self.parent.pk, [s.pk for s in self.sites], publish_round=publish_round)
 
         def capture(child_pk, inst, child_dir, **kw):
@@ -136,7 +161,9 @@ class NetworkPhaseOrderTests(TestCase):
 
         def release(job_id):
             self.events.append("release")
-            return [] if released else ["VPN release failed (x); DE captures ran on the VPN"]
+            if not network_ok:
+                return ["no internet; DE skipped"], False
+            return ([] if released else ["VPN release failed (x); DE captures ran on the VPN"]), True
 
         def lti_power(inst):
             self.events.append(f"relay {inst.key}")
@@ -182,6 +209,12 @@ class NetworkPhaseOrderTests(TestCase):
         errors, ok = self.run_audit(released=False)
         self.assertEqual(ok, 4)
         self.assertEqual(errors, ["VPN release failed (x); DE captures ran on the VPN"])
+
+    def test_no_internet_after_release_skips_de(self):
+        errors, ok = self.run_audit(network_ok=False)
+        self.assertEqual(ok, 2)
+        self.assertEqual(errors, ["no internet; DE skipped"])
+        self.assertEqual(self.events[2:], ["capture L1", "capture L2", "release"])
 
     def test_lti_only_run_that_publishes_releases_at_the_end(self):
         self.sites = [s for s in self.sites if s.kind == "lti"]

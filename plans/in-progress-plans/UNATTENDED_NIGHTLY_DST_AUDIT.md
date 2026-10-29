@@ -175,6 +175,18 @@ The review instance learns about a publish without a refresh. Publish writes to 
 
   Fix: the flag is removed, so the strict order is the only order. `_run_dst_audit` is now: LTI relays → boot wait → every LTI capture → release the VPN → OvrC DCAM on for DE → boot wait → every DE capture → OvrC time pass. It's split into `_dst_power_on_lti`, `_dst_settle`, `_dst_capture_half` and `_dst_capture_site`. The unit test asserts the exact event sequence and the child job order (L1, L2, D1, D2). Suite 128 OK. **Resolved when** the user's rerun shows that sequence live.
 
+- **I4 — open, blocks Phase 1/3: the VPN release left the laptop with no network until a reboot** (scheduled run #2 / job 183, 2026-10-28, home Wi-Fi NETGEAR06 192.168.1.x). The LTI half was correct: 210073, 220008 and 220054 all captured on the VPN. Then:
+  - 19:10:42: DST force-closed `wgsslvpnc.exe`, `SIGTERM` succeeded, and the TAP adapter disconnected.
+  - From 19:11:38: Wi-Fi kept re-associating but stayed "Connected, IPV4 (Local)". At 19:11:54 WLAN AutoConfig reported limited connectivity and reset the adapter.
+  - 19:12:00: the DE OvrC power-on failed with `net::ERR_NAME_NOT_RESOLVED`.
+  - The user cancelled at 19:16 and rebooted at 19:17:36, which fixed it.
+
+  Likely cause, from strings in the binaries: the tray app has the `wgsslvpnsrc` service install a WFP **LAN filter** (`ADD_LAN_FILTER`) and restart the DNS Client on connect. It undoes both (`REMOVE_LAN_FILTER`, `RESTART_DNS_CLIENT`) only on its own disconnect or exit. Force-closing it skipped that cleanup, so the service's WFP filters stayed in place until the reboot restarted the service.
+
+  Phase 0 didn't catch this because it ran on office Wi-Fi (10.100.30.0/24) and only checked that Supabase, :8443 and TeamViewer answered.
+
+  Candidate fix, not verified: set the tray's own `Global\wgsslvpnc_ExitEvent` (a graceful exit that should run its cleanup) instead of `taskkill /F`. After the release, check the Wi-Fi gateway and DNS, and stop with a clear message if they're broken. Needs a live test with the user on the VPN. **Resolved when** a release on home Wi-Fi leaves DNS and the internet working with no reboot.
+
 ## Open questions
 - ~~Q1 — MFA~~ — **resolved 2026-10-28 (user):** yes, on the initial connection. The user pre-connects the VPN, and DST never connects it.
 - ~~Q3 — schedule~~ — **resolved 2026-10-28 (user):** a one-time fire at a set time on the device's local clock.
@@ -214,6 +226,7 @@ Phase 1 as built:
 - [ ] Phase 1 — network detector + VPN half → release → direct half, live small run with no manual action between halves, accepted (implemented; unit tests pass; live run pending)
 - [x] Phase 2 — folded into Phase 1 (Phase 0: DST can release the VPN)
 - [ ] I2 — stale TeamViewer window guard, verified in the Phase 1 live run
+- [ ] I4 — VPN release must not break Wi-Fi (graceful tray exit + post-release network check), verified live on home Wi-Fi
 - [ ] Phase 3 — one-time local-time schedule via Task Scheduler, fires unattended, accepted (implemented ahead of Phase 1 by user direction; fire path checked live; real scheduled run pending)
 - [ ] Phase 4 — preflight + morning report, accepted
 - [ ] Phase 5 — review page picks up newly published results live, accepted

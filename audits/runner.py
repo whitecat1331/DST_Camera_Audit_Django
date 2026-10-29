@@ -2214,16 +2214,24 @@ def _dst_camera_network_up(lti_sites: list) -> bool:
     return camera_network_up(hosts)
 
 
-def _dst_release_vpn(job_id: int) -> list[str]:
-    """Release the user's camera VPN before the DE half; returns warnings."""
+def _dst_release_vpn(job_id: int) -> tuple[list[str], bool]:
+    """Release the user's camera VPN before the DE half; returns (warnings, network_ok)."""
     from services.netstate import release_vpn
 
     result = release_vpn(progress=lambda msg: _set_progress(job_id, msg))
-    logger.info("[DST] Job %s VPN release: %s (%s)", job_id, result.released, result.detail)
+    logger.info(
+        "[DST] Job %s VPN release: %s network_ok=%s (%s)",
+        job_id,
+        result.released,
+        result.network_ok,
+        result.detail,
+    )
     _set_progress(job_id, f"Network: {result.detail}")
+    if not result.network_ok:
+        return [f"{result.detail}; DE skipped. Reconnect Wi-Fi or reopen the WatchGuard app"], False
     if result.released:
-        return []
-    return [f"VPN release failed ({result.detail}); DE captures ran on the VPN"]
+        return [], True
+    return [f"VPN release failed ({result.detail}); DE captures ran on the VPN"], True
 
 
 class _DstRun:
@@ -2594,7 +2602,10 @@ def _run_dst_audit(
     # ── Release: the order never goes back to the VPN ───────────────────
     if de_sites or read_dst_publish_round(job_id):
         _raise_if_cancelled(job_id)
-        run.errors.extend(_dst_release_vpn(job_id))
+        warnings, network_ok = _dst_release_vpn(job_id)
+        run.errors.extend(warnings)
+        if not network_ok:
+            de_sites = []  # no internet: TeamViewer/OvrC can't work, don't burn the lanes
 
     # ── DE half (direct) ─────────────────────────────────────────────────
     if de_sites:
