@@ -157,5 +157,17 @@ class ReviewRoundTests(TestCase):
         self.assertEqual(self.client.get(f"/audits/review/{self.round.pk}/?drift=1").status_code, 200)
         self.assertEqual(self.client.get(f"/audits/review/{self.round.pk + 999}/").status_code, 404)
 
+    def test_expected_time_shows_even_without_a_device_clock(self):
+        grabbed = datetime(2026, 10, 29, 19, 44, 7, tzinfo=dt_timezone.utc)
+        job = self.site("255037", "de", finished=timezone.now(), site_tz="America/Chicago")
+        AuditScreenshot.objects.create(job=job, label="tv_overview", image=f"audits/{job.pk}/tv.png", captured_at=grabbed)
+        AuditScreenshot.objects.create(job=job, label="de_tv", image=f"audits/{job.pk}/de_tv.png", captured_at=grabbed)
+        self.client.force_login(get_user_model().objects.create_user("viewer2"))
+        body = self.client.get(f"/audits/review/{self.round.pk}/").content.decode()
+        no_clock = body.index("No device clock in this capture")
+        self.assertIn("Oct 29, 02:44:07 PM CDT", body[no_clock : no_clock + 200])
+        # An unread clock still gets the expected time and an Unread badge, not a fail.
+        self.assertGreaterEqual(body.count("Oct 29, 02:44:07 PM CDT"), 2)
+
     def test_requires_sign_in(self):
         self.assertEqual(self.client.get("/audits/review/").status_code, 302)

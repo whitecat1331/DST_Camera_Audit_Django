@@ -161,7 +161,9 @@
         </td>
         <td class="review-check"><span class="check-badge check-{{ c.verdict }}">{% if c.verdict == "pass" %}Pass{% elif c.verdict == "fail" %}Fail{% else %}Unread{% endif %}</span></td>
         {% else %}
-        <td colspan="4" class="muted">No device clock in this capture</td>
+        <td class="muted">No device clock in this capture</td>
+        <td class="review-time">{{ c.expected_local|default:"—" }}</td>
+        <td colspan="2"></td>
         {% endif %}
         {% else %}
         <td colspan="6" class="muted">No captures</td>
