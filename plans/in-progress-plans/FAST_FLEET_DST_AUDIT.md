@@ -260,7 +260,47 @@ Acceptance:
   - No keystrokes land in DragonCam.
 - Unit tests for the password order and the fail-fast classification.
 
-### Phase 4 — Parallel DE sessions (gated, conditional)
+Result (2026-10-29): **accepted.**
+- **Spike** (`tmp/spike/de_lane_spike.py`, `tmp/spike/tv_status_spike.py`; FX1173 L1 and a nonexistent ID):
+  - the session window appears at 6.9 s (the old code waited a fixed 10 s);
+  - the session paints ~1 s later;
+  - clicking the lock clock shows the password prompt (frame diff 5.4);
+  - the desktop replaces the prompt ~1 s after Enter (diff 64.8).
+  - **Wrong connection password:** a "TeamViewer Authentication" window at 4.8 s (the old code waited 60 s).
+  - **Unreachable partner:** an in-window "Unable to connect" dialog at 2.5–10 s; Enter and Esc don't close it, its blue OK button does.
+- **Implemented** (`services/teamviewer_capture.py`):
+  - `_connect` polls for the session window, the Authentication window (next password) or the Unable-to-connect dialog (`PartnerOffline`, no further passwords). It also clears a dialog left by an earlier lane first; live, TeamViewer left a second one behind.
+  - `_wait_until_settled` replaces the fixed sleeps: two calm frames, with a visible reconnect card extending the wait to 40 s.
+  - `_login` types the remembered camera password first and stops at the unlock. When the wake click changes nothing and the first password changes nothing, it doesn't type a second one.
+  - The 40 backspaces are now one pyautogui call (4 s → 0.2 s).
+  - Password numbers per TeamViewer ID are kept in `tv_password_hints.json` (git-ignored, numbers only), seeded from the keeper CSV: 367 IDs, 213 on #1, 154 on #2.
+  - `services/password_hints.py` is shared with the CBW hints.
+- **Bug found and fixed: the reconnect-card check was a false positive on bright DragonCam photos.**
+  - Its "≥ 22 % bright pixels in the center" test fired on sunlit L2 photos, so good lanes failed after ~100 s. That's 244127 L2 in run 188 (re-checked) and 244127 / 266007 L2 in job 246.
+  - It now measures card **shape**: the share of center rows whose flat-white run has the same edges. Real frames ≤ 0.16, a synthetic card 0.67, threshold 0.35.
+- **F9 decided differently from Phase 1: an OvrC DCAM failure is now a warning, not a DE skip.**
+  - In job 246, FX1173's OvrC page timed out, so 255039 was skipped, yet its TeamViewer worked (spike + job 251). FX1173 is also run 188's empty `Message:` power-on failure.
+  - With an offline partner now failing in seconds, skipping on OvrC buys little and risks false skips. LTI's skip-on-power-on stays (same network path as the cameras).
+- **F10:** the DST status poll returns totals for every site from one aggregate, and rows for the newest 150 only (running first), with no screenshot lists. The page shows "latest N of M".
+- **Tests:** 166 OK.
+  - Thresholds checked against real frames (`audits/testdata/tv/`), including a bright-photo fixture against a card drawn over it.
+  - Login stops at unlock / tries the next / types one at most when already unlocked.
+  - Connect: refused → next password; offline → one launch, dialog cleared; leftover dialog cleared, not misread.
+  - Hints; status poll totals and bounded rows.
+- **Live, job 251** (VPN off; 244127, 255039, 266007, plus 266110 OvrC-only): 4/4 ok.
+  - **All 6 lanes 17.6–22.9 s** (was ~52 s); every DE site has 2 TeamViewer shots + its OvrC time; 266110 has OvrC only.
+  - Screenshots show the logged-in DragonCam desktop and overlay.
+- **Live, offline partner:** a nonexistent ID gave `PartnerOffline` in 2.7 s (was up to 140 s). A real lane straight after connected normally (leftover dialog cleared).
+- **Residual:** a session that is already unlocked (e.g. re-captured within minutes) still gets one password typed into the desktop. It was harmless live (no text field focused) and is down from two before.
+- **Projection for the full DE half:**
+  - 384 lanes × ~20 s ≈ 2.1 h;
+  - OvrC power-on ~8.5 s/FX × ~271 ≈ 40 min;
+  - OvrC times ≈ 25 min;
+  - **≈ 3.2 h**. With LTI 0.5–2 h, **the fleet run is ≈ 4–5.5 h, inside 8 h**.
+
+### Phase 4 — Parallel DE sessions (gated, conditional) — not needed for now (2026-10-29)
+Decision: Phase 3's measured lanes project the fleet run at ≈ 4–5.5 h, inside the 8 h budget. Revisit only if Phase 5 measures over budget. The next-biggest DE costs would then be the two serial OvrC passes (~65 min), ahead of TeamViewer concurrency.
+
 **Only if Phase 3's projected DE time across 231 lanes is still over budget.**
 
 Starts with a **spike**, a throwaway that answers 3 questions:
@@ -284,7 +324,7 @@ Acceptance:
 - The phase timings are recorded in this plan's Verification section.
 
 ## Status
-in progress — Phases 1 and 2 accepted 2026-10-29 (Phase 1's DE live checks are carried into Phase 3). Next: Phase 3 (DE lanes; needs the VPN off).
+in progress — Phases 1–3 accepted 2026-10-29; Phase 4 not needed on the projection. Next: Phase 5, the full-fleet timed run (needs the user to connect the VPN with MFA first, ~4–5.5 h).
 
 ## Checklist
 - [x] User decision F6: keeper CSV merge-imported 2026-10-29 (119 → 13 unmapped); the 13 get OvrC only; passwords stay in `.env`, and only a per-device index will be stored.
@@ -293,8 +333,8 @@ in progress — Phases 1 and 2 accepted 2026-10-29 (Phase 1's DE live checks are
 - [x] Phase 1 accepted for LTI (tests + live job 216); DE paths are verified live in Phase 3's acceptance
 - [x] Phase 2 implemented (2026-10-29)
 - [x] Phase 2 accepted (152 tests; live job 221: 3.4× on the capture half, RAM 53 %; job 242 password memory)
-- [ ] Phase 3 implemented
-- [ ] Phase 3 accepted (≤25 s online lane, ≤30 s offline lane, screenshots unchanged)
-- [ ] Phase 4 decision: needed? (based on Phase 3's measured DE projection)
-- [ ] Phase 4 spike + implementation + acceptance (if needed)
+- [x] Phase 3 implemented (2026-10-29)
+- [x] Phase 3 accepted (166 tests; live job 251: 6 lanes 17.6–22.9 s; offline partner 2.7 s; screenshots unchanged)
+- [x] Phase 4 decision: not needed on the projection (≈ 4–5.5 h); revisit if Phase 5 is over 8 h
+- [ ] Phase 4 spike + implementation + acceptance (only if Phase 5 is over budget)
 - [ ] Phase 5 accepted: full fleet under 8 h

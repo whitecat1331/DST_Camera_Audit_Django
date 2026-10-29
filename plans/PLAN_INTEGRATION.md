@@ -5,7 +5,7 @@ Derived index: order and why only. Each plan file owns its own scope and status;
 Priority axis: workflow & skills → QOL & fixes → features by impact. A hard `Blocked by` overrides it.
 
 ## In flight
-- `plans/in-progress-plans/FAST_FLEET_DST_AUDIT.md`: Phases 1–2 accepted (offline skip, parallel LTI); Phase 3 (faster DE lanes) next. It speeds up UNATTENDED_NIGHTLY_DST_AUDIT's halves without changing their order.
+- `plans/in-progress-plans/FAST_FLEET_DST_AUDIT.md`: Phases 1–3 accepted (offline skip, parallel LTI, ~20 s DE lanes); Phase 5 full-fleet timed run next. It speeds up UNATTENDED_NIGHTLY_DST_AUDIT's halves without changing their order.
 - `plans/in-progress-plans/UNATTENDED_NIGHTLY_DST_AUDIT.md`: Phase 0 accepted; Phase 1 (Phase 2 folded) in implementation. The laptop runs remote over the VPN.
 - `plans/in-progress-plans/DST_AUDIT_SHARED_REVIEW.md`: 13/16. Phase 6 is built and deployed, waiting on the user's acceptance. Then the final real-audit-day acceptance.
 
@@ -24,3 +24,4 @@ These sit in a top-level `in-progress-plans/` instead of `plans/in-progress-plan
 - 2026-10-28: added FAST_FLEET_DST_AUDIT (new, Stage: plan) after run 196 projected over a day for the full fleet.
 - 2026-10-29: FAST_FLEET_DST_AUDIT promoted to in-progress (user: "start implementation"); Phase 1 accepted for LTI.
 - 2026-10-29: FAST_FLEET_DST_AUDIT Phase 2 accepted.
+- 2026-10-29: FAST_FLEET_DST_AUDIT Phase 3 accepted; Phase 4 not needed on the projection.
