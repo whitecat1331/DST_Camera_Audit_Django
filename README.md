@@ -20,7 +20,7 @@ Django web app for **ASE installation camera audits** at Blue Line Solutions. Op
 
 Progress bars (4 phases) and cancel are on the DST Audit page; terminal logs use `[DST]` / `[AUDIT]`.
 
-**Per-device time check.** Captures run concurrently and out of order, so each one stores when it was grabbed and the clock the device showed: CBW from the Date/Time page text, VNC and DragonCam (Ubuntu top-bar clock) read off the image with Windows' built-in OCR (`DEVICE_CLOCK_OCR=0` turns OCR off), OvrC from its dashboard. Each site job stores its own timezone (`site_tz`: the agency list for split states like FL/TN, else GPS when valid for the state, else the state). The review page (`/audits/review/`) shows one line per capture: captured (Eastern), device time, what it should be in the site's zone, drift, and Pass (within 2 min) / Fail / Unread.
+**Per-device time check.** Captures run concurrently and out of order, so each one stores when it was grabbed and the clock the device showed: CBW from the Date/Time page text, VNC and DragonCam (Ubuntu top-bar clock) read off the image with Windows' built-in OCR (`DEVICE_CLOCK_OCR=0` turns OCR off), OvrC from its dashboard. A VNC capture is stamped when the frame was requested, not when the PNG was written: the screen arrives over the VPN several seconds later, so the file time would read every lane 4–9 s behind. Each site job stores its own timezone (`site_tz`: the agency list for split states like FL/TN, else GPS when valid for the state, else the state). The review page (`/audits/review/`) shows one line per capture: captured (Eastern), device time, what it should be in the site's zone, drift, and Pass (within 2 min) / Fail / Unread.
 
 Chrome is required for CBW and OvrC captures. TeamViewer must be installed for DragonEye (`TEAMVIEWER_PATH` optional).
 
@@ -121,6 +121,39 @@ HTTPS with a self-signed cert instead, set `IMS_TLS_VERIFY=false` in `.env`.
 | `readonly+` | View dashboard, map, audits |
 | `technician+` | Start audit jobs |
 | `admin+` | Sync inventory from IMS |
+
+### CBW firmware report (CSV)
+
+Export every CBW (ControlByWeb X-410 relay controller) with its firmware
+version plus the full IMS installation record for the pole it lives on:
+
+```powershell
+.\\.venv\\Scripts\\python.exe manage.py cbw_firmware_report --output cbw_firmware_report.csv
+```
+
+- Enumerates active installations that carry a CBW (`device_type='cbw'`) plus
+  LTI/ALPR/ASE poles with no CBW device row. Probes each CBW at its
+  pole-derived `10.x.y.177` address (same as `services/cbw_relays.py`).
+- Reads firmware live from each CBW: `GET /overview.json` →
+  `x spc1_firmRev` / `x spc1_partNum` (uses `CBW_USERNAME`/`CBW_PASSWORDS`).
+  Works on every firmware generation (2.x → 3.x); `firmware.json` (v3.12+) is
+  tried as a fallback only.
+- One CSV row per CBW: `cbw_ip`, `cbw_firmware`, `cbw_part_number`,
+  `cbw_serial`, `cbw_source`, `cbw_status`, `cbw_error`, then the full IMS
+  identity/location fields (`identifier`, `name`, `pole_number`, `agency`,
+  `location`, `street`, `county`, `state`, `direction`, `site_type`,
+  `gps_lat`, `gps_lon`, …).
+
+`cbw_status` is `ok` (firmware captured), `no_firmware` (CBW reachable but no
+firmware field exposed — rare), `unreachable`, `auth_failed`, or `no_cbw`.
+
+Flags: `--output PATH`, `--limit N` (probe at most N CBWs),
+`--poles A,B,C` (poles only), `--concurrency N` (parallel probes, default 8;
+`1` = serial). Unreachable / bad-cred CBWs still emit a row rather than being
+dropped.
+
+Run `python manage.py sync_installations` first so the installation fields are
+current.
 
 ## Routes
 
