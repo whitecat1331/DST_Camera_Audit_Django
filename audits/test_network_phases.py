@@ -264,6 +264,26 @@ class PublishAfterRunTests(TestCase):
         self.assertEqual(job.progress_message, "Publish held: shared DB not reachable")
         self.assertIn("publish run #7", job.error_message)
 
+    def test_run_with_no_round_publishes_to_the_dated_default(self):
+        from audits import publish
+
+        sites = [site(5, "L9", "lti")]
+        with (
+            mock.patch.object(runner, "_active_dst_installations", return_value=sites),
+            mock.patch.object(publish, "shared_configured", return_value=True),
+            override_settings(DST_ROLE="capture"),
+        ):
+            job, _ = runner.create_dst_audit_job(
+                self.user, scope="all", state="", agency="", installation_ids=[5]
+            )
+            typed, _ = runner.create_dst_audit_job(
+                self.user, scope="all", state="", agency="", installation_ids=[5], publish_round="R2"
+            )
+        self.assertRegex(runner.read_dst_publish_round(job.pk), r"^DST audit \d{4}-\d{2}-\d{2}$")
+        self.assertEqual(runner.read_dst_publish_round(typed.pk), "R2")
+        with mock.patch.object(publish, "shared_configured", return_value=False):
+            self.assertEqual(runner.default_publish_round(), "")  # can't publish here → no round
+
     def test_start_request_validates_the_round(self):
         runner.write_dst_selection(99, [1], publish_round="R1")
         self.assertEqual(runner.read_dst_publish_round(99), "R1")

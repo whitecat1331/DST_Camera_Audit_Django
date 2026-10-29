@@ -98,7 +98,7 @@
   {% if can_publish %}
   <div class="dst-actions">
     <input type="text" id="dst-start-round" list="dst-publish-rounds" maxlength="128"
-      placeholder="Publish to round when done (optional)" aria-label="Publish the run into this round when it finishes">
+      placeholder="Publish to round (default: DST audit {{ default_round_date }})" aria-label="Publish the run into this round when it finishes; empty publishes to DST audit and the run date">
   </div>
   {% if can_schedule %}
   <div class="dst-actions dst-schedule-actions">
@@ -118,7 +118,7 @@
       <tr data-id="{{ s.pk }}">
         <td>{{ s.local_label }}</td>
         <td>{{ s.site_count }}</td>
-        <td>{{ s.publish_round|default:"—" }}</td>
+        <td>{{ s.publish_round|default:"DST audit (run date)" }}</td>
         <td>
           <span class="badge status-{% if s.status == 'done' %}succeeded{% elif s.status == 'scheduled' %}pending{% else %}{{ s.status }}{% endif %}">{{ s.get_status_display }}</span>
           {% if s.message %}<span class="muted">{{ s.message }}</span>{% endif %}

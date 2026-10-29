@@ -2699,8 +2699,24 @@ def create_dst_audit_job(
         progress_message=f"Queued — {len(sites)} site(s)",
     )
     # Only persist IDs that survived eligibility checks.
-    write_dst_selection(job.pk, [inst.pk for inst in sites], publish_round=publish_round)
+    write_dst_selection(
+        job.pk, [inst.pk for inst in sites], publish_round=publish_round or default_publish_round()
+    )
     return job, sites
+
+
+def default_publish_round() -> str:
+    """Round a run publishes into when none was typed: `DST audit <local date>`.
+
+    Empty when this install can't publish (not the capture laptop, no shared DB).
+    """
+    from audits.publish import shared_configured
+
+    if getattr(settings, "DST_ROLE", "") != "capture" or not shared_configured():
+        return ""
+    from datetime import datetime
+
+    return f"DST audit {datetime.now().astimezone():%Y-%m-%d}"  # the laptop clock
 
 
 def mirror_db_cancel(job_id: int, stop: threading.Event, interval: float = 3.0) -> None:

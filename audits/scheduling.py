@@ -137,8 +137,9 @@ def run_schedule(schedule_id: int) -> ScheduledAudit:
     except ValueError as exc:
         return finish(ScheduledAudit.Status.FAILED, f"Not started: {exc}")
     sched.job = job
+    sched.publish_round = runner.read_dst_publish_round(job.pk)  # the default when none was typed
     sched.message = f"Running DST audit #{job.pk} ({len(sites)} site(s))"
-    sched.save(update_fields=["job", "message"])
+    sched.save(update_fields=["job", "publish_round", "message"])
     logger.info("[SCHED] #%s fired: job=%s sites=%s", sched.pk, job.pk, len(sites))
 
     with runner._cancel_lock:
