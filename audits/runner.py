@@ -1975,17 +1975,18 @@ def _power_on_de_site(inst) -> tuple[str, str | None, bool]:
 def _power_on_all_de_sites(
     job_id: int,
     de_sites: list,
-) -> tuple[int, bool, list[str], set[str]]:
+) -> tuple[int, bool, list[str]]:
     """Phase 1 DE: one OvrC login, DCAM ON for every selected FX.
 
-    Returns (power_ok_count, any_turned_on, errors, offline_site_keys). A site is
-    offline when OvrC gave no result for one of its FX. When the OvrC call itself
-    fails, no site is marked offline: a broken login says nothing about the cameras.
+    Returns (power_ok_count, any_turned_on, errors). An FX that fails in OvrC is a
+    warning, not a skip: OvrC's page timing out says nothing certain about the
+    camera (FX1173 times out in OvrC every run, yet its TeamViewer answers), and an
+    offline TeamViewer partner now fails in ~10 s anyway.
     """
     from services.ovrc_capture import ensure_dcam_on_for_fxes
 
     if not de_sites:
-        return 0, False, [], set()
+        return 0, False, []
 
     ovrc_user = (getattr(settings, "OVRC_USERNAME", "") or "").strip()
     ovrc_pass = (getattr(settings, "OVRC_PASSWORD", "") or "").strip()
@@ -1994,7 +1995,7 @@ def _power_on_all_de_sites(
             f"power-on {_dst_site_key(inst)}: OVRC_USERNAME / OVRC_PASSWORD not configured"
             for inst in de_sites
         ]
-        return 0, False, errs, set()
+        return 0, False, errs
 
     # Preserve site → FX so we can attribute results / failures.
     site_fx: list[tuple[object, str, list[str]]] = []
@@ -2025,7 +2026,7 @@ def _power_on_all_de_sites(
 
     if not unique_fx:
         errs = [f"power-on {key}: no FX serials" for _inst, key, fx in site_fx]
-        return 0, False, errs, set()
+        return 0, False, errs
 
     try:
         results = ensure_dcam_on_for_fxes(
@@ -2047,14 +2048,12 @@ def _power_on_all_de_sites(
             0,
             False,
             [f"power-on DE fleet: {type(exc).__name__}: {exc}"],
-            set(),
         )
 
     by_fx = {(r.fx_number or "").strip().upper(): r for r in results}
     power_ok = 0
     any_turned_on = False
     errors: list[str] = []
-    offline: set[str] = set()
     for _inst, key, fx_list in site_fx:
         if not fx_list:
             errors.append(f"power-on {key}: no FX serials")
@@ -2062,13 +2061,11 @@ def _power_on_all_de_sites(
         missing = [fx for fx in fx_list if fx not in by_fx]
         if missing:
             errors.append(f"power-on {key}: no DCAM result for {', '.join(missing)}")
-            offline.add(key)
             continue
         dead = [fx for fx in fx_list if by_fx[fx].action == "failed"]
         if dead:
             detail = "; ".join(f"{fx}: {by_fx[fx].detail}" for fx in dead)
             errors.append(f"power-on {key}: OvrC DCAM failed ({detail})")
-            offline.add(key)
             continue
         bits = [f"{fx}:{by_fx[fx].action}" for fx in fx_list]
         changed = any((by_fx[fx].action or "") == "turned_on" for fx in fx_list)
@@ -2081,7 +2078,7 @@ def _power_on_all_de_sites(
             key,
             ", ".join(bits),
         )
-    return power_ok, any_turned_on, errors, offline
+    return power_ok, any_turned_on, errors
 
 
 def _run_dst_site_capture(
@@ -2775,8 +2772,7 @@ def _run_dst_audit(
     if de_sites:
         _raise_if_cancelled(job_id)
         _set_progress(job_id, f"[direct] DE 1/4: powering on {len(de_sites)} site(s) (OvrC)…")
-        de_ok, de_changed, de_errs, de_offline = _power_on_all_de_sites(job_id, de_sites)
-        run.offline.update(dict.fromkeys(de_offline, "offline: OvrC power-on failed"))
+        de_ok, de_changed, de_errs = _power_on_all_de_sites(job_id, de_sites)
         run.power_ok += de_ok
         for err in de_errs:
             run.errors.append(err)

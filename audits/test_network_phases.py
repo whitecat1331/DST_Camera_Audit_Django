@@ -187,7 +187,7 @@ class NetworkPhaseOrderTests(TestCase):
         def de_power(job_id, sites):
             self.events.append("ovrc dcam on")
             dead = {s.key for s in sites if s.key in de_dead}
-            return len(sites) - len(dead), False, [f"power-on {k}: OvrC DCAM failed" for k in sorted(dead)], dead
+            return len(sites) - len(dead), False, [f"power-on {k}: OvrC DCAM failed" for k in sorted(dead)]
 
         def ovrc_times(job_id, assignments, fleet_dir):
             self.events.append("ovrc " + ",".join(key for _pk, key, _fx, _dir in assignments))
@@ -275,12 +275,13 @@ class NetworkPhaseOrderTests(TestCase):
         self.assertIn("capture L2", self.events)
         self.assertEqual((ok, errors), (4, []))
 
-    def test_de_site_whose_ovrc_power_on_failed_is_skipped_and_gets_no_ovrc_time(self):
+    def test_de_site_whose_ovrc_power_on_failed_is_still_tried(self):
+        # OvrC timing out isn't proof (FX1173: OvrC fails, TeamViewer answers).
         errors, ok = self.run_audit(de_dead={"D1"})
-        self.assertNotIn("capture D1", self.events)
-        self.assertIn("ovrc D2", self.events)
-        self.assertEqual(self.children()["D1"].status, AuditJob.Status.SKIPPED)
-        self.assertEqual(ok, 3)
+        self.assertIn("capture D1", self.events)
+        self.assertEqual(self.children()["D1"].status, AuditJob.Status.SUCCEEDED)
+        self.assertEqual(ok, 4)
+        self.assertIn("power-on D1: OvrC DCAM failed", errors)
 
     def test_de_site_without_teamviewer_id_gets_the_ovrc_time_only(self):
         errors, ok = self.run_audit(no_tv={"D1"})
@@ -386,8 +387,8 @@ def de_site(key, *fx):
 
 
 @override_settings(OVRC_USERNAME="u", OVRC_PASSWORD="p")
-class DePowerOnOfflineTests(TestCase):
-    """Which DE sites the OvrC power-on marks offline (skipped before TeamViewer)."""
+class DePowerOnWarningTests(TestCase):
+    """OvrC power-on failures are per-site warnings; DE sites are never skipped on them."""
 
     def power_on(self, sites, *, results=None, raises=None):
         from services import ovrc_capture
@@ -401,10 +402,10 @@ class DePowerOnOfflineTests(TestCase):
         with mock.patch.object(ovrc_capture, "ensure_dcam_on_for_fxes", side_effect=fake):
             return runner._power_on_all_de_sites(0, sites)
 
-    def test_a_failed_fx_marks_only_its_site_offline(self):
+    def test_a_failed_fx_is_a_warning_for_its_site_only(self):
         from services.ovrc_capture import OvrcDcamResult
 
-        ok, _changed, errors, offline = self.power_on(
+        ok, _changed, errors = self.power_on(
             [de_site("A", "FX1"), de_site("B", "FX2", "FX3")],
             results=[
                 OvrcDcamResult("FX1", "already_on"),
@@ -412,14 +413,15 @@ class DePowerOnOfflineTests(TestCase):
                 OvrcDcamResult("FX3", "failed", "TimeoutException: "),
             ],
         )
-        self.assertEqual((ok, offline), (1, {"B"}))
-        self.assertIn("FX3: TimeoutException", errors[0])
+        self.assertEqual(ok, 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("power-on B: OvrC DCAM failed (FX3: TimeoutException", errors[0])
 
-    def test_a_failed_ovrc_login_marks_nothing_offline(self):
-        ok, _changed, errors, offline = self.power_on(
+    def test_a_failed_ovrc_login_is_one_warning(self):
+        ok, _changed, errors = self.power_on(
             [de_site("A", "FX1")], raises=RuntimeError("login page timed out")
         )
-        self.assertEqual((ok, offline), (0, set()))
+        self.assertEqual(ok, 0)
         self.assertIn("RuntimeError: login page timed out", errors[0])
 
 

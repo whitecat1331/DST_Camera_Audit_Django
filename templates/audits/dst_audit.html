@@ -720,12 +720,15 @@
     });
   }
 
-  function renderSites(sites) {
+  function renderSites(sites, total) {
     if (!sites || !sites.length) {
       sitesBody.innerHTML = '<tr><td colspan="6" class="muted">Waiting for site jobs…</td></tr>';
       return;
     }
-    sitesBody.innerHTML = sites
+    const more = total > sites.length
+      ? `<tr><td colspan="6" class="muted">Showing the latest ${sites.length} of ${total} sites — open the run for all of them.</td></tr>`
+      : "";
+    sitesBody.innerHTML = more + sites
       .map((s) => {
         const err = s.error_message
           ? `<div class="error small">${escapeHtml(s.error_message)}</div>`
@@ -910,7 +913,7 @@
       phaseLabel.textContent =
         phaseTitle(dst.phase) + ` · ${dst.current || 0}/${dst.total}`;
     }
-    renderSites(dst.sites || []);
+    renderSites(dst.sites || [], dst.sites_total || 0);
   }
 
   function startPoll() {

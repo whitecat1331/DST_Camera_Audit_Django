@@ -94,6 +94,10 @@ def _shot_payload(shot) -> dict:
     }
 
 
+# Site rows returned per DST status poll (totals still cover every site).
+DST_STATUS_SITE_ROWS = 150
+
+
 def _parse_dst_progress(target_host: str, progress_message: str) -> dict:
     """Derive phase / percent from dst_audit target_host + progress text.
 
@@ -233,12 +237,22 @@ def audit_job_status(request, pk):
             progress["phase"] = "failed"
         elif job.status == AuditJob.Status.CANCELLED:
             progress["phase"] = "cancelled"
-        children = list(
-            job.child_jobs.order_by("created_at").prefetch_related("screenshots")[:500]
+        # A fleet run has 800+ sites and this is polled every 2 s: totals come from
+        # one aggregate over all sites, rows only for the newest DST_STATUS_SITE_ROWS
+        # (running ones first), and no screenshot lists (the page shows a count).
+        from django.db.models import Count
+
+        counts = dict(
+            job.child_jobs.order_by().values("status").annotate(n=Count("id")).values_list("status", "n")
         )
+        children = list(
+            job.child_jobs.annotate(shots=Count("screenshots")).order_by("-created_at")[
+                :DST_STATUS_SITE_ROWS
+            ]
+        )
+        children.sort(key=lambda c: c.status != AuditJob.Status.RUNNING)
         site_rows = []
         for child in children:
-            child_shots = [_shot_payload(s) for s in child.screenshots.all() if s.image]
             kind = (child.target_host or "").strip().lower()
             if kind not in {"lti", "de"}:
                 kind = "—"
@@ -251,21 +265,19 @@ def audit_job_status(request, pk):
                     "message": child.progress_message or child.get_status_display(),
                     "error_message": child.error_message,
                     "detail_url": f"/audits/{child.pk}/",
-                    "screenshots": child_shots,
-                    "shot_count": len(child_shots),
+                    "shot_count": child.shots,
                 }
             )
+        total_sites = sum(counts.values())
         payload["dst"] = {
             **progress,
             "sites": site_rows,
-            "sites_done": sum(
-                1
-                for s in site_rows
-                if s["status"] in ("succeeded", "failed", "cancelled", "skipped")
-            ),
-            "sites_ok": sum(1 for s in site_rows if s["status"] == "succeeded"),
-            "sites_failed": sum(1 for s in site_rows if s["status"] == "failed"),
-            "sites_skipped": sum(1 for s in site_rows if s["status"] == "skipped"),
+            "sites_total": total_sites,
+            "sites_shown": len(site_rows),
+            "sites_done": sum(counts.get(k, 0) for k in ("succeeded", "failed", "cancelled", "skipped")),
+            "sites_ok": counts.get("succeeded", 0),
+            "sites_failed": counts.get("failed", 0),
+            "sites_skipped": counts.get("skipped", 0),
         }
 
     if job.device_type == AuditJob.DeviceType.CONFIRM_BATCH:

@@ -78,3 +78,5 @@ desktop.ini
 # Runtime: which CBW password number worked per host (no passwords)
 cbw_password_hints.json
 cbw_password_hints.tmp
+tv_password_hints.json
+tv_password_hints.tmp

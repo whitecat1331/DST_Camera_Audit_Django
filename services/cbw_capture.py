@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
-import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -18,6 +16,8 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+from services.password_hints import HintStore, first_then_rest
 
 logger = logging.getLogger(__name__)
 
@@ -238,8 +238,7 @@ def capture_cbw_with_passwords(
             "[CBW] no password passed HTTP auth probe host=%s — falling back to full list",
             host,
         )
-    first = [hint] if hint and 1 <= hint <= len(passwords) else []
-    order = list(dict.fromkeys([*first, *probed, *range(1, len(passwords) + 1)]))
+    order = first_then_rest(len(passwords), hint, *probed)
 
     url = f"http://{host}/setup.html"
     last_error: Exception | None = None
@@ -312,42 +311,15 @@ def _setting(name: str, default):
         return default
 
 
-_hints_lock = threading.Lock()
-
-
-def _hints_path() -> Path | None:
-    path = _setting("CBW_PASSWORD_HINTS_PATH", None)
-    if path:
-        return Path(path)
-    base = _setting("BASE_DIR", None)
-    return Path(base) / "cbw_password_hints.json" if base else None
+# host -> number of the password that last worked (never the password).
+_HINTS = HintStore("cbw_password_hints.json", "CBW_PASSWORD_HINTS_PATH")
 
 
 def _read_password_hint(host: str) -> int | None:
-    path = _hints_path()
-    if path is None or not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8")).get(host)
-    except (OSError, ValueError, AttributeError):
-        return None
+    value = _HINTS.get(host)
     return value if isinstance(value, int) else None
 
 
 def _write_password_hint(host: str, index: int) -> None:
-    """Remember which password number worked on host (the number only)."""
-    path = _hints_path()
-    if path is None:
-        return
-    with _hints_lock:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-            if not isinstance(data, dict):
-                data = {}
-        except (OSError, ValueError):
-            data = {}
-        data[host] = index
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=0, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
+    _HINTS.set(host, index)
 
