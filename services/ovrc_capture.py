@@ -1,6 +1,8 @@
 """OvrC portal helpers for DragonEye FX cameras.
 
 - Local date/time from the customer dashboard (screenshot)
+- WattBox "CURRENT DEVICE TIME" from Devices → WattBox → Configure → Time
+  Settings (screenshot only; services/device_clock.py reads it with OCR)
 - WattBox "DCAM System" outlet: turn ON only when currently OFF
 """
 
@@ -40,6 +42,8 @@ _LOCAL_TIME_RE = re.compile(
     r"\d{1,2},?\s+\d{4}\s+\d{1,2}:\d{2}\s*(?:AM|PM)\s+[A-Z]{2,5}",
     re.IGNORECASE,
 )
+# WattBox Time Settings: "2026-10-29 13:51:11"
+_WATTBOX_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}")
 
 
 def _noop_progress(_: str) -> None:
@@ -54,6 +58,10 @@ class OvrcTimeResult:
     dashboard_url: str
     # When local_time was read (UTC) — the reference for wall-clock drift.
     captured_at: datetime | None = None
+    # The WattBox Time Settings page: a second clock, its own capture.
+    wattbox_screenshot_path: Path | None = None
+    wattbox_captured_at: datetime | None = None
+    wattbox_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -191,8 +199,14 @@ class OvrcClient:
         fx_number: str,
         output_dir: str | Path,
         filename: str | None = None,
+        *,
+        wattbox: bool = True,
     ) -> OvrcTimeResult:
-        """Search FX, open dashboard, scrape local time, screenshot."""
+        """Search FX, open dashboard, scrape local time, screenshot.
+
+        wattbox: then screenshot the WattBox's Time Settings page too. A failure
+        there is kept on wattbox_error; the dashboard reading still stands.
+        """
         assert self.driver is not None and self._wait is not None
         fx = self._normalize_fx(fx_number)
 
@@ -217,13 +231,54 @@ class OvrcClient:
             time.perf_counter() - t0,
         )
         self.progress(f"OvrC {fx}: {local_time}")
+        wb_path: Path | None = None
+        wb_at: datetime | None = None
+        wb_error = ""
+        if wattbox:
+            try:
+                wb_path = output_dir / f"{filepath.stem}_wattbox.png"
+                wb_at = self.capture_wattbox_time(fx, wb_path)
+            except Exception as exc:  # noqa: BLE001 — the dashboard reading still stands
+                wb_path, wb_at = None, None
+                wb_error = f"{type(exc).__name__}: {exc}".strip()[:200]
+                logger.warning("[OVRC] fx=%s wattbox time failed: %s", fx, wb_error)
+                self.progress(f"OvrC {fx} WattBox time: failed")
         return OvrcTimeResult(
             fx_number=fx,
             local_time=local_time,
             screenshot_path=filepath,
             dashboard_url=url,
             captured_at=captured_at,
+            wattbox_screenshot_path=wb_path,
+            wattbox_captured_at=wb_at,
+            wattbox_error=wb_error,
         )
+
+    def capture_wattbox_time(self, fx: str, filepath: Path) -> datetime:
+        """From the FX dashboard: Devices → WattBox → Configure → Time Settings.
+
+        Screenshots the page (rendered at 2x so OCR reads the small clock) and
+        returns when the clock appeared (UTC).
+        """
+        assert self.driver is not None
+        t0 = time.perf_counter()
+        self._open_devices_tab()
+        self._open_wattbox_device(fx)
+        self._open_device_subpage("configure", "CONFIGURE", r"/details/?$")
+        self._open_device_subpage("configure-time-settings", "Time Settings", r"/configure/?$")
+        self.progress(f"OvrC reading WattBox time for {fx}")
+        self._wait_for_wattbox_time()
+        captured_at = datetime.now(timezone.utc)
+        self._dismiss_whats_new()
+        self._save_screenshot_2x(filepath)
+        logger.info(
+            "[OVRC] fx=%s wattbox time path=%s elapsed=%.1fs",
+            fx,
+            filepath.name,
+            time.perf_counter() - t0,
+        )
+        self.progress(f"OvrC {fx} WattBox time captured")
+        return captured_at
 
     def ensure_dcam_system_on(self, fx_number: str) -> OvrcDcamResult:
         """Turn WattBox outlet 'DCAM System' ON only if currently OFF."""
@@ -593,6 +648,71 @@ class OvrcClient:
         )
         time.sleep(1.0)
         self._dismiss_whats_new()
+
+    def _open_device_subpage(self, route: str, link_text: str, from_re: str) -> None:
+        """Open a WattBox device route (".../configure") by URL, else by its link."""
+        assert self.driver is not None and self._wait is not None
+        self.progress(f"OvrC opening {link_text}")
+        url = self.driver.current_url or ""
+        target = re.sub(from_re, f"/{route}", url, count=1, flags=re.IGNORECASE)
+        if target != url:
+            self.driver.get(target)
+        else:
+            self._click_text(link_text)
+        self._wait.until(lambda d: (d.current_url or "").lower().rstrip("/").endswith(f"/{route}"))
+        time.sleep(0.8)
+        self._dismiss_whats_new()
+
+    def _click_text(self, text: str) -> None:
+        """Click the innermost visible element whose text is `text` (any case)."""
+        assert self.driver is not None
+        upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        xpath = (
+            f"//*[translate(normalize-space(.), '{upper.lower()}', '{upper}')"
+            f"='{text.strip().upper()}']"
+        )
+        # Innermost first: a JS click on a wrapper never reaches the link inside.
+        for el in reversed(self.driver.find_elements(By.XPATH, xpath)):
+            try:
+                if el.is_displayed():
+                    self.driver.execute_script("arguments[0].click();", el)
+                    return
+            except StaleElementReferenceException:
+                continue
+        raise RuntimeError(f"OvrC link {text!r} not found")
+
+    def _wait_for_wattbox_time(self) -> None:
+        """Wait until Time Settings shows its CURRENT DEVICE TIME value."""
+        assert self.driver is not None
+        deadline = time.time() + 30
+        body = ""
+        while time.time() < deadline:
+            try:
+                body = self.driver.find_element(By.TAG_NAME, "body").text or ""
+                if "CURRENT DEVICE TIME" in body.upper() and _WATTBOX_TIME_RE.search(body):
+                    return
+            except (NoSuchElementException, StaleElementReferenceException):
+                pass
+            time.sleep(0.4)
+        sample = " ".join(body.split())[:240]
+        raise RuntimeError(f"OvrC WattBox CURRENT DEVICE TIME not shown (page sample: {sample!r})")
+
+    def _save_screenshot_2x(self, filepath: Path) -> None:
+        """Screenshot at device scale 2: at 1x OCR misreads the 13 px clock."""
+        assert self.driver is not None
+        size = self.driver.get_window_size()
+        try:
+            self.driver.execute_cdp_cmd(
+                "Emulation.setDeviceMetricsOverride",
+                {"width": size["width"], "height": size["height"], "deviceScaleFactor": 2, "mobile": False},
+            )
+            time.sleep(0.5)
+            self.driver.save_screenshot(str(filepath))
+        finally:
+            try:
+                self.driver.execute_cdp_cmd("Emulation.clearDeviceMetricsOverride", {})
+            except Exception:  # noqa: BLE001
+                logger.debug("[OVRC] clearDeviceMetricsOverride failed", exc_info=True)
 
     def _click_nav_label(self, label: str) -> None:
         assert self.driver is not None

@@ -198,8 +198,10 @@ def _save_shot(job_id: int, filepath: Path, label: str, *, captured_at=None, rea
     """Store a capture with when it was grabbed and the device clock it shows.
 
     captured_at defaults to the image file's write time (the grab; the row is
-    saved seconds later). reading (services.device_clock.Reading) defaults to
-    reading the image itself; OvrC passes the reading it already has.
+    saved seconds later). VNC passes when it requested the frame instead: the
+    screen it shows is from then, and arrives seconds later. reading
+    (services.device_clock.Reading) defaults to reading the image itself; OvrC
+    passes the reading it already has.
     """
     from audits.models import AuditJob, AuditScreenshot
 
@@ -237,6 +239,23 @@ def _ovrc_reading(raw: str):
 
     wall, _zone = parse_ovrc_local(raw)
     return Reading(" ".join((raw or "").split())[:128], wall, "ovrc") if wall else None
+
+
+def _save_wattbox_shot(job_id: int, r) -> str:
+    """Save an OvrC result's WattBox Time Settings capture as its own device.
+
+    Labelled ovrc_<fx>_wattbox; _save_shot reads its clock with OCR. Returns
+    an error line ("" when saved).
+    """
+    if r.wattbox_screenshot_path is None:
+        return f"OvrC WattBox time {r.fx_number}: {r.wattbox_error or 'not captured'}"
+    _save_shot(
+        job_id,
+        Path(r.wattbox_screenshot_path),
+        f"ovrc_{r.fx_number.lower()}_wattbox",
+        captured_at=r.wattbox_captured_at,
+    )
+    return ""
 
 
 def _file_written_at(path: Path):
@@ -331,14 +350,14 @@ def _capture_vnc_step(
     t0 = time.perf_counter()
     try:
         _set_progress(job_id, f"VNC L{lane} connect {host}…")
-        path = capture_vnc(
+        shot = capture_vnc(
             output_dir=output_dir,
             host=host,
             password=settings.TF_VNC_PASSWORD,
             filename=f"{label}.png",
             on_progress=lambda msg: _set_progress(job_id, msg),
         )
-        _save_shot(job_id, path, label)
+        _save_shot(job_id, shot.path, label, captured_at=shot.grabbed_at)
         _set_progress(job_id, f"VNC L{lane} screenshot saved")
         logger.info(
             "[AUDIT] Job %s VNC L%s ok host=%s elapsed=%.1fs",
@@ -802,6 +821,8 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
         return ["No FX serials for OvrC capture"]
 
     errors: list[str] = []
+    # Kept apart: a missing WattBox time must not drop the dashboard reading.
+    wattbox_errors: list[str] = []
     times: list[str] = []
     readings: list[dict] = []
     _set_progress(job_id, f"OvrC local time for {len(unique_fx)} FX…")
@@ -821,6 +842,9 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
             _save_shot(
                 job_id, r.screenshot_path, label, captured_at=r.captured_at, reading=_ovrc_reading(r.local_time)
             )
+            wattbox_error = _save_wattbox_shot(job_id, r)
+            if wattbox_error:
+                wattbox_errors.append(wattbox_error)
             line = _format_ovrc_timestamp_line(r.fx_number, r.local_time)
             _set_progress(job_id, line)
             logger.info(
@@ -853,7 +877,7 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
         logger.exception("[AUDIT] Job %s OvrC failed", job_id)
         errors.append(f"OvrC: {exc}")
         _set_progress(job_id, f"OvrC failed: {type(exc).__name__}")
-    return errors
+    return errors + wattbox_errors
 
 
 def _dst_fleet_ovrc_times(
@@ -959,6 +983,12 @@ def _dst_fleet_ovrc_times(
                     r.local_time,
                     line,
                 )
+                # After the dashboard reading is kept: a WattBox failure only warns.
+                wattbox_error = _save_wattbox_shot(child_pk, r)
+                if wattbox_error:
+                    msg = f"{site_key}: {wattbox_error}"
+                    errors.append(msg)
+                    child_errs.setdefault(child_pk, []).append(msg)
             except Exception as exc:  # noqa: BLE001
                 msg = f"{site_key}: OvrC save {fx}: {exc}"
                 errors.append(msg)
@@ -1548,14 +1578,14 @@ def _rejection_ds_capture(
         return [f"Unable to locate VNC lane for {ds_serial}"]
     try:
         _set_progress(job_id, f"VNC {ds_serial} connect {host}…")
-        path = capture_vnc(
+        shot = capture_vnc(
             output_dir=output_dir,
             host=host,
             password=settings.TF_VNC_PASSWORD,
             filename=f"{thumb or 'vnc'}.png",
             on_progress=lambda msg: _set_progress(job_id, msg),
         )
-        _save_shot(job_id, path, thumb or "vnc")
+        _save_shot(job_id, shot.path, thumb or "vnc", captured_at=shot.grabbed_at)
         return []
     except Exception as exc:  # noqa: BLE001
         return [f"VNC {lane_key or ds_serial}: {exc}"]
@@ -3583,18 +3613,16 @@ def _run_job(job_id: int) -> None:
                     filename="cbw.png",
                     on_progress=progress,
                 )
-                label = "cbw"
+                _save_shot(job_id, filepath, "cbw")
             else:
                 progress(f"VNC connect {host}…")
-                filepath = capture_vnc(
+                shot = capture_vnc(
                     output_dir=output_dir,
                     host=host,
                     password=settings.TF_VNC_PASSWORD,
                     on_progress=progress,
                 )
-                label = "vnc_l1"
-
-            _save_shot(job_id, filepath, label)
+                _save_shot(job_id, shot.path, "vnc_l1", captured_at=shot.grabbed_at)
             job.status = AuditJob.Status.SUCCEEDED
             job.progress_message = "Done"
             job.finished_at = timezone.now()

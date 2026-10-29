@@ -83,7 +83,7 @@
     <li><strong>1 · LTI, on the camera VPN</strong> — CBW relays on (parallel), wait {{ settle_seconds }}s to boot if any were off, then capture every LTI site (CBW + VNC)</li>
     <li><strong>2 · Disconnect the VPN</strong> — DST drops your WatchGuard VPN (it never connects it)</li>
     <li><strong>3 · DE, off the VPN</strong> — one OvrC login turns DCAM on, wait {{ settle_seconds }}s if any were off, then capture every DE site (TeamViewer lanes)</li>
-    <li><strong>4 · OvrC times</strong> — one OvrC pass for all FX local times (keeps ADT/EDT from the portal), then publish if a round is typed</li>
+    <li><strong>4 · OvrC times</strong> — one OvrC pass for all FX local times (keeps ADT/EDT from the portal) and each WattBox's own Time Settings clock, then publish if a round is typed</li>
   </ol>
 
   {% if can_audit %}

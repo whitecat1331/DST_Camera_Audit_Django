@@ -366,6 +366,17 @@ def _build_dragoneye_layers(installation: Installation) -> list[DeviceLayer]:
                 display_name=f"{fx} local time",
                 fx_number=fx,
             )
+            # The WattBox's own clock (OvrC Time Settings), from the same OvrC pass.
+            add_layer(
+                key=f"ovrc_{fx.lower()}_wattbox",
+                label="OvrC WattBox",
+                ip=None,
+                thumb_key=f"ovrc_{fx.lower()}_wattbox",
+                device=None,
+                ds_number=fx,
+                display_name=f"{fx} WattBox time",
+                fx_number=fx,
+            )
     else:
         add_layer(
             key="de_tv",
