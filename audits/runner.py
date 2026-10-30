@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 import time
 from collections import Counter
@@ -15,6 +16,7 @@ from django.db import close_old_connections
 from django.utils import timezone
 
 from audits.ovrc_time import OVRC_FIELD_NAMES, ovrc_fields
+from services.cbw_auth import CbwAuthError
 
 logger = logging.getLogger(__name__)
 
@@ -383,8 +385,13 @@ def _run_pole_bundle_parallel(
     job_id: int,
     pole_number: str,
     output_dir: Path,
+    *,
+    cbw_skip: str | None = None,
 ) -> list[str]:
-    """Run CBW + each VNC lane concurrently. Returns error strings."""
+    """Run CBW + each VNC lane concurrently. Returns error strings.
+
+    cbw_skip: the CBW rejects every password (power-on found it), so only VNC runs.
+    """
     from services.ip_map import DeviceType, pole_to_ip_address
 
     cbw_host = pole_to_ip_address(pole_number, DeviceType.CBW)
@@ -406,10 +413,8 @@ def _run_pole_bundle_parallel(
         vnc_l2 or "(skipped)",
     )
 
-    steps: list[tuple] = [
-        ("cbw", cbw_host, None),
-        ("vnc_l1", vnc_l1, 1),
-    ]
+    steps: list[tuple] = [("cbw", cbw_host, None)] if not cbw_skip else []
+    steps.append(("vnc_l1", vnc_l1, 1))
     if include_l2 and vnc_l2:
         steps.append(("vnc_l2", vnc_l2, 2))
 
@@ -428,7 +433,7 @@ def _run_pole_bundle_parallel(
         max_workers,
     )
 
-    errors: list[str] = []
+    errors: list[str] = [f"CBW: {cbw_skip}; capture skipped"] if cbw_skip else []
     with ThreadPoolExecutor(
         max_workers=max_workers,
         thread_name_prefix=f"audit-{job_id}",
@@ -838,6 +843,9 @@ def _capture_ovrc_times(job_id: int, fx_list: list[str], output_dir: Path) -> li
             on_progress=lambda msg: _set_progress(job_id, msg),
         )
         for r in results:
+            if r.error:
+                errors.append(f"OvrC {r.fx_number}: {r.error}")
+                continue
             label = f"ovrc_{r.fx_number.lower()}"
             _save_shot(
                 job_id, r.screenshot_path, label, captured_at=r.captured_at, reading=_ovrc_reading(r.local_time)
@@ -959,6 +967,13 @@ def _dst_fleet_ovrc_times(
     child_errs: dict[int, list[str]] = {}
     for r in results:
         fx = (r.fx_number or "").strip().upper()
+        if r.error:
+            # Its own reason on each owning site; the other FX carry on.
+            for child_pk, site_key, _child_dir in fx_owners.get(fx) or []:
+                msg = f"{site_key}: OvrC {fx}: {r.error}"
+                errors.append(msg)
+                child_errs.setdefault(child_pk, []).append(msg)
+            continue
         label = f"ovrc_{fx.lower()}"
         line = _format_ovrc_timestamp_line(fx, r.local_time)
         reading = ovrc_fields(fx, r.local_time, r.captured_at or timezone.now())
@@ -1035,9 +1050,10 @@ def _dst_fleet_ovrc_times(
         )
 
     logger.info(
-        "[DST] Job %s fleet OvrC done fx=%s elapsed=%.1fs errors=%s",
+        "[DST] Job %s fleet OvrC done fx=%s read=%s elapsed=%.1fs errors=%s",
         parent_job_id,
         len(results),
+        sum(1 for r in results if not r.error),
         time.perf_counter() - t0,
         len(errors),
     )
@@ -1661,7 +1677,7 @@ def _run_rejection_report(job_id: int, output_dir: Path) -> tuple[list[str], int
                     power_text[fx] = f"UNABLE TO TURN ON: {type(exc).__name__}"
 
     if lti_rows:
-        from services.cbw_relays import turn_all_relays_on
+        from services.cbw_logic import power_on_cbw
 
         by_pole: dict[str, list[str]] = {}
         for r in lti_rows:
@@ -1672,15 +1688,16 @@ def _run_rejection_report(job_id: int, output_dir: Path) -> tuple[list[str], int
         _set_progress(job_id, f"Rejection power-on: {len(by_pole)} LTI pole(s)…")
         for pole, serials in by_pole.items():
             try:
-                result = turn_all_relays_on(
+                result = power_on_cbw(
                     pole,
                     settings.CBW_USERNAME,
                     settings.CBW_PASSWORDS,
+                    vin_floor=float(getattr(settings, "DST_SOLAR_VIN_FLOOR", 12.8)),
                 )
-                action = result.action
+                ok = result.action != "battery_low"
                 for serial in serials:
-                    power_ok[serial] = True
-                    power_text[serial] = f"relays {action}"
+                    power_ok[serial] = ok
+                    power_text[serial] = result.summary if ok else f"UNABLE TO TURN ON: {result.detail}"
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "[REJECTION] Job %s LTI power-on failed pole=%s: %s",
@@ -2003,26 +2020,40 @@ def _dst_site_key(inst) -> str:
     return (inst.pole_number or inst.identifier or f"ims-{inst.ims_id}").strip()
 
 
-def _power_on_lti_site(inst) -> tuple[str, str | None, bool]:
-    """Turn CBW relays on. Returns (summary, error_or_none, did_turn_on)."""
-    from services.cbw_relays import turn_all_relays_on
+def _power_on_lti_site(inst) -> tuple[str, str | None, bool, object]:
+    """Power the CBW on: through its logic when scheduled, else relays (cbw_logic).
+
+    Returns (summary, error_or_none, did_turn_on, CbwPowerResult_or_None).
+    """
+    from services.cbw_logic import power_on_cbw
 
     pole = (inst.pole_number or "").strip()
     try:
-        result = turn_all_relays_on(
+        result = power_on_cbw(
             pole,
             settings.CBW_USERNAME,
             settings.CBW_PASSWORDS,
+            vin_floor=float(getattr(settings, "DST_SOLAR_VIN_FLOOR", 12.8)),
         )
         changed = result.action == "turned_on"
-        return f"{pole}: relays {result.action}", None, changed
+        return f"{pole}: {result.summary}", None, changed, result
+    except CbwAuthError:
+        # No manager password: its logic can't be read. A grid site (no Cerbo) can
+        # still take relays on the state.json password, as before Phase 3; a solar
+        # site never gets forced relays (E7), so it is recorded as unmanaged (D3).
+        if getattr(inst, "is_solar", True):
+            raise
+        from services.cbw_relays import turn_all_relays_on
+
+        relay = turn_all_relays_on(pole, settings.CBW_USERNAME, settings.CBW_PASSWORDS)
+        return f"{pole}: relays {relay.action} (no manager password)", None, relay.action == "turned_on", None
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[DST] power-on LTI failed pole=%s err=%s",
             pole,
             type(exc).__name__,
         )
-        return pole, f"{pole}: {exc}", False
+        return pole, f"{pole}: {exc}", False, None
 
 
 def _power_on_de_site(inst) -> tuple[str, str | None, bool]:
@@ -2172,10 +2203,12 @@ def _run_dst_site_capture(
     *,
     kind: str | None = None,
     include_ovrc: bool = True,
+    cbw_skip: str | None = None,
 ) -> list[str]:
     """Capture one site for DST audit: LTI=CBW+VNC, DE=TV(+OvrC). Logs wall times.
 
     When include_ovrc is False, DE sites skip OvrC time scrapes (fleet pass does them).
+    cbw_skip (why no password gets into the CBW) leaves the CBW out and keeps VNC (D3).
     """
     # Long settle / OvrC power-on can leave a stale SQLite connection on this thread.
     _dst_log(job_id, "site capture enter inst_pk=%s pole=%s", getattr(inst, "pk", None), getattr(inst, "pole_number", ""))
@@ -2230,7 +2263,7 @@ def _run_dst_site_capture(
     errors: list[str] = []
     if kind == "lti":
         _dst_log(job_id, "site capture calling LTI pole bundle")
-        errors.extend(_run_pole_bundle_parallel(job_id, key, output_dir))
+        errors.extend(_run_pole_bundle_parallel(job_id, key, output_dir, cbw_skip=cbw_skip))
         _dst_log(job_id, "site capture LTI bundle returned errors=%s", len(errors))
     elif kind == "de":
         _dst_log(job_id, "site capture calling DE TeamViewer bundle")
@@ -2342,6 +2375,13 @@ class _DstRun:
         self.de_ovrc: list[tuple[int, str, list[str], Path]] = []
         # Site key → why it's skipped: power-on showed it unreachable.
         self.offline: dict[str, str] = {}
+        # Site key → why DST can't manage its CBW (answered, but no password got
+        # in): the CBW capture is skipped, VNC is still tried (D3).
+        self.cbw_unmanaged: dict[str, str] = {}
+        # Site key → its CBW power-on result (method, lanes started, logic read).
+        self.cbw_power: dict[str, object] = {}
+        # TF CPU hosts started through CBW logic: the boot wait polls their VNC.
+        self.boot_hosts: list[str] = []
         self.skipped = 0
         # DE children with no TeamViewer ID: OvrC time only, settled after the OvrC pass.
         self.ovrc_only: list[int] = []
@@ -2400,7 +2440,11 @@ def _dst_power_on_lti(run: _DstRun, lti_sites: list) -> bool:
 
 
 def _dst_power_on_pass(run: _DstRun, sites: list, label: str) -> tuple[bool, list[tuple[object, str]]]:
-    """One parallel relay pass; returns (any_turned_on, [(inst, error)])."""
+    """One parallel CBW power-on pass; returns (any_relays_turned_on, [(inst, error)]).
+
+    Sites started through their CBW logic aren't in the flag: their lanes go into
+    run.boot_hosts and the boot wait polls them instead of a fixed settle.
+    """
     from audits.models import AuditJob
 
     job_id = run.job_id
@@ -2422,8 +2466,16 @@ def _dst_power_on_pass(run: _DstRun, sites: list, label: str) -> tuple[bool, lis
             inst = futures[fut]
             done += 1
             changed = False
+            power = None
             try:
-                summary, err, changed = fut.result()
+                summary, err, changed, power = fut.result()
+            except CbwAuthError as exc:
+                key = _dst_site_key(inst)
+                with run.lock:
+                    run.cbw_unmanaged[key] = str(exc)
+                    run.errors.append(f"power-on {key}: {exc} (CBW skipped, VNC tried)")
+                logger.warning("[DST] Job %s %s CBW %s %s", job_id, label, exc.reason, key)
+                continue
             except Exception as exc:  # noqa: BLE001
                 err = f"{_dst_site_key(inst)}: {exc}"
                 summary = _dst_site_key(inst)
@@ -2431,7 +2483,15 @@ def _dst_power_on_pass(run: _DstRun, sites: list, label: str) -> tuple[bool, lis
                 failed.append((inst, err))
             else:
                 run.power_ok += 1
-                if changed:
+                key = _dst_site_key(inst)
+                if power is not None:
+                    with run.lock:
+                        run.cbw_power[key] = power
+                    if power.action == "battery_low":
+                        run.errors.append(f"power-on {key}: {power.detail}; not powered on")
+                    elif changed and power.method == "logic":
+                        run.boot_hosts.extend(_lane_hosts(inst, power.lanes))
+                if changed and (power is None or power.method == "relays"):
                     turned_on = True
                 logger.info("[DST] Job %s %s ok %s", job_id, label, summary)
             _set_progress(
@@ -2443,6 +2503,102 @@ def _dst_power_on_pass(run: _DstRun, sites: list, label: str) -> tuple[bool, lis
                 target_host=f"power_on {run.power_ok}/{run.total}"
             )
     return turned_on, failed
+
+
+def _lane_hosts(inst, lanes: list[str]) -> list[str]:
+    """TF CPU hosts of the started lanes (A → lane 1 `.140`, B → lane 2 `.141`)."""
+    from services.ip_map import DeviceType, pole_to_ip_address
+
+    hosts = []
+    for lane in lanes:
+        n = {"A": 1, "B": 2}.get(str(lane).upper())
+        if n:
+            try:
+                hosts.append(pole_to_ip_address(inst.pole_number, DeviceType.TF_CPU, n))
+            except (ValueError, AttributeError):
+                pass
+    return hosts
+
+
+def _vnc_open(host: str, timeout: float = 2.0) -> bool:
+    try:
+        socket.create_connection((host, 5900), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def _dst_wait_for_boot(job_id: int, hosts: list[str], label: str) -> list[str]:
+    """Poll VNC on lanes started through CBW logic until all answer or the timeout.
+
+    The logic's start-up is relay on, off 8 s, on, then the TF boots: about
+    40 s–2.5 min (E3/E7), bounded by its step timers. Returns the hosts still down.
+    """
+    from audits.models import AuditJob
+
+    pending = sorted(set(hosts))
+    timeout = max(0, int(getattr(settings, "DST_SOLAR_BOOT_TIMEOUT_SECONDS", 420)))
+    if not pending or timeout <= 0:
+        return pending
+    logger.info("[DST] Job %s %s boot wait hosts=%s timeout=%ss", job_id, label, len(pending), timeout)
+    deadline = time.monotonic() + timeout
+    with ThreadPoolExecutor(max_workers=min(20, len(pending)), thread_name_prefix=f"dst-boot-{job_id}") as pool:
+        while pending:
+            _raise_if_cancelled(job_id)
+            up = dict(zip(pending, pool.map(_vnc_open, pending)))
+            pending = [h for h in pending if not up[h]]
+            remaining = int(max(0, deadline - time.monotonic()))
+            if not pending or remaining <= 0:
+                break
+            _set_progress(job_id, f"{label}: {len(pending)} lane(s) booting through CBW logic, up to {remaining}s…")
+            AuditJob.objects.filter(pk=job_id).update(target_host=f"boot {len(pending)} lane(s) {remaining}s")
+            time.sleep(min(10, remaining))
+    logger.info("[DST] Job %s %s boot wait done still_down=%s", job_id, label, len(pending))
+    return pending
+
+
+def _dst_cbw_report(run: _DstRun, lti_sites: list) -> list[str]:
+    """Run-summary lines on solar power (Phase 3 steps 0, 5, 6): one line per group."""
+    lines: list[str] = []
+
+    def group(title: str, keys: list[str], limit: int = 60) -> None:
+        if keys:
+            keys = sorted(keys)
+            more = f", … (+{len(keys) - limit})" if len(keys) > limit else ""
+            lines.append(f"CBW report: {title}: {len(keys)}: {', '.join(keys[:limit])}{more}")
+
+    power = run.cbw_power
+    group("battery low, not powered on", [f"{k} ({p.vin:g} V)" for k, p in power.items() if p.action == "battery_low"])
+    group("CBW not managed (no password got in)", list(run.cbw_unmanaged))
+    group("CBW offline (no answer twice)", [k for k, why in run.offline.items() if "CBW" in why])
+    gates: dict[str, list[str]] = {}
+    for k, p in power.items():
+        logic = p.logic
+        if logic is None or not logic.scheduled:
+            continue
+        if logic.m2_gate is None:
+            gates.setdefault("M2 has no battery gate", []).append(k)
+        elif logic.m2_gate_inverted:
+            gates.setdefault(f"M2 gate '{logic.m2_gate}' is inverted (never passes on a healthy battery)", []).append(k)
+    for title, keys in sorted(gates.items()):
+        group(title, keys)
+    group("lane power with no start-up logic (not started)",
+          [f"{k} lane {', '.join(p.no_startup)}" for k, p in power.items() if p.no_startup])
+    by_key = {_dst_site_key(i): i for i in lti_sites}
+    group("Cerbo site whose CBW has no schedule (relays used)",
+          [k for k, p in power.items() if p.method == "relays" and getattr(by_key.get(k), "is_solar", False)])
+    mismatch = []
+    for k, inst in by_key.items():
+        solar = getattr(inst, "is_solar", None)
+        typed = (getattr(inst, "power_type", "") or "").strip()
+        if solar is None:
+            continue
+        if solar and typed.lower() != "solar":
+            mismatch.append(f"{k} ({typed or 'blank'}, has Cerbo)")
+        elif not solar and typed.lower() == "solar":
+            mismatch.append(f"{k} (Solar, no Cerbo)")
+    group("IMS power_type disagrees with the Cerbo (fix in IMS)", mismatch, limit=40)
+    return lines
 
 
 def _dst_settle(job_id: int, turned_on: bool, label: str) -> None:
@@ -2674,6 +2830,7 @@ def _dst_capture_site(run: _DstRun, inst, index: int) -> None:
             child_dir,
             kind=kind,
             include_ovrc=False,
+            cbw_skip=run.cbw_unmanaged.get(key),
         )
         _dst_log(
             job_id,
@@ -2803,6 +2960,82 @@ def _dst_capture_site_in_thread(run: _DstRun, inst, index: int) -> None:
         connection.close()  # pool threads each hold their own DB connection
 
 
+def _write_run_errors(output_dir: Path, errors: list[str]) -> Path | None:
+    """One error per line in <output_dir>/run_errors.txt; never raises."""
+    path = Path(output_dir) / "run_errors.txt"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(errors) + "\n", encoding="utf-8")
+        return path
+    except OSError as exc:
+        logger.warning("[DST] could not write %s: %s", path, type(exc).__name__)
+        return None
+
+
+def _dst_refresh_scope(job_id: int) -> list[str]:
+    """Pre-audit IMS refresh: PRTG tree/enclosures/sensors, then the installation sync.
+
+    Gives the scope filter current pause / unmonitored state. Any failure is a
+    warning and the run uses the last synced state (Phase 2b step 4).
+    """
+    if not getattr(settings, "DST_PRE_AUDIT_IMS_REFRESH", True):
+        return []
+    from services.ims_client import IMSClientError, refresh_prtg
+    from services.ims_sync import sync_installations_from_ims
+
+    warnings: list[str] = []
+    _set_progress(job_id, "Refreshing PRTG state in IMS…")
+    try:
+        refresh_prtg(timeout=float(getattr(settings, "DST_PRTG_REFRESH_TIMEOUT_SECONDS", 900)))
+    except (IMSClientError, Exception) as exc:  # noqa: BLE001
+        warnings.append(f"IMS PRTG refresh skipped ({exc}); used the last synced PRTG state")
+        logger.warning("[DST] Job %s PRTG refresh failed: %s", job_id, exc)
+    _set_progress(job_id, "Syncing installations from IMS…")
+    try:
+        created, updated, deactivated = sync_installations_from_ims()
+        logger.info("[DST] Job %s IMS sync created=%s updated=%s deactivated=%s", job_id, created, updated, deactivated)
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"IMS installation sync failed ({type(exc).__name__}: {exc}); used the last synced installations")
+        logger.warning("[DST] Job %s IMS sync failed: %s", job_id, exc)
+    return warnings
+
+
+def _dst_out_of_scope_reason(inst) -> str:
+    """Why a site is out of the audit's scope, or "" (Phase 2b, user 2026-10-30)."""
+    monitoring = (getattr(inst, "prtg_monitoring", "") or "").strip().lower()
+    if monitoring == "paused":
+        return "PRTG paused"
+    if monitoring == "unmonitored":
+        return "no PRTG device"
+    if _dst_site_kind(inst) == "lti" and getattr(inst, "is_legacy", False):
+        return "legacy (no 10.x CBW/CPU host)"
+    return ""
+
+
+def _dst_drop_out_of_scope(job_id: int, sites: list) -> list:
+    """Drop legacy, PRTG-paused and unmonitored sites before anything runs.
+
+    They're silently out of scope (user, 2026-10-30): no child row, no status,
+    no count in the run or the review; only the log names them.
+    """
+    kept, dropped = [], Counter()
+    for inst in sites:
+        why = _dst_out_of_scope_reason(inst)
+        if why:
+            dropped[why] += 1
+            logger.info("[DST] Job %s out of scope %s: %s", job_id, _dst_site_key(inst), why)
+        else:
+            kept.append(inst)
+    if dropped:
+        logger.info(
+            "[DST] Job %s out of scope total=%s (%s)",
+            job_id,
+            sum(dropped.values()),
+            ", ".join(f"{why}: {n}" for why, n in sorted(dropped.items())),
+        )
+    return kept
+
+
 def _run_dst_audit(
     job_id: int,
     output_dir: Path,
@@ -2836,14 +3069,18 @@ def _run_dst_audit(
     agency = agency or meta.get("agency") or ""
     selected_ids = read_dst_selection(job_id)
 
+    # Fresh PRTG pause / device state before choosing sites; never blocks the run.
+    refresh_warnings = _dst_refresh_scope(job_id)
+
     sites = _active_dst_installations(
         scope=scope,
         state=state,
         agency=agency,
         installation_ids=selected_ids,
     )
+    sites = _dst_drop_out_of_scope(job_id, sites)
     if not sites:
-        return ["No eligible installations for DST audit"], 0
+        return refresh_warnings + ["No eligible installations for DST audit"], 0
 
     lti_sites = [s for s in sites if _dst_site_kind(s) == "lti"]
     de_sites = [s for s in sites if _dst_site_kind(s) == "de"]
@@ -2858,7 +3095,7 @@ def _run_dst_audit(
         agency or "*",
         len(selected_ids) if selected_ids is not None else "all",
     )
-    skipped: list[str] = []
+    skipped: list[str] = list(refresh_warnings)
     if lti_sites and not _dst_camera_network_up(lti_sites):
         msg = (
             f"LTI skipped ({len(lti_sites)} site(s)): camera network not reachable. "
@@ -2879,6 +3116,10 @@ def _run_dst_audit(
     if lti_sites:
         turned_on = _dst_power_on_lti(run, lti_sites)
         _dst_settle(job_id, turned_on, "[VPN] LTI 2/3")
+        still_down = _dst_wait_for_boot(job_id, run.boot_hosts, "[VPN] LTI 2/3")
+        if still_down:
+            run.errors.append(f"boot wait: {len(still_down)} lane(s) started through CBW logic not up by the timeout")
+        run.errors.extend(_dst_cbw_report(run, lti_sites))
         _dst_capture_half(
             run,
             lti_sites,
@@ -3358,10 +3599,13 @@ def _run_job(job_id: int) -> None:
                     return
                 if sites_ok == 0:
                     _stop_live_publish(job_id)
+                    _write_run_errors(output_dir, errors)
                     raise RuntimeError("; ".join(errors) or "DST Audit failed")
                 job.status = AuditJob.Status.SUCCEEDED
                 if errors:
-                    job.error_message = "; ".join(errors)[:2000]
+                    # The whole list: run 389's 2,000-char cut hid the OvrC error.
+                    job.error_message = "; ".join(errors)
+                    _write_run_errors(output_dir, errors)
                 job.progress_message = (
                     f"Done with warnings ({len(errors)})" if errors else "Done"
                 )

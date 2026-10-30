@@ -12,6 +12,7 @@ from django.core.files.base import ContentFile
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from audits import runner
+from services.cbw_auth import CbwAuthError
 from audits.models import AuditJob
 from services import netstate
 
@@ -161,14 +162,16 @@ class NetworkPhaseOrderTests(TestCase):
         publish_round="",
         lti_dead=(),
         lti_flaky=(),
+        lti_locked=(),
         de_dead=(),
         no_tv=(),
         ovrc_shots=True,
+        refresh_warnings=(),
     ):
         runner.write_dst_selection(self.parent.pk, [s.pk for s in self.sites], publish_round=publish_round)
 
         def capture(child_pk, inst, child_dir, **kw):
-            self.events.append(f"capture {inst.key}")
+            self.events.append(f"capture {inst.key}" + (" (no CBW)" if kw.get("cbw_skip") else ""))
             job = AuditJob.objects.get(pk=child_pk)
             job.screenshots.create(label="x").image.save("x.png", ContentFile(b"png"), save=True)
             return []
@@ -181,9 +184,11 @@ class NetworkPhaseOrderTests(TestCase):
 
         def lti_power(inst):
             self.events.append(f"relay {inst.key}")
+            if inst.key in lti_locked:
+                raise CbwAuthError(f"10.0.0.{inst.pk}", "auth_failed", "all 3 passwords got 401")
             if inst.key in lti_dead or (inst.key in lti_flaky and self.events.count(f"relay {inst.key}") == 1):
-                return inst.key, f"{inst.key}: Failed to turn on relays", False
-            return inst.key, None, False
+                return inst.key, f"{inst.key}: Failed to turn on relays", False, None
+            return inst.key, None, False, None
 
         def de_power(job_id, sites):
             self.events.append("ovrc dcam on")
@@ -205,6 +210,7 @@ class NetworkPhaseOrderTests(TestCase):
 
         self.addCleanup(runner._live_publishers.pop, self.parent.pk, None)
         with (
+            mock.patch.object(runner, "_dst_refresh_scope", return_value=list(refresh_warnings)),
             mock.patch.object(runner, "_start_live_publish", side_effect=start_live),
             mock.patch.object(runner, "_active_dst_installations", return_value=self.sites),
             mock.patch.object(runner, "_dst_site_kind", side_effect=lambda s: s.kind),
@@ -261,6 +267,31 @@ class NetworkPhaseOrderTests(TestCase):
     def children(self):
         return {c.pole_number: c for c in AuditJob.objects.filter(parent_job=self.parent)}
 
+    def test_out_of_scope_sites_never_run_and_get_no_child_row(self):
+        # Phase 2: legacy, PRTG-paused and unmonitored sites are dropped before power-on.
+        self.sites = [
+            site(1, "D1", "de"),
+            site(2, "L1", "lti"),
+            SimpleNamespace(**vars(site(4, "L2", "lti")), prtg_monitoring="paused"),
+            SimpleNamespace(**vars(site(5, "L3", "lti")), prtg_monitoring="unmonitored"),
+            SimpleNamespace(**vars(site(6, "L4", "lti")), is_legacy=True),
+        ]
+        with self.assertLogs("audits.runner", "INFO") as logs:
+            errors, ok = self.run_audit()
+        self.assertEqual((ok, errors), (2, []))
+        self.assertEqual(sorted(self.children()), ["D1", "L1"])
+        self.assertFalse([e for e in self.events if any(k in e for k in ("L2", "L3", "L4"))])
+        text = "\n".join(logs.output)
+        self.assertIn("out of scope L2: PRTG paused", text)
+        self.assertIn("out of scope L3: no PRTG device", text)
+        self.assertIn("out of scope L4: legacy (no 10.x CBW/CPU host)", text)
+        self.assertIn("out of scope total=3", text)
+
+    def test_a_failed_refresh_is_a_warning_and_the_run_goes_on(self):
+        warning = "IMS PRTG refresh skipped (x); used the last synced PRTG state"
+        errors, ok = self.run_audit(refresh_warnings=[warning])
+        self.assertEqual((ok, errors), (4, [warning]))
+
     def test_finished_sites_go_to_the_live_publisher_ovrc_only_ones_wait_for_the_end(self):
         self.run_audit(publish_round="R1", no_tv={"D1"}, lti_dead={"L2"})
         kids = self.children()
@@ -291,6 +322,22 @@ class NetworkPhaseOrderTests(TestCase):
             [c.pole_number for c in AuditJob.objects.filter(parent_job=self.parent).order_by("pk")],
             ["L1", "L2", "D1", "D2"],
         )  # a skipped site still gets its row, in run order
+
+    def test_cbw_that_rejects_every_password_skips_the_cbw_but_tries_vnc(self):
+        """D3: the CBW answered, so the site isn't offline; VNC is still captured."""
+        errors, ok = self.run_audit(lti_locked={"L2"})
+        self.assertEqual(self.events.count("relay L2"), 1)  # a real 401 on every password isn't retried
+        self.assertIn("capture L2 (no CBW)", self.events)
+        self.assertIn("capture L1", self.events)
+        self.assertEqual(self.children()["L2"].status, AuditJob.Status.SUCCEEDED)
+        self.assertEqual(ok, 4)
+        self.assertEqual(
+            errors,
+            [
+                "power-on L2: CBW auth_failed @ 10.0.0.4: all 3 passwords got 401 (CBW skipped, VNC tried)",
+                "CBW report: CBW not managed (no password got in): 1: L2",
+            ],
+        )
 
     def test_power_on_that_fails_once_is_retried_and_the_site_captured(self):
         errors, ok = self.run_audit(lti_flaky={"L2"})
