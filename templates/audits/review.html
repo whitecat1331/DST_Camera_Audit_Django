@@ -96,8 +96,13 @@
   <span id="review-live" class="review-live is-off" title="Complete, notes and assignments from teammates appear here without refreshing">Live updates: connecting…</span>
 </div>
 
-<div class="table-scroll">
+<div class="review-table-wrap">
   <table class="data-table review-table" data-update-url="{% url 'review_update' pk=current.pk %}" data-events-url="{% url 'review_events' pk=current.pk %}" data-user="{{ request.user.username }}">
+    <colgroup>
+      <col class="col-camera"><col class="col-status"><col class="col-capture"><col class="col-time">
+      <col class="col-time"><col class="col-time"><col class="col-drift"><col class="col-check">
+      <col class="col-assignee"><col class="col-complete"><col class="col-notes">
+    </colgroup>
     <thead>
       <tr>
         <th>Camera</th>
@@ -146,15 +151,15 @@
           </figure>
         </td>
         <td class="review-time">
-          {{ c.captured_eastern|default:"—" }}
+          {{ c.captured_eastern|date_then_time|default:"—" }}
           {% if c.captured_estimated %}<div class="muted review-meta" title="Older run: this is when the capture was saved, a few seconds after the grab">saved time</div>{% endif %}
         </td>
         {% if c.checkable %}
         <td class="review-time" {% if c.device_time_raw %}title="{{ c.device_time_raw }}"{% endif %}>
-          {% if c.device_display %}{{ c.device_display }}<div class="muted review-meta">{{ c.device_note }}</div>
+          {% if c.device_display %}{{ c.device_display|date_then_time }}<div class="muted review-meta">{{ c.device_note }}</div>
           {% else %}<span class="muted">Unread — check the image</span>{% endif %}
         </td>
-        <td class="review-time">{{ c.expected_local|default:"—" }}</td>
+        <td class="review-time">{{ c.expected_local|date_then_time|default:"—" }}</td>
         <td class="review-drift">
           {% if c.drift_display %}<span class="{% if c.verdict == 'fail' %}drift-flag{% else %}drift-ok{% endif %}">{{ c.drift_display }}</span>
           {% else %}<span class="muted">—</span>{% endif %}
@@ -162,7 +167,7 @@
         <td class="review-check"><span class="check-badge check-{{ c.verdict }}">{% if c.verdict == "pass" %}Pass{% elif c.verdict == "fail" %}Fail{% else %}Unread{% endif %}</span></td>
         {% else %}
         <td class="muted">No device clock in this capture</td>
-        <td class="review-time">{{ c.expected_local|default:"—" }}</td>
+        <td class="review-time">{{ c.expected_local|date_then_time|default:"—" }}</td>
         <td colspan="2"></td>
         {% endif %}
         {% else %}

@@ -11,3 +11,15 @@ def thumb_src(field_file) -> str:
         return ""
     thumb_url = getattr(field_file.storage, "thumb_url", None)
     return thumb_url(field_file.name) if thumb_url else field_file.url
+
+
+@register.filter
+def date_then_time(stamp: str):
+    """"Oct 29, 06:42:34 PM EDT" → date and time on two lines, so the column stays narrow."""
+    from django.utils.html import conditional_escape
+    from django.utils.safestring import mark_safe
+
+    date, sep, rest = str(stamp or "").partition(", ")
+    if not sep:
+        return stamp
+    return mark_safe(f'<span class="review-date">{conditional_escape(date)}</span> {conditional_escape(rest)}')
