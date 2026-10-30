@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 import requests
 
+from services.cbw_auth import CbwAuthError, CbwUnreachable, cbw_login
+
 logger = logging.getLogger(__name__)
 
 # overview.json is the universal source; firmware.json only exists on v3.12+.
@@ -26,7 +28,7 @@ FIRMWARE_ENDPOINTS = ("/overview.json", "/firmware.json")
 @dataclass(frozen=True)
 class CbwFirmwareResult:
     host: str
-    status: str  # ok | auth_failed | unreachable | no_firmware | no_cbw
+    status: str  # ok | auth_failed | locked_out | unreachable | no_firmware | no_cbw
     firmware: str = ""
     part_number: str = ""
     serial: str = ""
@@ -49,81 +51,62 @@ def read_cbw_firmware(
 ) -> CbwFirmwareResult:
     """Read firmware revision + part number (+ serial) from a CBW X-410.
 
-    Tries each password in order (some devices need the manager password for
-    ``overview.json``). Never raises — failures are reported via `status`.
+    Logs in through `cbw_login` (remembered password first, a 429 waited out on
+    the same password). Never raises — failures are reported via `status`.
     """
     host = (host or "").strip()
     if not host:
         return CbwFirmwareResult(host=host, status="no_cbw")
 
     base = f"http://{host}"
-    saw_401 = False
+    try:
+        # Lockout-aware login on overview.json itself: some devices only give
+        # it to the manager password.
+        login = cbw_login(host, username, passwords, path=FIRMWARE_ENDPOINTS[0], timeout=timeout)
+    except CbwAuthError as exc:
+        return CbwFirmwareResult(host=host, status=exc.reason, error=str(exc))
+    except CbwUnreachable as exc:
+        return CbwFirmwareResult(host=host, status="unreachable", error=str(exc))
+    except RuntimeError as exc:  # credentials not configured
+        return CbwFirmwareResult(host=host, status="auth_failed", error=str(exc))
+
+    session = login.session
     saw_response = False
-    last_error = ""
+    try:
+        for path in FIRMWARE_ENDPOINTS:
+            try:
+                r = login.response if path == FIRMWARE_ENDPOINTS[0] else session.get(f"{base}{path}", timeout=timeout)
+            except requests.RequestException as exc:
+                return CbwFirmwareResult(host=host, status="unreachable", error=f"{type(exc).__name__}: {exc}")
+            if r.status_code >= 400:
+                continue  # not found / forbidden → try next endpoint
 
-    for password in passwords:
-        session = requests.Session()
-        try:
-            session.trust_env = False
-        except Exception:  # noqa: BLE001
-            pass
-        session.auth = (username, password)
-        try:
-            for path in FIRMWARE_ENDPOINTS:
-                try:
-                    r = session.get(f"{base}{path}", timeout=timeout)
-                except requests.RequestException as exc:
-                    # Network-level failure (connect timeout / refused): the
-                    # device isn't answering, so retrying other passwords or
-                    # endpoints can't help — fail fast.
-                    return CbwFirmwareResult(
-                        host=host,
-                        status="unreachable",
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
+            saw_response = True
+            try:
+                data = r.json()
+            except ValueError:
+                continue  # non-JSON (e.g. firmware.json on pre-3.12 fw)
 
-                if r.status_code == 401:
-                    saw_401 = True
-                    break  # wrong credentials → try next password
-                if r.status_code >= 400:
-                    continue  # not found / forbidden → try next endpoint
+            fw, part = _extract(data)
+            if not fw:
+                continue  # no firmware field → try next endpoint
 
-                saw_response = True
-                try:
-                    data = r.json()
-                except ValueError:
-                    continue  # non-JSON (e.g. firmware.json on pre-3.12 fw)
+            serial = ""
+            try:
+                sr = session.get(f"{base}/state.json", timeout=timeout)
+                if sr.status_code == 200:
+                    serial = (sr.json() or {}).get("serialNumber", "") or ""
+            except Exception:  # noqa: BLE001 — serial is best-effort only
+                pass
 
-                fw, part = _extract(data)
-                if not fw:
-                    continue  # no firmware field → try next endpoint
+            return CbwFirmwareResult(host=host, status="ok", firmware=fw, part_number=part, serial=serial)
+    finally:
+        session.close()
 
-                serial = ""
-                try:
-                    sr = session.get(f"{base}/state.json", timeout=timeout)
-                    if sr.status_code == 200:
-                        serial = (sr.json() or {}).get("serialNumber", "") or ""
-                except Exception:  # noqa: BLE001 — serial is best-effort only
-                    pass
-
-                return CbwFirmwareResult(
-                    host=host, status="ok", firmware=fw, part_number=part, serial=serial
-                )
-        except requests.RequestException as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-        finally:
-            session.close()
-
-    if saw_401 and not saw_response:
-        return CbwFirmwareResult(
-            host=host, status="auth_failed", error="no CBW password accepted"
-        )
     if saw_response:
         return CbwFirmwareResult(
             host=host,
             status="no_firmware",
             error=f"no firmware field in {'/'.join(FIRMWARE_ENDPOINTS)}",
         )
-    return CbwFirmwareResult(
-        host=host, status="unreachable", error=last_error or "no response"
-    )
+    return CbwFirmwareResult(host=host, status="unreachable", error="no response")

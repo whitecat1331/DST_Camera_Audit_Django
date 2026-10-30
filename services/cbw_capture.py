@@ -18,7 +18,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from services.password_hints import HintStore, first_then_rest
+from services.cbw_auth import CbwUnreachable, cbw_login, read_hint, write_hint
+from services.password_hints import first_then_rest
 
 logger = logging.getLogger(__name__)
 
@@ -37,24 +38,21 @@ def _noop_progress(_: str) -> None:
     return None
 
 
-def _probe_cbw_auth(host: str, username: str, password: str) -> bool:
-    """True when Basic Auth is accepted (state.json or setup.html)."""
-    session = requests.Session()
+def _probe_cbw_auth(host: str, username: str, passwords: list[str]) -> int | None:
+    """Number of the password the CBW accepts on setup.html, or None if HTTP can't tell.
+
+    One lockout-aware login (`cbw_login`): the remembered password first, and a
+    429 is waited out on the same password, never counted as accepted (it used
+    to be, and the loop's own 401s caused it). Raises CbwAuthError when the CBW
+    answers but rejects every password: D3 skips the capture then.
+    """
     try:
-        session.trust_env = False
-    except Exception:  # noqa: BLE001
-        pass
-    session.auth = (username, password)
-    for path in ("/state.json", "/setup.html"):
-        try:
-            r = session.get(f"http://{host}{path}", timeout=8)
-            if r.status_code == 401:
-                return False
-            if r.status_code < 500:
-                return True
-        except requests.RequestException as exc:
-            logger.debug("[CBW] auth probe %s%s failed: %s", host, path, type(exc).__name__)
-    return False
+        login = cbw_login(host, username, passwords, path="/setup.html")
+    except CbwUnreachable as exc:
+        logger.debug("[CBW] auth probe %s: %s", host, exc)
+        return None
+    login.session.close()
+    return login.index
 
 
 def _find_date_time_elements(driver: webdriver.Chrome):
@@ -421,9 +419,10 @@ def capture_cbw_with_passwords(
 ) -> Path:
     """Try CBW passwords until capture succeeds.
 
-    Order: the password number that last worked on this host (a hint file holds
-    the number only, never the password), then those that pass the HTTP auth
-    probe, then the rest. Each password gets one try per round before any is
+    Order: the password one lockout-aware HTTP login accepts (it tries the
+    remembered number first; the hint file holds the number only, never the
+    password), then the rest. A CBW that rejects every password raises
+    CbwAuthError before Selenium starts. Each password gets one try per round before any is
     retried: on some firmware a wrong password isn't a 401, it shows up as a menu
     timeout (220054: passwords 1 and 2 timed out 3× each; 3 worked in 18 s).
     budget_seconds stops starting new attempts once spent (default
@@ -441,24 +440,11 @@ def capture_cbw_with_passwords(
     logger.info("[CBW] trying passwords host=%s count=%s", host, len(passwords))
     progress(f"CBW probing auth @ {host}")
     hint = _read_password_hint(host)
-    probed: list[int] = []
-    for idx, password in enumerate(passwords, start=1):
-        ok = _probe_cbw_auth(host, username, password)
-        logger.info(
-            "[CBW] auth probe attempt=%s/%s host=%s ok=%s",
-            idx,
-            len(passwords),
-            host,
-            ok,
-        )
-        if ok:
-            probed.append(idx)
-    if not probed:
-        logger.warning(
-            "[CBW] no password passed HTTP auth probe host=%s — falling back to full list",
-            host,
-        )
-    order = first_then_rest(len(passwords), hint, *probed)
+    probed = _probe_cbw_auth(host, username, passwords)  # CbwAuthError: no password gets in
+    logger.info("[CBW] auth probe host=%s accepted=%s", host, probed)
+    if probed is None:
+        logger.warning("[CBW] HTTP auth probe got no answer host=%s — trying the full list", host)
+    order = first_then_rest(len(passwords), probed, hint)
 
     url = f"http://{host}/setup.html"
     last_error: Exception | None = None
@@ -575,15 +561,10 @@ def _setting(name: str, default):
         return default
 
 
-# host -> number of the password that last worked (never the password).
-_HINTS = HintStore("cbw_password_hints.json", "CBW_PASSWORD_HINTS_PATH")
-
-
 def _read_password_hint(host: str) -> int | None:
-    value = _HINTS.get(host)
-    return value if isinstance(value, int) else None
+    return read_hint(host)
 
 
 def _write_password_hint(host: str, index: int) -> None:
-    _HINTS.set(host, index)
+    write_hint(host, index)
 

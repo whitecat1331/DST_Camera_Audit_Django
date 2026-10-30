@@ -1,6 +1,7 @@
 """CBW password order: remembered number first, each password once per round, a time budget."""
 
 import json
+import time
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -19,7 +20,7 @@ class CbwPasswordOrderTests(SimpleTestCase):
         HINTS.unlink(missing_ok=True)
         self.tried: list[str] = []
 
-    def capture(self, works="p3", probe_ok=True, **kw):
+    def capture(self, works="p3", probe_ok=None, **kw):
         def shot(url, user, password, out, **_):
             self.tried.append(password)
             if password == works:
@@ -52,7 +53,10 @@ class CbwPasswordOrderTests(SimpleTestCase):
         self.assertEqual(self.tried, ["p1", "p2", "p3"] * 3)
 
     def test_budget_stops_new_attempts(self):
-        with mock.patch.object(cbw_capture.time, "monotonic", side_effect=[0, 0, 200, 200]):
+        # Only cbw_capture's clock: patching time.monotonic itself also feeds the log
+        # handler's rollover check (config/logging.py), which would eat the values.
+        clock = mock.Mock(wraps=time, monotonic=mock.Mock(side_effect=[0, 0, 200, 200]))
+        with mock.patch.object(cbw_capture, "time", clock):
             with self.assertRaisesMessage(RuntimeError, "gave up after 150s"):
                 self.capture(works="none", budget_seconds=150)
         self.assertEqual(self.tried, ["p1"])
@@ -155,7 +159,7 @@ class CbwRecaptureTests(SimpleTestCase):
             return path
 
         with (
-            mock.patch.object(cbw_capture, "_probe_cbw_auth", return_value=True),
+            mock.patch.object(cbw_capture, "_probe_cbw_auth", return_value=1),
             mock.patch.object(cbw_capture, "screenshot_date_time", side_effect=shot),
         ):
             path = cbw_capture.capture_cbw_with_passwords("10.3.201.177", "admin", ["p1"], out)

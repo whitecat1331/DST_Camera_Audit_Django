@@ -1,9 +1,11 @@
 """Unit tests for services.cbw_firmware (mocked HTTP, no live CBW)."""
 
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import requests
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
 from services.cbw_firmware import read_cbw_firmware
 
@@ -21,6 +23,7 @@ class FakeResponse:
         return self._payload
 
 
+@override_settings(CBW_PASSWORD_HINTS_PATH=str(Path(tempfile.mkdtemp(prefix="cbw-fw-hints-")) / "hints.json"))
 class ReadCbwFirmwareTests(SimpleTestCase):
     OVERVIEW = "http://10.3.38.177/overview.json"
     FIRMWARE = "http://10.3.38.177/firmware.json"
@@ -35,7 +38,7 @@ class ReadCbwFirmwareTests(SimpleTestCase):
 
         return factory
 
-    @patch("services.cbw_firmware.requests.Session")
+    @patch("services.cbw_auth.requests.Session")
     def test_ok(self, Session):
         Session.side_effect = self._session_factory(
             {
@@ -51,7 +54,7 @@ class ReadCbwFirmwareTests(SimpleTestCase):
         self.assertEqual(res.part_number, "X-410-I")
         self.assertEqual(res.serial, "00:0C:C8:08:58:F3")
 
-    @patch("services.cbw_firmware.requests.Session")
+    @patch("services.cbw_auth.requests.Session")
     def test_firmware_json_fallback(self, Session):
         # overview.json lacks the firmware field; firmware.json (v3.12+) has it.
         Session.side_effect = self._session_factory(
@@ -66,13 +69,13 @@ class ReadCbwFirmwareTests(SimpleTestCase):
         self.assertEqual(res.status, "ok")
         self.assertEqual(res.firmware, "3.13.7.9")
 
-    @patch("services.cbw_firmware.requests.Session")
+    @patch("services.cbw_auth.requests.Session")
     def test_auth_failed(self, Session):
         Session.side_effect = self._session_factory({self.OVERVIEW: FakeResponse(401)})
         res = read_cbw_firmware("10.3.38.177", "u", ["p1", "p2"])
         self.assertEqual(res.status, "auth_failed")
 
-    @patch("services.cbw_firmware.requests.Session")
+    @patch("services.cbw_auth.requests.Session")
     def test_unreachable(self, Session):
         def factory():
             s = MagicMock()
@@ -84,7 +87,7 @@ class ReadCbwFirmwareTests(SimpleTestCase):
         res = read_cbw_firmware("10.3.38.177", "u", ["p"])
         self.assertEqual(res.status, "unreachable")
 
-    @patch("services.cbw_firmware.requests.Session")
+    @patch("services.cbw_auth.requests.Session")
     def test_no_firmware(self, Session):
         # Both endpoints return JSON but neither exposes a firmware field.
         Session.side_effect = self._session_factory(
