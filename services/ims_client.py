@@ -195,3 +195,47 @@ def fetch_ase_installations(*, include_devices: bool = False) -> list[dict[str, 
                 break
     logger.info("[IMS] ASE fetch complete rows=%s pages=%s", len(all_rows), page)
     return all_rows
+
+
+def refresh_prtg(*, timeout: float = 900.0, poll_seconds: float = 10.0, sleep=None) -> str:
+    """Ask IMS for a fresh PRTG view (tree, enclosures, sensor status) and wait for it.
+
+    Needs an IMS_API_TOKEN with the `prtg:refresh` scope. Returns IMS's final
+    message; raises IMSClientError on refusal, failure, or timeout.
+    """
+    import time
+
+    sleep = sleep or time.sleep
+    if not settings.IMS_API_TOKEN:
+        raise IMSClientError("IMS_API_TOKEN is not configured")
+    url = urljoin(_base_url(), "api/external/prtg-refresh")
+    headers = {"Authorization": f"Bearer {settings.IMS_API_TOKEN}"}
+    deadline = time.monotonic() + timeout
+    with httpx.Client(timeout=30.0, verify=_tls_verify(), headers=headers) as client:
+        try:
+            resp = client.post(url)
+        except httpx.HTTPError as exc:
+            raise IMSClientError(f"PRTG refresh: IMS unreachable ({type(exc).__name__})") from exc
+        if resp.status_code in (401, 403):
+            raise IMSClientError("PRTG refresh refused: the IMS token lacks the prtg:refresh scope")
+        if resp.status_code == 404:
+            raise IMSClientError("PRTG refresh: this IMS has no /api/external/prtg-refresh (update IMS)")
+        if resp.status_code >= 400:
+            raise IMSClientError(f"PRTG refresh failed to start (HTTP {resp.status_code})")
+        progress_id = resp.json().get("progress_id") or ""
+        logger.info("[IMS] PRTG refresh started id=%s new=%s", progress_id, resp.json().get("started"))
+        while True:
+            try:
+                p = client.get(url, params={"id": progress_id})
+                state = p.json() if p.status_code == 200 else {}
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning("[IMS] PRTG refresh poll failed: %s", type(exc).__name__)
+                state = {}
+            if state.get("state") == "done":
+                logger.info("[IMS] PRTG refresh done: %s", state.get("message", ""))
+                return state.get("message", "")
+            if state.get("state") == "error":
+                raise IMSClientError(f"PRTG refresh failed in IMS: {state.get('error') or 'unknown error'}")
+            if time.monotonic() >= deadline:
+                raise IMSClientError(f"PRTG refresh still running after {timeout:.0f}s")
+            sleep(poll_seconds)
