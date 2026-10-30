@@ -17,7 +17,7 @@ from audits.models import AuditJob, AuditRound
 from audits.runner import enqueue_audit_job, request_job_cancel
 from cameras.models import Installation
 from cameras.roles import role_at_least
-from services.cbw_relays import turn_all_relays_on
+from services.cbw_logic import power_on_cbw
 from services.ip_map import DeviceType, pole_to_ip_address
 
 logger = logging.getLogger(__name__)
@@ -1271,10 +1271,11 @@ def turn_relays(request):
         return JsonResponse({"error": "pole_number is required"}, status=400)
 
     try:
-        result = turn_all_relays_on(
+        result = power_on_cbw(
             pole_number,
             settings.CBW_USERNAME,
             settings.CBW_PASSWORDS,
+            vin_floor=float(getattr(settings, "DST_SOLAR_VIN_FLOOR", 12.8)),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -1286,18 +1287,21 @@ def turn_relays(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
     logger.info(
-        "[AUDIT] relays %s pole=%s relays=%s user=%s",
-        result.action,
+        "[AUDIT] power-on %s pole=%s user=%s",
+        result.summary,
         pole_number,
-        result.relays,
         request.user.get_username(),
     )
+    # Scheduled (solar) CBWs start through their own logic (lanes), others by relays.
+    started = [f"TF {lane}" for lane in result.lanes] if result.method == "logic" else result.lanes
     return JsonResponse(
         {
             "ok": True,
             "pole": pole_number,
             "action": result.action,
-            "relays": result.relays,
+            "method": result.method,
+            "relays": started,
+            "detail": result.detail,
         }
     )
 
