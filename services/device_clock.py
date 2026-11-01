@@ -44,6 +44,11 @@ _MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct n
 _TOP_RE = re.compile(
     r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{1,2})\s+(\d{1,2}):(\d{2})\s*([AP]M)?", re.I
 )
+# Windows' engine merges a single-digit day into the month ("Nov 1" → "Novi":
+# the "1" reads as I/l). Split it back so the day still parses.
+_TOP_DAY_LOOKALIKE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)([1ilI|])\b", re.I
+)
 # WattBox "2026-10-29 13:51:11"; OCR may drop the colons or the date's hyphens.
 _WATTBOX_RE = re.compile(r"(\d{4})\s*-?\s*(\d{2})\s*-\s*(\d{2})\s*(\d{2})\s*:?\s*(\d{2})\s*:?\s*(\d{2})(?!\d)")
 # "Thu, 29 Oct 2026 09:12:19"
@@ -233,14 +238,22 @@ def read_vnc(img) -> Reading | None:
     return Reading(f"{date[0]} {shown}", wall, "ocr")
 
 
-def read_dragoncam(img, expected: datetime) -> Reading | None:
+def _repair_top_day(text: str) -> str:
+    return _TOP_DAY_LOOKALIKE.sub(r"\1 1", text)
+
+
+def read_dragoncam(img, expected) -> Reading | None:
     """DragonCam (Ubuntu): the top-bar system clock, e.g. "Oct 29 10:15"."""
     found = ocr_lines(img)
     for text, (x0, y0, x1, y1) in sorted(found, key=lambda f: f[1][1]):
         if y0 > img.height * 0.2 or not re.match(r"(?i)\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", text):
             continue
-        for scale in (2, 3):
-            m = _TOP_RE.search(_ocr_crop(img, (x0 - 40, y0 - 6, x1 + 120, y1 + 6), scale))
+        # The whole-image line, then the crop at higher scales; each is repaired
+        # for the day lookalike ("Novi" → "Nov 1") before matching.
+        box = (x0 - 40, y0 - 6, x1 + 120, y1 + 6)
+        candidates = [text] + [_ocr_crop(img, box, scale) for scale in (2, 3, 4)]
+        for candidate in candidates:
+            m = _TOP_RE.search(_repair_top_day(candidate))
             if m:
                 month, day = _MONTHS[m[1][:3].lower()], int(m[2])
                 # Year from the capture; a reading across New Year takes the nearer one.

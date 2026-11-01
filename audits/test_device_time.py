@@ -131,6 +131,14 @@ class DeviceReadingTests(SimpleTestCase):
         for text in ("2026-10-29 1361:11", "2026-10-29 13511", "2026-10-29", ""):
             self.assertIsNone(device_clock._parse_wattbox(text), text)
 
+    def test_top_bar_day_lookalike_is_repaired(self):
+        # The engine merges a single-digit day into the month ("Nov 1" → "Novi").
+        self.assertEqual(device_clock._repair_top_day("NOVI 05:28"), "NOV 1 05:28")
+        self.assertEqual(device_clock._repair_top_day("Nov 1 05:28"), "Nov 1 05:28")
+        self.assertEqual(device_clock._repair_top_day("Oct 31 17:00"), "Oct 31 17:00")
+        # July's own "l" is part of the month, not a glued day.
+        self.assertEqual(device_clock._repair_top_day("Jul 1 05:00"), "Jul 1 05:00")
+
     def test_ovrc_reading(self):
         from audits.runner import _ovrc_reading
 
@@ -172,6 +180,11 @@ class OcrReaderTests(SimpleTestCase):
     def test_dragoncam_top_bar_clock(self):
         reading = self.read("de_l1", "dragoncam_1015_02.png")
         self.assertEqual((reading.iso, reading.source), ("2026-10-29T10:15:00", "ocr-min"))
+
+    def test_dragoncam_single_digit_day_after_the_month_is_not_lost(self):
+        # Nov 1: OCR reads "Nov 1 05:28" as "NOVI 05:28"; the reader repairs it.
+        reading = self.read("de_l1", "dragoncam_nov1_0528.png")
+        self.assertEqual((reading.iso, reading.source), ("2026-11-01T05:28:00", "ocr-min"))
 
     def test_dragoncam_ignores_the_lagging_status_bar_time(self):
         # Status bar says "Time: 10:50:00" (last event); the system clock says 10:52.
