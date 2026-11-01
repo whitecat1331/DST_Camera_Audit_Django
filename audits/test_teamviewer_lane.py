@@ -83,6 +83,7 @@ class FakeLockScreen:
             mock.patch.object(tvc, "_type_secret", side_effect=self.type_secret),
             mock.patch.object(tvc, "_clear_password_field"),
             mock.patch.object(tvc, "_grab_session_image", return_value=None),
+            mock.patch.object(tvc, "_input_state", return_value=""),
             mock.patch.object(tvc, "_save_login_frames"),
             mock.patch.object(tvc, "_sleep_cancellable"),
             mock.patch.object(tvc.time, "time", side_effect=range(0, 10_000)),
