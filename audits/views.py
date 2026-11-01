@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any
 
 from django.conf import settings
@@ -16,7 +17,7 @@ from audits.models import AuditJob, AuditRound
 from audits.runner import enqueue_audit_job, request_job_cancel
 from cameras.models import Installation
 from cameras.roles import role_at_least
-from services.cbw_relays import turn_all_relays_on
+from services.cbw_logic import power_on_cbw
 from services.ip_map import DeviceType, pole_to_ip_address
 
 logger = logging.getLogger(__name__)
@@ -859,12 +860,13 @@ def dst_audit_page(request):
     preview = []
     lti_count = 0
     de_count = 0
-    q_lower = q.lower()
+    terms = [t.lower() for t in parse_search_terms(q)]
+    matched_terms: set[str] = set()
     for inst in sites:
         kind = _dst_site_kind(inst) or "?"
         serials = _dst_serials_for_inst(inst)
         serials_text = " · ".join(serials) if serials else ""
-        if q_lower:
+        if terms:
             hay = " ".join(
                 [
                     (inst.pole_number or ""),
@@ -882,8 +884,10 @@ def dst_audit_page(request):
                     " ".join(inst.fx_numbers or []),
                 ]
             ).lower()
-            if q_lower not in hay:
+            hits = site_term_hits(terms, inst.pole_number, hay)
+            if not hits:
                 continue
+            matched_terms.update(hits)
         if kind == "lti":
             lti_count += 1
         elif kind == "de":
@@ -954,6 +958,8 @@ def dst_audit_page(request):
             "state": state,
             "agency": agency,
             "q": q,
+            "search_terms": len(terms),
+            "unmatched_terms": [t for t in parse_search_terms(q) if t.lower() not in matched_terms],
             "states": states,
             "agencies": agencies,
             "sites": preview,
@@ -974,6 +980,27 @@ def dst_audit_page(request):
             "has_filters": bool(q or state or agency or (scope and scope != "all")),
         },
     )
+
+
+def parse_search_terms(raw: str) -> list[str]:
+    """Search terms, IMS Installation Multi-Search style: one per line or split on , and ;.
+
+    Blank and repeated (case-insensitive) terms are dropped; order and casing kept.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[\r\n,;]+", raw or ""):
+        term = part.strip()
+        if term and term.lower() not in seen:
+            seen.add(term.lower())
+            out.append(term)
+    return out
+
+
+def site_term_hits(terms: list[str], pole: str | None, hay: str) -> list[str]:
+    """The (lowercased) terms a site matches: its exact pole number, or a substring of hay."""
+    pole = (pole or "").strip().lower()
+    return [t for t in terms if t == pole or t in hay]
 
 
 def _dst_serials_for_inst(inst) -> list[str]:
@@ -1244,10 +1271,11 @@ def turn_relays(request):
         return JsonResponse({"error": "pole_number is required"}, status=400)
 
     try:
-        result = turn_all_relays_on(
+        result = power_on_cbw(
             pole_number,
             settings.CBW_USERNAME,
             settings.CBW_PASSWORDS,
+            vin_floor=float(getattr(settings, "DST_SOLAR_VIN_FLOOR", 12.8)),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -1259,18 +1287,21 @@ def turn_relays(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
     logger.info(
-        "[AUDIT] relays %s pole=%s relays=%s user=%s",
-        result.action,
+        "[AUDIT] power-on %s pole=%s user=%s",
+        result.summary,
         pole_number,
-        result.relays,
         request.user.get_username(),
     )
+    # Scheduled (solar) CBWs start through their own logic (lanes), others by relays.
+    started = [f"TF {lane}" for lane in result.lanes] if result.method == "logic" else result.lanes
     return JsonResponse(
         {
             "ok": True,
             "pole": pole_number,
             "action": result.action,
-            "relays": result.relays,
+            "method": result.method,
+            "relays": started,
+            "detail": result.detail,
         }
     )
 

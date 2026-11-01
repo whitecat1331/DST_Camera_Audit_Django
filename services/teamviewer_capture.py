@@ -520,6 +520,38 @@ def _wait_until_settled(
     return prev
 
 
+# Lock-screen frames of failed login attempts (dots only: no password is visible).
+LOGIN_DEBUG_DIR = Path(__file__).resolve().parents[1] / "logs" / "tv_login"
+
+
+def _input_state(hwnd) -> str:
+    """This PC's keyboard state as the password goes out (a stuck key garbles it)."""
+    user32 = ctypes.windll.user32
+    held = [n for n, vk in (("shift", 0x10), ("ctrl", 0x11), ("alt", 0x12), ("lwin", 0x5B), ("rwin", 0x5C))
+            if user32.GetAsyncKeyState(vk) & 0x8000]
+    fg = user32.GetForegroundWindow()
+    return (
+        f"caps={'on' if user32.GetKeyState(0x14) & 1 else 'off'} "
+        f"held={','.join(held) or 'none'} "
+        f"layout={user32.GetKeyboardLayout(0) & 0xFFFF:#06x} "
+        f"foreground={'session' if fg == hwnd else repr(_get_window_title(fg))}"
+    )
+
+
+def _save_login_frames(hwnd, number: int, typed, after) -> None:
+    """Keep a failed attempt's lock screen: as typed (dot count) and after Enter."""
+    try:
+        LOGIN_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        stem = LOGIN_DEBUG_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{_get_window_title(hwnd)[:40]}-pw{number}"
+        stem = stem.with_name("".join(c if c.isalnum() or c in "-_." else "_" for c in stem.name))
+        for tag, img in (("typed", typed), ("after", after)):
+            if img is not None:
+                img.save(f"{stem}-{tag}.png")
+        logger.info("[TV] login frames saved %s-*.png", stem)
+    except Exception:  # noqa: BLE001 — diagnostics never fail a capture
+        logger.warning("[TV] could not save login frames", exc_info=True)
+
+
 def _login(
     pyautogui,
     hwnd,
@@ -544,16 +576,19 @@ def _login(
         if attempt > 1:
             _focus_remote_desktop(pyautogui, hwnd)
         _clear_password_field(pyautogui)
+        state = _input_state(hwnd)
         _type_secret(pyautogui, passwords[number - 1])
         typed = _small_frame(hwnd)
+        typed_full = _grab_session_image(hwnd)  # kept only if this attempt fails
         pyautogui.press("enter")
         deadline = time.time() + 6
         while time.time() < deadline:
             _sleep_cancellable(0.4, should_cancel)
             if frame_diff(_small_frame(hwnd), typed) >= UNLOCK_DIFF:
-                logger.info("[TV] unlocked with camera password #%s (try %s)", number, attempt)
+                logger.info("[TV] unlocked with camera password #%s (try %s) %s", number, attempt, state)
                 return number
-        logger.info("[TV] camera password #%s did not unlock", number)
+        logger.info("[TV] camera password #%s did not unlock %s", number, state)
+        _save_login_frames(hwnd, number, typed_full, _grab_session_image(hwnd))
     return None
 
 

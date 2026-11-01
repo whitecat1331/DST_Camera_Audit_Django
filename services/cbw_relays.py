@@ -1,13 +1,18 @@
-"""CBW relay power-on (from LTI-DateTime-Validator)."""
+"""CBW relay power-on (from LTI-DateTime-Validator).
+
+Never on a scheduled (solar) CBW: forced relays block its own start-up (E7).
+DST power-on goes through services.cbw_logic.power_on_cbw, which picks this path
+only for CBWs with no "on" schedule.
+"""
 
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 
 import requests
 
+from services.cbw_auth import cbw_login
 from services.ip_map import DeviceType, pole_to_ip_address
 
 logger = logging.getLogger(__name__)
@@ -40,40 +45,35 @@ def turn_all_relays_on(
         raise RuntimeError("CBW_PASSWORDS is not configured")
 
     ip = pole_to_ip_address(str(pole).strip(), DeviceType.CBW)
-    base_url = f"http://{ip}"
-    state_url = f"{base_url}/state.json"
+    # Lockout-aware (a 429 waits and retries the same password); CbwAuthError
+    # means the CBW answered but wouldn't log in, CbwUnreachable that it didn't answer.
+    login = cbw_login(ip, username, passwords, timeout=5)
+    session = login.session
+    try:
+        r = login.response
+        r.raise_for_status()
+        return relays_on(session, ip, r.json(), timeout=5, pole=pole)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Failed to turn on relays for pole {pole} ({ip}): {type(exc).__name__}") from exc
+    finally:
+        session.close()
 
-    for password in passwords:
-        session = requests.Session()
-        session.trust_env = False
-        session.auth = (username, password)
-        try:
-            r = session.get(state_url, timeout=5)
-            if r.status_code == 401:
-                time.sleep(0.2)
-                continue
-            if r.status_code == 429:
-                time.sleep(5)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            relays = [key for key in data if str(key).lower().startswith("relay")]
-            if not relays:
-                raise RuntimeError(f"No relays found on CBW for pole {pole} ({ip})")
 
-            if all(_relay_is_on(data.get(relay)) for relay in relays):
-                logger.info("[CBW] Relays already on for %s: %s", ip, relays)
-                return CbwRelayResult(action="already_on", relays=relays)
+def relays_on(session, ip: str, data: dict, *, timeout: float = 5, pole: str = "") -> CbwRelayResult:
+    """Every relay in `data` (a state.json read) on, on an already logged-in session.
 
-            update_url = f"{base_url}/state.json?" + "&".join(f"{relay}=1" for relay in relays)
-            r = session.get(update_url, timeout=5)
-            r.raise_for_status()
-            logger.info("[CBW] Relays on for %s: %s", ip, relays)
-            return CbwRelayResult(action="turned_on", relays=relays)
-        except requests.RequestException as exc:
-            logger.warning("[CBW] Relay attempt failed for %s: %s", ip, type(exc).__name__)
-            time.sleep(0.2)
-        finally:
-            session.close()
+    Only for CBWs whose logic doesn't own power (services.cbw_logic decides).
+    """
+    relays = [key for key in data if str(key).lower().startswith("relay")]
+    if not relays:
+        raise RuntimeError(f"No relays found on CBW for pole {pole or ip} ({ip})")
 
-    raise RuntimeError(f"Failed to turn on relays for pole {pole} ({ip})")
+    if all(_relay_is_on(data.get(relay)) for relay in relays):
+        logger.info("[CBW] Relays already on for %s: %s", ip, relays)
+        return CbwRelayResult(action="already_on", relays=relays)
+
+    update_url = f"http://{ip}/state.json?" + "&".join(f"{relay}=1" for relay in relays)
+    r = session.get(update_url, timeout=timeout)
+    r.raise_for_status()
+    logger.info("[CBW] Relays on for %s: %s", ip, relays)
+    return CbwRelayResult(action="turned_on", relays=relays)

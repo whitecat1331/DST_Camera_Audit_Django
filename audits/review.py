@@ -24,9 +24,9 @@ from audits.site_timezone import site_timezone
 from audits.thumbs import normalize_thumb_label
 
 DRIFT_FLAG_SECONDS = device_drift.PASS_SECONDS
-_LAYER_ORDER = ("cbw", "vnc_l1", "vnc_l2", "de_l1", "de_l2", "de_l3")
+_LAYER_ORDER = ("cbw", "vnc_l1", "vnc_l2", "de_tv", "de_l1", "de_l2", "de_l3")
 # Captures that show a device clock (services/device_clock.py, OvrC).
-_CLOCK_PREFIXES = ("cbw", "vnc_", "de_l", "ovrc_")
+_CLOCK_PREFIXES = ("cbw", "vnc_", "de_l", "de_tv", "ovrc_")
 KINDS = ("lti", "de")
 STATUSES = ("incomplete", "complete")
 

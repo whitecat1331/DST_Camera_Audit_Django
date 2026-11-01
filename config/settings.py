@@ -307,6 +307,14 @@ CBW_CAPTURE_BUDGET_SECONDS = int(os.getenv("CBW_CAPTURE_BUDGET_SECONDS", "150"))
 AUDIT_SLOT_WAIT_SECONDS = int(os.getenv("AUDIT_SLOT_WAIT_SECONDS", "300"))
 # After DST Audit turns cameras on, wait before starting captures (boot settle).
 DST_POWER_SETTLE_SECONDS = int(os.getenv("DST_POWER_SETTLE_SECONDS", "90"))
+# Scheduled (solar) CBWs are started through their own logic, not relays: DST won't
+# start a lane below this battery voltage, and polls VNC for up to the boot timeout.
+DST_SOLAR_VIN_FLOOR = float(os.getenv("DST_SOLAR_VIN_FLOOR", "12.8"))
+DST_SOLAR_BOOT_TIMEOUT_SECONDS = int(os.getenv("DST_SOLAR_BOOT_TIMEOUT_SECONDS", "420"))
+# Before a DST run: ask IMS to refresh PRTG (needs a prtg:refresh token), then sync
+# installations, so paused / unmonitored sites drop out. Failure only warns.
+DST_PRE_AUDIT_IMS_REFRESH = os.getenv("DST_PRE_AUDIT_IMS_REFRESH", "true").lower() in ("1", "true", "yes")
+DST_PRTG_REFRESH_TIMEOUT_SECONDS = int(os.getenv("DST_PRTG_REFRESH_TIMEOUT_SECONDS", "900"))
 # WatchGuard openvpn.exe management port, used when netstat can't name it.
 DST_VPN_MGMT_PORT = int(os.getenv("DST_VPN_MGMT_PORT", "1337"))
 # How long a held publish waits for the shared DB (VPN off) before giving up.

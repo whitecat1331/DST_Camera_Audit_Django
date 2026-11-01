@@ -3,7 +3,7 @@
 from datetime import datetime, timezone as dt_timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import skipUnless
+from unittest import mock, skipUnless
 
 from django.test import SimpleTestCase, TestCase, override_settings
 from PIL import Image
@@ -97,6 +97,48 @@ class DeviceReadingTests(SimpleTestCase):
         self.assertIsNone(device_clock.read_capture("cbw", Path("nowhere/cbw.png"), datetime(2026, 10, 29)))
 
 
+    def test_colons_on_the_clock_line_are_blanked_and_nothing_else(self):
+        # Glyph columns: a 6-px "1", a 2-px colon, an 8-px "0"; only the colon goes.
+        img = Image.new("RGB", (40, 10), "white")
+        for x0, x1 in ((4, 10), (12, 14), (16, 24)):
+            for x in range(x0, x1):
+                img.putpixel((x, 5), (0, 0, 0))
+        box = (0, 0, 40, 10)
+        self.assertEqual(device_clock._dark_runs(img, box), [(4, 10), (12, 14), (16, 24)])
+        self.assertEqual(device_clock._dark_runs(device_clock._blank_colons(img, box), box), [(4, 10), (16, 24)])
+        self.assertEqual(device_clock._dark_runs(img, box), [(4, 10), (12, 14), (16, 24)])  # original untouched
+
+    def test_colon_dot_pairs_are_blanked_but_narrow_digits_and_hyphens_stay(self):
+        # At 1x a WattBox "1" is 2 px, as narrow as a colon: shape tells them apart.
+        img = Image.new("RGB", (30, 12), "white")
+        for y in range(1, 11):  # "1": one unbroken stroke
+            img.putpixel((4, y), (0, 0, 0))
+            img.putpixel((5, y), (0, 0, 0))
+        for y in (3, 4, 8, 9):  # ":": two dots with a gap
+            img.putpixel((10, y), (0, 0, 0))
+            img.putpixel((11, y), (0, 0, 0))
+        for x in range(16, 20):  # "-": one middle bar
+            img.putpixel((x, 6), (0, 0, 0))
+        box = (0, 0, 30, 12)
+        blanked = device_clock._blank_dot_pairs(img, box)
+        self.assertEqual(device_clock._dark_runs(blanked, box), [(4, 6), (16, 20)])
+
+    def test_wattbox_text_parses_with_or_without_its_colons(self):
+        for text in ("2026-10-29 13:51:11", "2026-10-29 135111", "202610-29 13 51 11", "2026-10-2913:51:11"):
+            self.assertEqual(device_clock._parse_wattbox(text), datetime(2026, 10, 29, 13, 51, 11), text)
+
+    def test_wattbox_misreads_are_unread_not_a_wrong_time(self):
+        for text in ("2026-10-29 1361:11", "2026-10-29 13511", "2026-10-29", ""):
+            self.assertIsNone(device_clock._parse_wattbox(text), text)
+
+    def test_top_bar_day_lookalike_is_repaired(self):
+        # The engine merges a single-digit day into the month ("Nov 1" → "Novi").
+        self.assertEqual(device_clock._repair_top_day("NOVI 05:28"), "NOV 1 05:28")
+        self.assertEqual(device_clock._repair_top_day("Nov 1 05:28"), "Nov 1 05:28")
+        self.assertEqual(device_clock._repair_top_day("Oct 31 17:00"), "Oct 31 17:00")
+        # July's own "l" is part of the month, not a glued day.
+        self.assertEqual(device_clock._repair_top_day("Jul 1 05:00"), "Jul 1 05:00")
+
     def test_ovrc_reading(self):
         from audits.runner import _ovrc_reading
 
@@ -130,13 +172,19 @@ class OcrReaderTests(SimpleTestCase):
         reading = self.read("vnc_l1", "vnc_1048_05.png")
         self.assertEqual((reading.iso, reading.source), ("2026-10-29T10:48:05", "ocr"))
 
-    def test_vnc_clock_ocr_cannot_read_is_unread(self):
-        # OCR sees only "AM" on this line (Phase 4 of PER_DEVICE_TIME_CHECK).
-        self.assertIsNone(self.read("vnc_l1", "vnc_1012_01.png"))
+    def test_vnc_clock_the_engine_drops_with_its_colons(self):
+        # OCR sees only "AM" on this line with the colons in (Phase 4 of PER_DEVICE_TIME_CHECK).
+        reading = self.read("vnc_l1", "vnc_1012_01.png")
+        self.assertEqual((reading.iso, reading.raw), ("2026-10-29T10:12:01", "10/29/2026 10:12:01 AM"))
 
     def test_dragoncam_top_bar_clock(self):
         reading = self.read("de_l1", "dragoncam_1015_02.png")
         self.assertEqual((reading.iso, reading.source), ("2026-10-29T10:15:00", "ocr-min"))
+
+    def test_dragoncam_single_digit_day_after_the_month_is_not_lost(self):
+        # Nov 1: OCR reads "Nov 1 05:28" as "NOVI 05:28"; the reader repairs it.
+        reading = self.read("de_l1", "dragoncam_nov1_0528.png")
+        self.assertEqual((reading.iso, reading.source), ("2026-11-01T05:28:00", "ocr-min"))
 
     def test_dragoncam_ignores_the_lagging_status_bar_time(self):
         # Status bar says "Time: 10:50:00" (last event); the system clock says 10:52.
@@ -150,8 +198,26 @@ class OcrReaderTests(SimpleTestCase):
         Image.new("RGB", (800, 600), "white").save(blank)
         self.assertIsNone(device_clock.read_capture("de_l1", blank, self.EXPECTED))
 
+    def test_unlaned_de_tv_capture_is_read_like_a_lane(self):
+        # A DE site whose TeamViewer row has no lane saves its one capture as de_tv.
+        reading = self.read("de_tv", "dragoncam_1015_02.png")
+        self.assertEqual((reading.iso, reading.source), ("2026-10-29T10:15:00", "ocr-min"))
+
     def test_other_labels_are_not_read(self):
         self.assertIsNone(self.read("tv_status", "dragoncam_1015_02.png"))
+
+    def test_wattbox_time_settings_at_2x(self):
+        # Live OvrC capture (FX1168), rendered at 2x as services/ovrc_capture.py takes it.
+        reading = self.read("ovrc_fx1168_wattbox", "wattbox_1357_58.png")
+        self.assertEqual((reading.iso, reading.source), ("2026-10-29T13:57:58", "ocr"))
+
+    def test_wattbox_time_settings_at_1x(self):
+        # A browser screenshot at 1x: OCR misreads some passes ("1361:11"); agreeing ones win.
+        reading = self.read("ovrc_fx1168_wattbox", "wattbox_1351_11_1x.png")
+        self.assertEqual(reading.iso, "2026-10-29T13:51:11")
+
+    def test_the_ovrc_dashboard_capture_is_not_ocr_read(self):
+        self.assertIsNone(self.read("ovrc_fx1168", "wattbox_1357_58.png"))
 
 
 class SaveShotTests(TestCase):
@@ -195,6 +261,80 @@ class SaveShotTests(TestCase):
         shot = self.save("ovrc_fx1408", captured_at=at, reading=_ovrc_reading("Thu, Oct 29, 2026 10:00 AM CDT"))
         self.assertEqual((shot.captured_at, shot.device_time, shot.device_time_source), (at, "2026-10-29T10:00:00", "ovrc"))
 
+    def test_wattbox_capture_is_saved_as_its_own_device(self):
+        from audits.runner import _save_wattbox_shot
+
+        at = datetime(2026, 10, 29, 17, 57, 59, tzinfo=dt_timezone.utc)
+        r = SimpleNamespace(fx_number="FX1168", wattbox_screenshot_path=self.png, wattbox_captured_at=at, wattbox_error="")
+        reading = device_clock.Reading("2026-10-29 13:57:58", datetime(2026, 10, 29, 13, 57, 58), "ocr")
+        with override_settings(MEDIA_ROOT=self.media), mock.patch("audits.runner._read_device_clock", return_value=reading):
+            self.assertEqual(_save_wattbox_shot(self.job.pk, r), "")
+        shot = AuditScreenshot.objects.get(job=self.job, label="ovrc_fx1168_wattbox")
+        self.assertEqual((shot.captured_at, shot.device_time, shot.device_time_source), (at, "2026-10-29T13:57:58", "ocr"))
+
+    def test_missing_wattbox_capture_is_a_warning_line(self):
+        from audits.runner import _save_wattbox_shot
+
+        r = SimpleNamespace(fx_number="FX1168", wattbox_screenshot_path=None, wattbox_captured_at=None, wattbox_error="TimeoutException: x")
+        self.assertEqual(_save_wattbox_shot(self.job.pk, r), "OvrC WattBox time FX1168: TimeoutException: x")
+        self.assertFalse(AuditScreenshot.objects.filter(job=self.job).exists())
+
     def test_unreadable_capture_leaves_the_device_time_blank(self):
         shot = self.save("cbw")  # no page text kept
         self.assertEqual((shot.device_time, shot.device_time_source), ("", ""))
+
+
+class VncGrabTimeTests(TestCase):
+    """A VNC capture is stamped when the frame was requested, not when the PNG was written."""
+
+    databases = {"default"}
+
+    def fake_vnc(self, delay: float = 0.3):
+        """A SyncVNCClient stand-in whose capture() takes `delay`, like a frame over the VPN."""
+        import time
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        import numpy as np
+
+        def capture():
+            time.sleep(delay)
+            return np.zeros((4, 4, 4), dtype=np.uint8)
+
+        @contextmanager
+        def connect(config):
+            yield SimpleNamespace(rect=SimpleNamespace(width=4, height=4), capture=capture)
+
+        return mock.patch("services.vnc_capture.SyncVNCClient.connect", side_effect=connect)
+
+    def test_grabbed_at_is_the_frame_request_not_the_file_write(self):
+        import tempfile
+
+        from services.vnc_capture import capture_vnc
+
+        with self.fake_vnc():
+            before = datetime.now(dt_timezone.utc)
+            shot = capture_vnc(tempfile.mkdtemp(prefix="dst-vnc-test-"), "10.0.0.1", "pw")
+            after = datetime.now(dt_timezone.utc)
+        written = datetime.fromtimestamp(shot.path.stat().st_mtime, tz=dt_timezone.utc)
+        self.assertTrue(shot.path.exists())
+        self.assertLessEqual(before, shot.grabbed_at)
+        self.assertLessEqual(shot.grabbed_at, after)
+        self.assertGreaterEqual((written - shot.grabbed_at).total_seconds(), 0.25)
+
+    def test_vnc_step_saves_the_shot_at_its_grab_time(self):
+        import tempfile
+
+        from audits.runner import _capture_vnc_step
+
+        job = AuditJob.objects.create(pole_number="220033", device_type=AuditJob.DeviceType.DST_SITE)
+        with (
+            self.fake_vnc(delay=0),
+            mock.patch("audits.runner._save_shot") as save,
+            override_settings(TF_VNC_PASSWORD="pw"),
+        ):
+            label, exc = _capture_vnc_step(job.pk, 1, "10.0.0.1", "vnc_l1", Path(tempfile.mkdtemp()))
+        self.assertIsNone(exc)
+        (_job_id, path, saved_label), kw = save.call_args.args, save.call_args.kwargs
+        self.assertEqual((saved_label, path.name), ("vnc_l1", "vnc_l1.png"))
+        self.assertIsInstance(kw["captured_at"], datetime)

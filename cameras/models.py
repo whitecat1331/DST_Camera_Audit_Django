@@ -63,6 +63,9 @@ class Installation(models.Model):
     source = models.CharField(max_length=64, blank=True, default="")
     notes = models.TextField(blank=True, default="")
     prtg_device_name = models.CharField(max_length=255, blank=True, default="")
+    # From IMS (?include=devices): active | paused | unmonitored; "" when IMS
+    # didn't say (older IMS). DST skips paused and unmonitored sites entirely.
+    prtg_monitoring = models.CharField(max_length=16, blank=True, default="")
     parent_installation_id = models.IntegerField(null=True, blank=True)
     created_at = models.CharField(max_length=64, blank=True, default="")
     ims_updated_at = models.CharField(max_length=64, blank=True)
@@ -88,6 +91,33 @@ class Installation(models.Model):
             return tf_cpu_ips(self.pole_number)
         except ValueError:
             return []
+
+    @property
+    def is_solar(self) -> bool:
+        """Solar = IMS lists a Victron Cerbo (`solar` device), whatever `power_type` says.
+
+        IMS `power_type` is often wrong (AC or blank on 165 Cerbo installations,
+        FLEET_AUDIT_SCOPE_AND_RELIABILITY E3); the Cerbo is the reliable sign.
+        """
+        if not self.pk:
+            return False
+        return any((d.device_type or "").strip().lower() == "solar" for d in self.devices.all())
+
+    @property
+    def is_legacy(self) -> bool:
+        """Legacy site: it has CBW / TF CPU devices in IMS and none is on a `10.` host.
+
+        User rule (2026-10-30): legacy sites don't start with a 10.x IP and are
+        skipped. A site with no CBW/CPU devices at all isn't called legacy here.
+        """
+        if not self.pk:
+            return False
+        hosts = [
+            (d.host or "").strip()
+            for d in self.devices.all()
+            if (d.device_type or "").strip().lower() in ("cbw", "cpu")
+        ]
+        return bool(hosts) and not any(h.startswith("10.") for h in hosts)
 
     @property
     def has_gps(self) -> bool:
@@ -213,6 +243,8 @@ class InstallationSensor(models.Model):
     name = models.CharField(max_length=255, blank=True)
     last_value = models.CharField(max_length=255, blank=True)
     sensor_type = models.CharField(max_length=64, blank=True)
+    # PRTG status from IMS's last sensor sync ("Up", "Paused by User", …).
+    status = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
         ordering = ["name"]
