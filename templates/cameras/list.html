@@ -672,11 +672,15 @@
 
   function formatRelaysMessage(data, pole) {
     const names = (data.relays || []).join(', ') || 'relays';
+    if (data.action === 'battery_low') {
+      return `Pole ${pole}: not turned on, ${data.detail || 'battery low'}.`;
+    }
     if (data.action === 'already_on') {
       return `Pole ${pole}: already on.\n\n${names}`;
     }
     if (data.action === 'turned_on') {
-      return `Pole ${pole}: successfully turned on.\n\n${names}`;
+      const how = data.method === 'logic' ? 'started through the CBW logic (boots in about 1-3 min)' : 'successfully turned on';
+      return `Pole ${pole}: ${how}.\n\n${names}`;
     }
     return `Pole ${pole}: relays ON.\n\n${names}`;
   }

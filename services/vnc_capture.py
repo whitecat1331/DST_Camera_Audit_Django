@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
@@ -19,6 +21,15 @@ def _noop_progress(_: str) -> None:
     return None
 
 
+@dataclass(frozen=True)
+class VncShot:
+    path: Path
+    # When the frame was requested: the screen the server sends is from then, and
+    # arrives over the VPN seconds later (4-9 s on 2026-10-29), so the clock it
+    # shows is read against this, not the file's write time.
+    grabbed_at: datetime
+
+
 def capture_vnc(
     output_dir: str | Path,
     host: str,
@@ -26,7 +37,7 @@ def capture_vnc(
     port: int = 5900,
     filename: str = "VNC_Screenshot.png",
     on_progress: ProgressFn | None = None,
-) -> Path:
+) -> VncShot:
     """Connect to a TF VNC server and save a full-screen PNG."""
     progress = on_progress or _noop_progress
     if not password:
@@ -51,6 +62,7 @@ def capture_vnc(
             time.perf_counter() - t0,
         )
         progress(f"VNC capturing {host} ({vnc.rect.width}x{vnc.rect.height})")
+        grabbed_at = datetime.now(timezone.utc)
         pixels = vnc.capture()
         image = Image.fromarray(pixels, "RGBA")
         image.save(filepath)
@@ -61,4 +73,4 @@ def capture_vnc(
         time.perf_counter() - t0,
     )
     progress(f"VNC saved {filename}")
-    return filepath
+    return VncShot(filepath, grabbed_at)

@@ -3,8 +3,60 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
+import time
 from pathlib import Path
+
+
+class LockTolerantRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Size rotation that survives another process holding the log open.
+
+    On Windows a file another process has open can't be renamed. The stock
+    handler shifts dst.log.1..5 down *before* that rename fails, then reopens
+    and fails again on the next record: run 389 lost its log at 10 MB and
+    every backup with it. Here the base file is moved aside first; if that
+    fails, the backups are left alone, writing goes on in the same file, and
+    the rollover is retried after `retry_seconds`.
+    """
+
+    retry_seconds = 60.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._retry_at = 0.0
+
+    def shouldRollover(self, record):
+        if time.monotonic() < self._retry_at:
+            return False
+        return super().shouldRollover(record)
+
+    def doRollover(self):
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        aside = f"{self.baseFilename}.rotating-{os.getpid()}"
+        try:
+            os.replace(self.baseFilename, aside)
+        except FileNotFoundError:
+            aside = ""
+        except OSError:
+            # Held open elsewhere: keep appending, try again later.
+            self._retry_at = time.monotonic() + self.retry_seconds
+            self.stream = self._open()
+            return
+        if aside:
+            if self.backupCount > 0:
+                for i in range(self.backupCount - 1, 0, -1):
+                    sfn = self.rotation_filename(f"{self.baseFilename}.{i}")
+                    dfn = self.rotation_filename(f"{self.baseFilename}.{i + 1}")
+                    if os.path.exists(sfn):
+                        os.replace(sfn, dfn)
+                os.replace(aside, self.rotation_filename(f"{self.baseFilename}.1"))
+            else:
+                os.remove(aside)
+        self._retry_at = 0.0
+        self.stream = self._open()
 
 
 def resolve_log_level(default: int = logging.INFO) -> int:
@@ -69,13 +121,16 @@ def build_logging_config(base_dir: Path | None = None) -> dict:
 
     if log_path is not None:
         handlers["file"] = {
-            "class": "logging.handlers.RotatingFileHandler",
+            "class": "config.logging.LockTolerantRotatingFileHandler",
             "level": level_name,
             "formatter": "standard",
             "filename": str(log_path),
             "maxBytes": 10 * 1024 * 1024,
             "backupCount": 5,
             "encoding": "utf-8",
+            # Opened on the first record, so a process that never logs
+            # (runserver's reloader parent, a probe script) doesn't hold it.
+            "delay": True,
         }
         root_handlers.append("file")
 

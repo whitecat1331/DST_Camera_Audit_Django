@@ -1,6 +1,8 @@
 """OvrC portal helpers for DragonEye FX cameras.
 
 - Local date/time from the customer dashboard (screenshot)
+- WattBox "CURRENT DEVICE TIME" from Devices → WattBox → Configure → Time
+  Settings (screenshot only; services/device_clock.py reads it with OCR)
 - WattBox "DCAM System" outlet: turn ON only when currently OFF
 """
 
@@ -40,6 +42,8 @@ _LOCAL_TIME_RE = re.compile(
     r"\d{1,2},?\s+\d{4}\s+\d{1,2}:\d{2}\s*(?:AM|PM)\s+[A-Z]{2,5}",
     re.IGNORECASE,
 )
+# WattBox Time Settings: "2026-10-29 13:51:11"
+_WATTBOX_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}")
 
 
 def _noop_progress(_: str) -> None:
@@ -50,10 +54,21 @@ def _noop_progress(_: str) -> None:
 class OvrcTimeResult:
     fx_number: str
     local_time: str
-    screenshot_path: Path
+    screenshot_path: Path | None
     dashboard_url: str
     # When local_time was read (UTC) — the reference for wall-clock drift.
     captured_at: datetime | None = None
+    # The WattBox Time Settings page: a second clock, its own capture.
+    wattbox_screenshot_path: Path | None = None
+    wattbox_captured_at: datetime | None = None
+    wattbox_error: str = ""
+    # Set when this FX couldn't be read (e.g. "not an OvrC customer"); the
+    # other fields are then empty. One FX failing never ends the pass.
+    error: str = ""
+
+
+class OvrcCustomerNotFound(RuntimeError):
+    """OvrC's customer search answered "No results found." for this FX."""
 
 
 @dataclass(frozen=True)
@@ -191,8 +206,14 @@ class OvrcClient:
         fx_number: str,
         output_dir: str | Path,
         filename: str | None = None,
+        *,
+        wattbox: bool = True,
     ) -> OvrcTimeResult:
-        """Search FX, open dashboard, scrape local time, screenshot."""
+        """Search FX, open dashboard, scrape local time, screenshot.
+
+        wattbox: then screenshot the WattBox's Time Settings page too. A failure
+        there is kept on wattbox_error; the dashboard reading still stands.
+        """
         assert self.driver is not None and self._wait is not None
         fx = self._normalize_fx(fx_number)
 
@@ -217,13 +238,54 @@ class OvrcClient:
             time.perf_counter() - t0,
         )
         self.progress(f"OvrC {fx}: {local_time}")
+        wb_path: Path | None = None
+        wb_at: datetime | None = None
+        wb_error = ""
+        if wattbox:
+            try:
+                wb_path = output_dir / f"{filepath.stem}_wattbox.png"
+                wb_at = self.capture_wattbox_time(fx, wb_path)
+            except Exception as exc:  # noqa: BLE001 — the dashboard reading still stands
+                wb_path, wb_at = None, None
+                wb_error = f"{type(exc).__name__}: {exc}".strip()[:200]
+                logger.warning("[OVRC] fx=%s wattbox time failed: %s", fx, wb_error)
+                self.progress(f"OvrC {fx} WattBox time: failed")
         return OvrcTimeResult(
             fx_number=fx,
             local_time=local_time,
             screenshot_path=filepath,
             dashboard_url=url,
             captured_at=captured_at,
+            wattbox_screenshot_path=wb_path,
+            wattbox_captured_at=wb_at,
+            wattbox_error=wb_error,
         )
+
+    def capture_wattbox_time(self, fx: str, filepath: Path) -> datetime:
+        """From the FX dashboard: Devices → WattBox → Configure → Time Settings.
+
+        Screenshots the page (rendered at 2x so OCR reads the small clock) and
+        returns when the clock appeared (UTC).
+        """
+        assert self.driver is not None
+        t0 = time.perf_counter()
+        self._open_devices_tab()
+        self._open_wattbox_device(fx)
+        self._open_device_subpage("configure", "CONFIGURE", r"/details/?$")
+        self._open_device_subpage("configure-time-settings", "Time Settings", r"/configure/?$")
+        self.progress(f"OvrC reading WattBox time for {fx}")
+        self._wait_for_wattbox_time()
+        captured_at = datetime.now(timezone.utc)
+        self._dismiss_whats_new()
+        self._save_screenshot_2x(filepath)
+        logger.info(
+            "[OVRC] fx=%s wattbox time path=%s elapsed=%.1fs",
+            fx,
+            filepath.name,
+            time.perf_counter() - t0,
+        )
+        self.progress(f"OvrC {fx} WattBox time captured")
+        return captured_at
 
     def ensure_dcam_system_on(self, fx_number: str) -> OvrcDcamResult:
         """Turn WattBox outlet 'DCAM System' ON only if currently OFF."""
@@ -440,22 +502,77 @@ class OvrcClient:
         box.send_keys(Keys.BACKSPACE)
         time.sleep(0.2)
         box.send_keys(fx.lower())
-        # Debounced filter — wait for a row mentioning this FX.
-        deadline = time.time() + 25
+        # Debounced filter — wait for a row mentioning this FX. "No results
+        # found." is a definite answer once it has held past the debounce
+        # (FX1031 used to cost the full 25 s, then ended the fleet pass).
+        typed = time.time()
+        deadline = typed + 25
+        empty_since: float | None = None
         last_err: Exception | None = None
         while time.time() < deadline:
             try:
                 rows = self._customer_rows_matching(fx)
                 if rows:
                     return
+                others = [] if self._no_results_shown() else self._other_customer_ids(fx)
+                if others is not None:
+                    empty_since = empty_since or time.time()
+                    now = time.time()
+                    if now - empty_since >= 1.5 and now - typed >= 2.5:
+                        found = f"only {', '.join(others)}" if others else "No results found"
+                        raise OvrcCustomerNotFound(f"{fx} is not an OvrC customer (search: {found})")
+                else:
+                    empty_since = None
+            except OvrcCustomerNotFound:
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
             time.sleep(0.4)
         raise RuntimeError(f"OvrC search for {fx} returned no customers") from last_err
 
-    def _customer_rows_matching(self, fx: str):
+    def _no_results_shown(self) -> bool:
+        assert self.driver is not None
+        for el in self.driver.find_elements(
+            By.XPATH,
+            "//*[not(*)][contains(translate(normalize-space(.),'NORESULTSFD','noresultsfd'),"
+            "'no results found')]",
+        ):
+            try:
+                if el.is_displayed():
+                    return True
+            except StaleElementReferenceException:
+                continue
+        return False
+
+    def _other_customer_ids(self, fx: str) -> list[str] | None:
+        """Longer FX ids the search listed instead of `fx` (FX140 → FX1400…), or None if none."""
+        assert self.driver is not None
+        ids: set[str] = set()
+        for el in self._customer_rows_matching(fx, exact=False):
+            try:
+                ids.update(m.upper() for m in re.findall(rf"{re.escape(fx)}\d+", el.text or "", re.I))
+            except StaleElementReferenceException:
+                continue
+        return sorted(ids) or None
+
+    def recover(self) -> None:
+        """After a failed FX: back to a clean customer list, re-logging in if the session died."""
+        try:
+            assert self.driver is not None
+            self.driver.get(f"{self.base_url}/#/customers")
+            self._wait_for_customers_list()
+            self._dismiss_whats_new()
+            return
+        except Exception:  # noqa: BLE001
+            logger.warning("[OVRC] customer list unreachable after a failure; restarting the session")
+        self.close()
+        self.start()
+
+    def _customer_rows_matching(self, fx: str, exact: bool = True):
+        """Visible rows naming `fx`. Exact means the whole id: FX140 must not match FX1400."""
         assert self.driver is not None
         fx_u = fx.upper()
+        whole_id = re.compile(rf"(?<![A-Z0-9]){re.escape(fx_u)}(?![0-9])")
         # Prefer table body rows / list items that mention the FX id.
         xpath = (
             f"//tr[.//*[contains(translate(., 'fx', 'FX'), '{fx_u}')]]"
@@ -468,7 +585,7 @@ class OvrcClient:
                 if not el.is_displayed():
                     continue
                 text = (el.text or "").upper()
-                if fx_u in text:
+                if (whole_id.search(text) if exact else fx_u in text):
                     out.append(el)
             except StaleElementReferenceException:
                 continue
@@ -486,7 +603,7 @@ class OvrcClient:
         try:
             links = target.find_elements(By.XPATH, ".//a|.//*[@role='link']")
             for link in links:
-                if fx.upper() in (link.text or "").upper() and link.is_displayed():
+                if re.search(rf"(?<![A-Z0-9]){re.escape(fx.upper())}(?![0-9])", (link.text or "").upper()) and link.is_displayed():
                     clickable = link
                     break
         except StaleElementReferenceException:
@@ -593,6 +710,71 @@ class OvrcClient:
         )
         time.sleep(1.0)
         self._dismiss_whats_new()
+
+    def _open_device_subpage(self, route: str, link_text: str, from_re: str) -> None:
+        """Open a WattBox device route (".../configure") by URL, else by its link."""
+        assert self.driver is not None and self._wait is not None
+        self.progress(f"OvrC opening {link_text}")
+        url = self.driver.current_url or ""
+        target = re.sub(from_re, f"/{route}", url, count=1, flags=re.IGNORECASE)
+        if target != url:
+            self.driver.get(target)
+        else:
+            self._click_text(link_text)
+        self._wait.until(lambda d: (d.current_url or "").lower().rstrip("/").endswith(f"/{route}"))
+        time.sleep(0.8)
+        self._dismiss_whats_new()
+
+    def _click_text(self, text: str) -> None:
+        """Click the innermost visible element whose text is `text` (any case)."""
+        assert self.driver is not None
+        upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        xpath = (
+            f"//*[translate(normalize-space(.), '{upper.lower()}', '{upper}')"
+            f"='{text.strip().upper()}']"
+        )
+        # Innermost first: a JS click on a wrapper never reaches the link inside.
+        for el in reversed(self.driver.find_elements(By.XPATH, xpath)):
+            try:
+                if el.is_displayed():
+                    self.driver.execute_script("arguments[0].click();", el)
+                    return
+            except StaleElementReferenceException:
+                continue
+        raise RuntimeError(f"OvrC link {text!r} not found")
+
+    def _wait_for_wattbox_time(self) -> None:
+        """Wait until Time Settings shows its CURRENT DEVICE TIME value."""
+        assert self.driver is not None
+        deadline = time.time() + 30
+        body = ""
+        while time.time() < deadline:
+            try:
+                body = self.driver.find_element(By.TAG_NAME, "body").text or ""
+                if "CURRENT DEVICE TIME" in body.upper() and _WATTBOX_TIME_RE.search(body):
+                    return
+            except (NoSuchElementException, StaleElementReferenceException):
+                pass
+            time.sleep(0.4)
+        sample = " ".join(body.split())[:240]
+        raise RuntimeError(f"OvrC WattBox CURRENT DEVICE TIME not shown (page sample: {sample!r})")
+
+    def _save_screenshot_2x(self, filepath: Path) -> None:
+        """Screenshot at device scale 2: at 1x OCR misreads the 13 px clock."""
+        assert self.driver is not None
+        size = self.driver.get_window_size()
+        try:
+            self.driver.execute_cdp_cmd(
+                "Emulation.setDeviceMetricsOverride",
+                {"width": size["width"], "height": size["height"], "deviceScaleFactor": 2, "mobile": False},
+            )
+            time.sleep(0.5)
+            self.driver.save_screenshot(str(filepath))
+        finally:
+            try:
+                self.driver.execute_cdp_cmd("Emulation.clearDeviceMetricsOverride", {})
+            except Exception:  # noqa: BLE001
+                logger.debug("[OVRC] clearDeviceMetricsOverride failed", exc_info=True)
 
     def _click_nav_label(self, label: str) -> None:
         assert self.driver is not None
@@ -939,7 +1121,13 @@ def capture_fx_times(
     headless: bool = True,
     on_progress: ProgressFn | None = None,
 ) -> list[OvrcTimeResult]:
-    """Login once and capture local time screenshots for each FX serial."""
+    """Login once and capture local time screenshots for each FX serial.
+
+    Returns one result per FX, in order: a reading, or `error` set with the
+    reason. Only the login failing (or a cancel) raises.
+    """
+    from services.teamviewer_capture import CaptureCancelled
+
     progress = on_progress or _noop_progress
     results: list[OvrcTimeResult] = []
     # Preserve order, drop duplicates.
@@ -961,12 +1149,34 @@ def capture_fx_times(
         headless=headless,
         on_progress=progress,
     ) as client:
-        for fx in ordered:
-            results.append(
-                client.capture_fx_local_time(
-                    fx,
-                    output_dir,
-                    filename=f"ovrc_{fx.lower()}.png",
+        for i, fx in enumerate(ordered):
+            try:
+                results.append(
+                    client.capture_fx_local_time(
+                        fx,
+                        output_dir,
+                        filename=f"ovrc_{fx.lower()}.png",
+                    )
                 )
-            )
+                continue
+            except CaptureCancelled:
+                raise
+            except OvrcCustomerNotFound as exc:
+                detail = str(exc)
+            except Exception as exc:  # noqa: BLE001 — one FX must not end the pass
+                detail = f"{type(exc).__name__}: {exc}".strip()[:200]
+            logger.warning("[OVRC] fx=%s time failed: %s", fx, detail)
+            progress(f"OvrC {fx}: failed")
+            results.append(_failed_time(fx, detail))
+            try:
+                client.recover()
+            except Exception as exc:  # noqa: BLE001 — keep what was read; mark the rest
+                lost = f"OvrC session lost: {type(exc).__name__}: {exc}".strip()[:200]
+                logger.warning("[OVRC] %s; %s FX left unread", lost, len(ordered) - i - 1)
+                results.extend(_failed_time(rest, lost) for rest in ordered[i + 1 :])
+                break
     return results
+
+
+def _failed_time(fx: str, detail: str) -> OvrcTimeResult:
+    return OvrcTimeResult(fx_number=fx, local_time="", screenshot_path=None, dashboard_url="", error=detail)

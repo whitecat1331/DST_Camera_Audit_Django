@@ -54,6 +54,7 @@ def _sync_devices(installation: Installation, devices: list[dict]) -> None:
                     name=s.get("name") or "",
                     last_value=s.get("last_value") or "",
                     sensor_type=s.get("sensor_type") or "",
+                    status=(s.get("status") or "")[:64],
                 )
             )
         if sensors:
@@ -135,6 +136,7 @@ def sync_installations_from_ims() -> tuple[int, int, int]:
             "tf_a_ip": _inv_str(inv.get("tf_a_ip")),
             "tf_b_ip": _inv_str(inv.get("tf_b_ip")),
             "name": row.get("name") or "",
+            "prtg_monitoring": (row.get("prtg_monitoring") or "")[:16],
             "street": row.get("street") or "",
             "county": row.get("county") or "",
             "direction": row.get("direction") or "",
